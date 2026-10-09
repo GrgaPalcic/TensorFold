@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from tensorfold.cuda.exl3.linear import Exl3Linear
+from .split import fused_rank_runs
 from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
@@ -112,6 +113,11 @@ class Config:
         """Largest context (tokens) where DSA's top-k selection keeps every visible key (dense attention)."""
 
         return self.index_topk + self.kpool - 1
+
+
+
+
+
 
 
 @dataclass
@@ -312,8 +318,24 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         """One EXL3 group (trellis, suh, svh). The rank's splits are already the tensor's:
         out-linears hold trellis tile columns and svh rows, in-linears trellis tile rows and
         suh rows. The scales read as fp16, the form the linear kernel wants."""
+
         return Exl3Linear.from_tensors(rd.get(PREFIX + name + ".trellis"), t(name + ".suh", torch.float16),
                                        t(name + ".svh", torch.float16), cfg.codebook, device=dev)
+
+    def exl3_qkv(name: str) -> Exl3Linear:
+        """The rank's share of the fused q|k|v group: three head-major blocks, so the rank's
+        share of each block is one run — re-slice the three runs and stack them back into one
+        [q|k|v] linear the chain kernel reads. The q|k|v order is the pack fusion order; the
+        layer-parity phase is what catches a differently ordered pack."""
+
+        trellis = rd.get(PREFIX + name + ".trellis")            # [K/16, 3N/16, words]
+        suh = t(name + ".suh", torch.float16)                   # [K]: input scales, already whole
+        svh = rd.get(PREFIX + name + ".svh")                    # [3N]: output scales per block
+        t_runs = fused_rank_runs(trellis.shape[1], 3, rank, world)
+        s_runs = fused_rank_runs(svh.shape[0], 3, rank, world)
+        return Exl3Linear.from_tensors(torch.cat([trellis[:, s, :] for s in t_runs], dim=1).contiguous(),
+                                       suh, torch.cat([svh[s] for s in s_runs]).contiguous(),
+                                       cfg.codebook, device=dev)
 
     def dense(name: str) -> Q4 | B16 | Exl3Linear:
         """A linear the pack may store as an EXL3 group (RED-SNOW) or a plain bf16 ``.weight`` (Mia's)."""
@@ -326,12 +348,15 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def kda(i: int) -> KDAW:
         p = f"layers.{i}.self_attn."
-        conv = (torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]) if has(p + "q_conv1d.weight")
-                else t(p + "conv1d.weight")).reshape(3 * LL * 128, cfg.conv).contiguous()
+        if has(p + "q_conv1d.weight"):
+            conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
+        else:                          # the fused taps: q|k|v blocks, the rank's share is three runs
+            conv = torch.cat([t(p + "conv1d.weight")[s] for s in
+                              fused_rank_runs(3 * cfg.lin_heads * 128, 3, rank, world)]).contiguous()
         common = (q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
                   t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), dense(p + "o_proj"), LL)
         if has(p + "qkv_proj.trellis"):    # RED-SNOW's SAGE pack: fused q|k|v group, plain bf16 low-rank pair
-            return KDAW(None, exl3_linear(p + "qkv_proj"), make_b16(t(p + "f_a_proj.weight")),
+            return KDAW(None, exl3_qkv(p + "qkv_proj"), make_b16(t(p + "f_a_proj.weight")),
                         make_b16(t(p + "g_a_proj.weight")), make_b16(t(p + "b_proj.weight")), *common)
         proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
         return KDAW(proj, None, None, None, None, *common)

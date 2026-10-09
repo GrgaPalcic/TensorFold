@@ -18,7 +18,6 @@ ROW = (
     r"\.mlp\.shared_experts\.(gate|up)_proj\.",
     r"\.mlp\.(gate|up)_proj\.",
     r"\.self_attn\.(q|k|v)_proj\.",
-    r"\.self_attn\.conv1d\.",
     r"\.self_attn\.(f_b|g_b|b)_proj\.",
     r"\.self_attn\.(A_log|dt_bias)$",
     r"\.self_attn\.(q_b|kv_b)_proj\.",
@@ -34,6 +33,7 @@ REP = (
     r"_layernorm\.weight$", r"\.hc_(attn|ffn)_(fn|base|scale)$", r"\.mlp\.gate\.(weight|e_score_correction_bias)$",
     r"\.self_attn\.indexer\.", r"\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.", r"\.self_attn\.(f_a|g_a)_proj\.",
     r"\.self_attn\.o_norm\.weight$", r"\.(eh_proj)\.", r"\.(enorm|hnorm)\.weight$", r"\.shared_head\.norm\.weight$",
+    r"\.self_attn\.conv1d\.",                     # fused q|k|v taps: the loader re-slices per rank
 )
 RUN = 128 << 20          # most bytes one read of neighbouring tensors takes (``RankReader.prefetch``)
 GAP = 1 << 20            # most unused bytes such a read spans between two tensors (more reads other layers twice)
@@ -47,14 +47,14 @@ SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_c
 
 # EXL3 split rules for every trellis group: experts AND every dense/attention linear
 # (RED-SNOW's SAGE pack quantizes all of them). Out-linears split trellis tile columns
-# (dim1) and svh rows; in-linears split trellis tile rows and suh rows; the replicated
-# projections (q_a/kv_a/eh_proj) and the codebook marker stay whole on every rank.
+# (dim1) and svh rows; in-linears split trellis tile rows and suh rows; replicated
+# projections and codebook markers stay whole. The two FUSED groups (qkv_proj, conv1d)
+# also replicate whole: a rank's share of a fused q|k|v group is three disjoint column
+# runs, which no single byte cut expresses — the loader re-slices them (weights.exl3_qkv).
 EXL3_LINEAR = re.compile(
     r"\.(?:mlp\.experts\.\d+\.|mlp\.shared_experts\.|mlp\.)?(gate|up|down)_proj\.(trellis|suh|svh|mul1|mcg)$"
     r"|\.self_attn\.(q_b|kv_b|f_b|g_b|b|qkv)_proj\.(trellis|suh|svh|mul1|mcg)$"
-    r"|\.self_attn\.(o_proj)\.(trellis|suh|svh|mul1|mcg)$"
-    r"|\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.(trellis|suh|svh|mul1|mcg)$"
-    r"|\.self_attn\.(eh_proj)\.(trellis|suh|svh|mul1|mcg)$"
+    r"|\.self_attn\.(o_proj|q_a_proj|kv_a_proj_with_mqa|eh_proj)\.(trellis|suh|svh|mul1|mcg)$"
 )
 EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh"): "row",
               ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep",
@@ -62,14 +62,13 @@ EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh
               ("f_b", "trellis"): "dim1", ("f_b", "suh"): "rep", ("f_b", "svh"): "row",
               ("g_b", "trellis"): "dim1", ("g_b", "suh"): "rep", ("g_b", "svh"): "row",
               ("b", "trellis"): "dim1", ("b", "suh"): "rep", ("b", "svh"): "row",
-              ("qkv", "trellis"): "dim1", ("qkv", "suh"): "rep", ("qkv", "svh"): "row",
+              ("qkv", "trellis"): "rep", ("qkv", "suh"): "rep", ("qkv", "svh"): "rep",
+              ("kv_b", "trellis"): "dim1", ("kv_b", "suh"): "rep", ("kv_b", "svh"): "row",
               ("o_proj", "trellis"): "row", ("o_proj", "suh"): "row", ("o_proj", "svh"): "rep",
               ("q_a_proj", "trellis"): "rep", ("q_a_proj", "suh"): "rep", ("q_a_proj", "svh"): "rep",
               ("kv_a_proj_with_mqa", "trellis"): "rep", ("kv_a_proj_with_mqa", "suh"): "rep",
               ("kv_a_proj_with_mqa", "svh"): "rep",
               ("eh_proj", "trellis"): "rep", ("eh_proj", "suh"): "rep", ("eh_proj", "svh"): "rep"}
-EXL3_REP_PROJ = re.compile(r"(q_a_proj|kv_a_proj_with_mqa|eh_proj)\.(trellis|suh|svh|mul1|mcg)$")
-
 
 def rule(name: str) -> str:
     if name.startswith("model.visual."):
@@ -85,8 +84,6 @@ def rule(name: str) -> str:
         proj = groups[-2]
         proj = "gate" if proj == "up" else proj
         return EXL3_RULES[(proj, part)]
-    if EXL3_REP_PROJ.search(name):
-        return "rep"
     hits = [kind for kind, pats in (("row", ROW), ("col", COL), ("rep", REP)) if any(re.search(p, name) for p in pats)]
     if len(hits) != 1:
         raise ValueError(f"{name}: split rule is ambiguous or missing ({hits})")
@@ -131,6 +128,17 @@ def validate_exl3_cuts(model_dir: str | Path, world: int = 2) -> int:
             if name != "__metadata__":
                 shapes[name] = info["shape"]
     return _check_exl3_cut_shapes(shapes, world)
+
+
+def fused_rank_runs(n_fused: int, parts: int, rank: int, world: int) -> list[slice]:
+    """One rank's column runs of a fused [p0|p1|...] tensor: each part is head-major, so the
+    rank's share of every part is one contiguous run — ``parts`` disjoint runs in total."""
+
+    per = n_fused // parts
+    half = per // world
+    if half * world != per:
+        raise ValueError(f"fused width {n_fused} does not split into {parts} parts of {world} ranks")
+    return [slice(j * per + rank * half, j * per + (rank + 1) * half) for j in range(parts)]
 
 
 def read_header(path: str | Path) -> tuple[dict, int]:

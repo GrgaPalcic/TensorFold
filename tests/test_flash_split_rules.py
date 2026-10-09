@@ -29,9 +29,9 @@ def test_real_index_coverage():
     # the load-bearing expectations from the coverage pass
     assert kinds.get("col", 0) == 0                                 # no plain col tensors in this pack
     assert kinds["drop"] == 351                                     # pack head 4 + vision 347
-    assert kinds["dim1"] == 24906                                   # out-linear trellis (gate/up/q_b)
-    assert kinds["row"] == 50074                                    # down/o_proj trellis+suh, out svh, plain f_b/g_b/b/kv_b
-    assert kinds["rep"] == 75527                                    # suh(out)/svh(in), q_a/kv_a/eh_proj, norms, router, indexer
+    assert kinds["dim1"] == 24872                                   # out-linear trellis (gate/up/q_b)
+    assert kinds["row"] == 50006                                    # down/o_proj trellis+suh, out svh, plain f_b/g_b/b/kv_b
+    assert kinds["rep"] == 75629                                    # fused qkv/conv1d whole, q_a/kv_a/eh_proj, norms, router, indexer
     assert sum(kinds.values()) == 150858                            # the full index, nothing unaccounted
 
 
@@ -88,13 +88,13 @@ def test_hadamard_shapes_pass():
 
 
 def test_hadamard_shapes_refuse_bad_cut():
-    shapes = {"layers.0.self_attn.qkv_proj.trellis": [256, 1535, 80],   # odd tile columns
-              "layers.0.self_attn.qkv_proj.suh": [4096]}
+    shapes = {"layers.3.self_attn.q_b_proj.trellis": [96, 1023, 80],     # odd tile columns (dim1)
+              "layers.3.self_attn.q_b_proj.suh": [1536]}
     with pytest.raises(ValueError):
         sp._check_exl3_cut_shapes(shapes, world=2)
     shapes = {"layers.2.mlp.down_proj.trellis": [127, 256, 80]}          # odd tile rows
     with pytest.raises(ValueError):
         sp._check_exl3_cut_shapes(shapes, world=2)
-    shapes = {"layers.0.self_attn.qkv_proj.svh": [24577]}                # scale rows off 128
+    shapes = {"layers.3.self_attn.q_b_proj.svh": [16377]}                # scale rows off 128
     with pytest.raises(ValueError):
         sp._check_exl3_cut_shapes(shapes, world=2)
