@@ -18,7 +18,7 @@ ROW = (
     r"\.mlp\.shared_experts\.(gate|up)_proj\.",
     r"\.mlp\.(gate|up)_proj\.",
     r"\.self_attn\.(q|k|v)_proj\.",
-    r"\.self_attn\.(q|k|v)_conv1d\.",
+    r"\.self_attn\.conv1d\.",
     r"\.self_attn\.(f_b|g_b|b)_proj\.",
     r"\.self_attn\.(A_log|dt_bias)$",
     r"\.self_attn\.(q_b|kv_b)_proj\.",
@@ -45,23 +45,92 @@ SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_c
          "processor_config.json", "model.safetensors.index.json")
 
 
-# EXL3 gate/up split tile columns and svh; down splits tile rows and suh; each replicates the remaining tensors.
-EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg)$")
+# EXL3 split rules for every trellis group: experts AND every dense/attention linear
+# (RED-SNOW's SAGE pack quantizes all of them). Out-linears split trellis tile columns
+# (dim1) and svh rows; in-linears split trellis tile rows and suh rows; the replicated
+# projections (q_a/kv_a/eh_proj) and the codebook marker stay whole on every rank.
+EXL3_LINEAR = re.compile(
+    r"\.(?:mlp\.experts\.\d+\.|mlp\.shared_experts\.|mlp\.)?(gate|up|down)_proj\.(trellis|suh|svh|mul1|mcg)$"
+    r"|\.self_attn\.(q_b|kv_b|f_b|g_b|b|qkv)_proj\.(trellis|suh|svh|mul1|mcg)$"
+    r"|\.self_attn\.(o_proj)\.(trellis|suh|svh|mul1|mcg)$"
+    r"|\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.(trellis|suh|svh|mul1|mcg)$"
+    r"|\.self_attn\.(eh_proj)\.(trellis|suh|svh|mul1|mcg)$"
+)
 EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh"): "row",
-              ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep"}
+              ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep",
+              ("q_b", "trellis"): "dim1", ("q_b", "suh"): "rep", ("q_b", "svh"): "row",
+              ("f_b", "trellis"): "dim1", ("f_b", "suh"): "rep", ("f_b", "svh"): "row",
+              ("g_b", "trellis"): "dim1", ("g_b", "suh"): "rep", ("g_b", "svh"): "row",
+              ("b", "trellis"): "dim1", ("b", "suh"): "rep", ("b", "svh"): "row",
+              ("qkv", "trellis"): "dim1", ("qkv", "suh"): "rep", ("qkv", "svh"): "row",
+              ("o_proj", "trellis"): "row", ("o_proj", "suh"): "row", ("o_proj", "svh"): "rep",
+              ("q_a_proj", "trellis"): "rep", ("q_a_proj", "suh"): "rep", ("q_a_proj", "svh"): "rep",
+              ("kv_a_proj_with_mqa", "trellis"): "rep", ("kv_a_proj_with_mqa", "suh"): "rep",
+              ("kv_a_proj_with_mqa", "svh"): "rep",
+              ("eh_proj", "trellis"): "rep", ("eh_proj", "suh"): "rep", ("eh_proj", "svh"): "rep"}
+EXL3_REP_PROJ = re.compile(r"(q_a_proj|kv_a_proj_with_mqa|eh_proj)\.(trellis|suh|svh|mul1|mcg)$")
 
 
 def rule(name: str) -> str:
     if name.startswith("model.visual."):
         return "drop"
-    m = EXL3_EXPERT.search(name)
+    if name.startswith("lm_head.") and not name.endswith(".weight"):
+        return "drop"          # the pack's 8-bit head: served from the BF16 source instead
+    m = EXL3_LINEAR.search(name)
     if m:
-        proj, part = m.groups()
-        return "rep" if part == "mcg" else EXL3_RULES[("gate" if proj == "up" else proj, part)]
+        groups = [g for g in m.groups() if g is not None]
+        part = groups[-1]
+        if part in ("mul1", "mcg"):
+            return "rep"
+        proj = groups[-2]
+        proj = "gate" if proj == "up" else proj
+        return EXL3_RULES[(proj, part)]
+    if EXL3_REP_PROJ.search(name):
+        return "rep"
     hits = [kind for kind, pats in (("row", ROW), ("col", COL), ("rep", REP)) if any(re.search(p, name) for p in pats)]
     if len(hits) != 1:
         raise ValueError(f"{name}: split rule is ambiguous or missing ({hits})")
     return hits[0]
+
+def _check_exl3_cut_shapes(shapes: dict[str, list[int]], world: int = 2) -> int:
+    """The divisibility core over a name -> shape map; returns the groups checked. A rank's
+    trellis tiles never straddle a 128-wide Hadamard block (per-rank tile count % 8), and
+    split scale rows stay on 128-row boundaries (per-rank rows % 128)."""
+
+    groups: dict[str, dict[str, list[int]]] = {}
+    for name, shape in shapes.items():
+        if ".trellis" in name or ".suh" in name or ".svh" in name:
+            groups.setdefault(name.rsplit(".", 1)[0], {})[name.rsplit(".", 1)[1]] = shape
+    for prefix, parts in sorted(groups.items()):
+        for part, shape in parts.items():
+            kind = rule(prefix + "." + part)
+            if kind == "rep":
+                continue
+            if kind == "dim1":
+                if shape[1] % (world * 8):
+                    raise ValueError(f"{prefix}.{part}: trellis tile columns {shape[1]} do not divide by "
+                                     f"{world} on 128-block boundaries ({shape[1] // world} % 8 != 0)")
+            elif kind == "row" and part == "trellis":
+                if shape[0] % (world * 8):
+                    raise ValueError(f"{prefix}.{part}: trellis tile rows {shape[0]} do not divide by "
+                                     f"{world} on 128-block boundaries ({shape[0] // world} % 8 != 0)")
+            elif kind == "row":
+                if shape[0] % (world * 128):
+                    raise ValueError(f"{prefix}.{part}: scale rows {shape[0]} do not divide by {world} "
+                                     f"on 128-row boundaries ({shape[0] // world} % 128 != 0)")
+    return len(groups)
+
+
+def validate_exl3_cuts(model_dir: str | Path, world: int = 2) -> int:
+    """Read every shard header once, then check every EXL3 group's cut divisibility."""
+
+    shapes: dict[str, list[int]] = {}
+    for file in sorted(Path(model_dir).glob("*.safetensors")):
+        header, _ = read_header(file)
+        for name, info in header.items():
+            if name != "__metadata__":
+                shapes[name] = info["shape"]
+    return _check_exl3_cut_shapes(shapes, world)
 
 
 def read_header(path: str | Path) -> tuple[dict, int]:
@@ -159,6 +228,7 @@ class RankReader:
                      if k != "__metadata__"}
         self.files: dict[str, tuple[dict, int]] = {}
         self.index = dict(names)
+        validate_exl3_cuts(self.dir)                       # Hadamard-block divisibility, before any read
 
     def prefetch(self, names, device=None) -> None:
         """Start reading ``names`` (a layer's hundreds of small expert tensors) in shared reads; with a CUDA ``device``, ``get`` returns them uploaded."""
