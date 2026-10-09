@@ -3,7 +3,8 @@
 The EXL3 GEMV is bandwidth-bound on the trellises (about 5.5 GiB a layer across TP2), so prefill keeps the
 bf16 GEMV while the GEMMs move to fp8: each layer's three expert matrices are decoded once into e4m3 B tiles
 (``dequant_fp8``, one scalar scale per matrix - e4m3's relative rounding is scale invariant), the grouped
-GEMMs run through ``torch._scaled_grouped_mm`` (per-expert ``_scaled_mm`` as the fallback), and the shared
+GEMMs run through the Triton grouped kernel (``moe_fp8_gemm``, one launch per GEMM; torch's grouped/_scaled_mm
+as fallbacks), and the shared
 expert stays a BF16 MLP. The routed path loses at most e4m3's ~2^-4 relative precision per matrix product;
 decode keeps the exact bf16 trellis GEMV.
 
@@ -20,6 +21,7 @@ pairs' fp8 activations, on top of the bf16 route's scratch.
 
 from __future__ import annotations
 
+import importlib.util
 import numpy as np
 from functools import lru_cache
 import torch
@@ -124,8 +126,17 @@ def stage(ex: generic.Exl3RoutedExperts, s: Scratch) -> None:
 def grouped_mm(a8: torch.Tensor, sa: torch.Tensor, b8: torch.Tensor, sb: torch.Tensor, offs: torch.Tensor,
                E: int) -> torch.Tensor:
     """The grouped fp8 GEMM: a8 [P, K] e4m3, b8 [E, N, K] e4m3 (column-major per expert), offs [E] int32
-    cumulative row ends -> [P, N] bf16. Both scales are TensorWise singletons: what SM121's _scaled_mm
-    accepts (its row-wise scaling is rejected, and _scaled_grouped_mm is unsupported below SM100)."""
+    cumulative row ends -> [P, N] bf16. All scales are TensorWise singletons. First the Triton kernel (one
+    launch per GEMM, what the fp8 route runs on), then torch._scaled_grouped_mm, then the per-expert
+    _scaled_mm loop (the only scaling config SM121's _scaled_mm accepts; _scaled_grouped_mm is unsupported
+    below SM100)."""
+
+    if a8.is_cuda and _TRITON is None and importlib.util.find_spec("triton") is not None:
+        try:
+            from . import moe_fp8_gemm
+            return moe_fp8_gemm.grouped(a8, sa, b8, sb, offs, E)
+        except (RuntimeError, ValueError, triton_compilation_error()):
+            globals()["_TRITON"] = False
 
     ok = _grouped_ok()
     if ok:
@@ -145,6 +156,16 @@ def grouped_mm(a8: torch.Tensor, sa: torch.Tensor, b8: torch.Tensor, sb: torch.T
     return out
 
 
+_TRITON: bool | None = None
+
+
+def triton_compilation_error():
+    """Triton's compile-failure class, when triton is importable (the CPU tests run without it)."""
+
+    import triton
+    return triton.errors.CompilationError
+
+
 _GROUPED: bool | None = None
 
 
@@ -155,6 +176,16 @@ def _grouped_ok() -> bool:
     if _GROUPED is None:
         _GROUPED = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
     return _GROUPED
+
+
+def prime(device) -> None:
+    """Compile the Triton grouped GEMM and settle its fp8-dot support before any CUDA graph capture: the
+    engine calls this at Buffers creation, so first use is never inside a capture."""
+
+    if not torch.cuda.is_available() or importlib.util.find_spec("triton") is None:
+        return
+    from . import moe_fp8_gemm
+    moe_fp8_gemm.prime(device)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s: Scratch, acts, R: int,

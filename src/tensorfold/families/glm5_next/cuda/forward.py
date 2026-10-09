@@ -127,7 +127,8 @@ class Buffers:
             ex0 = next((l.moe.experts for l in w.layers
                         if l.moe is not None and hasattr(l.moe.experts, "gate_ptr")), None)
             self.fp8 = moe_fp8.Scratch(ex0, rows, slots, dev) if ex0 is not None and moe_fp8.enabled() else None
-            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
+            if self.fp8 is not None:
+                moe_fp8.prime(dev)             # compile the grouped GEMM before any CUDA graph capture
             self.ey = self.exl3.y.view(rows, slots, D)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.smg = torch.empty((rows, sl), dtype=bf, device=dev)
