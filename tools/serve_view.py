@@ -47,11 +47,16 @@ def serve_view(pack: Path, head_file: Path, out: Path, expect_sha256: str | None
         raise IsADirectoryError(f"{head_file}: pass the BF16 shard file holding lm_head.weight, not a repo")
     if "lm_head.weight" not in read_header(head_file)[0]:
         raise ValueError(f"{head_file.name} holds no lm_head.weight: pick the BF16 repo's shard that does")
-    head_out = out / "head-source.safetensors"
+    head_out = out / "lm_head.safetensors"
     if not head_out.exists():
-        head_out.symlink_to(head_file.resolve())
+        from safetensors.torch import load_file, save_file
+
+        tensors = load_file(str(head_file))
+        if "lm_head.weight" not in tensors:
+            raise ValueError(f"{head_file.name} holds no lm_head.weight after load")
+        save_file({"lm_head.weight": tensors["lm_head.weight"]}, str(head_out))
     kept = {n: f for n, f in weight_map.items() if n not in head_parts}
-    kept["lm_head.weight"] = "head-source.safetensors"
+    kept["lm_head.weight"] = "lm_head.safetensors"
     (out / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": kept, "metadata": {"format": "pt", "head_source": str(head_file)}}))
     print(f"serve view: {out} — {len(kept)} tensors, head {head_file.name} "
