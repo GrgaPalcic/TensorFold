@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -220,7 +221,9 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
 
-    if mtp_drafts is None:
+    if os.environ.get("TENSORFOLD_DRAFT_POLICY", "").strip():
+        policy = os.environ["TENSORFOLD_DRAFT_POLICY"].strip()   # e.g. fc5:0.25 — overrides the mtp_drafts default
+    elif mtp_drafts is None:
         policy = DEFAULT_POLICY
     elif int(mtp_drafts) == 0 and drafter and not no_drafts:
         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
