@@ -12,6 +12,7 @@ import triton.language as tl
 
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+from tensorfold.cuda.exl3.linear import Exl3Linear
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
@@ -55,7 +56,7 @@ class Buffers:
             self.attn = AttnScratch(1 if prefill else rows, HL, c.qk_dim, capacity, dev)
         if prefill:
             kda_layers = [l for l in w.layers if l.kind == "kda"]
-            width = kda_layers[0].kda.proj.n if kda_layers else 0
+            width = kda_layers[0].kda.out_n if kda_layers else 0
             self.kproj = torch.zeros((1, rows, width), dtype=bf, device=dev)
             self.kscratch = kda_mod.KDAScratch(rows, LL, dev)
         self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
@@ -72,6 +73,22 @@ class Buffers:
         self.xs_fa = torch.empty((rows, 2), dtype=f32, device=dev)
         self.xs_ga = torch.empty((rows, 2), dtype=f32, device=dev)
         self.kxs = torch.empty((rows, LL * 128 // 64), dtype=f32, device=dev)
+        k0 = next((l.kda for l in w.layers if l.kind == "kda"), None)
+        if k0 is not None and k0.proj is None:     # the fused q|k|v pack: one scratch per projection part
+            self.kqkv = torch.empty((rows, k0.qkv.n), dtype=bf, device=dev)
+            self.kfa = torch.empty((rows, k0.fa.n), dtype=bf, device=dev)
+            self.kga = torch.empty((rows, k0.ga.n), dtype=bf, device=dev)
+            self.kb = torch.empty((rows, k0.b.n), dtype=bf, device=dev)
+        # DSA
+        d0 = next((l.dsa for l in w.layers if l.kind == "dsa"), None)
+        if d0 is not None and d0.proj is None:     # the pack's separate q_a and kv_a groups
+            self.dqa = torch.empty((rows, d0.q_a.n), dtype=bf, device=dev)
+            self.dkv = torch.empty((rows, d0.kv_a.n), dtype=bf, device=dev)
+        # dense MLP (the pack's own gate/up groups)
+        m0 = next((l.mlp for l in w.layers if l.mlp is not None and getattr(l.mlp, "gate", None) is not None), None)
+        if m0 is not None:
+            self.mg = torch.empty((rows, m0.gate.n), dtype=bf, device=dev)
+            self.mu = torch.empty((rows, m0.up.n), dtype=bf, device=dev)
         # DSA
         self.dp = torch.empty((rows, c.q_lora + c.kv_lora), dtype=bf, device=dev)
         self.qr = torch.empty((rows, c.q_lora), dtype=bf, device=dev)
@@ -163,7 +180,7 @@ class State:
         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
         n = len(kda_layers)
-        width = kda_layers[0].kda.proj.n if kda_layers else 0
+        width = kda_layers[0].kda.out_n if kda_layers else 0
         self.conv = torch.zeros((n, c.conv - 1, 3 * LL * 128), dtype=torch.bfloat16, device=dev)
         self.rec = torch.zeros((2, n, LL, 128, 128), dtype=torch.float32, device=dev)
         self.cur = [0] * n
@@ -244,9 +261,25 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     return out.view(b.world, R, d)
 
 
+def exl3_mm(x: torch.Tensor, lin: Exl3Linear, out: torch.Tensor) -> torch.Tensor:
+    """An EXL3 dense linear: the kernel takes 1..128 rows, so a prompt chunk runs in row blocks
+    (the kernel is row-invariant, so the blocks change no bits)."""
+
+    m = x.shape[0]
+    if m <= 128:
+        return lin(x, out=out)
+    o = torch.empty((min(m, 128), lin.n), dtype=out.dtype, device=out.device)
+    for r in range(0, m, 128):
+        lin(x[r:r + 128], out=o)
+        out[r:r + 128].copy_(o)
+    return out
+
+
 def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
+    if isinstance(q, Exl3Linear):
+        return exl3_mm(x, q, out)
     if b.prefill and isinstance(q, qmm.Q4):
         return shared.prefill_matmul(x, q, f32=f32, out=out)
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
@@ -262,7 +295,17 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
     k = layer.kda
     li = st.kda_index[layer.index]
     p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
-    mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+    if k.proj is not None:
+        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+    else:                                   # the fused q|k|v pack: one part at a time into the state row
+        mm(b, b.normed[:R], k.qkv, b.xs[:R], b.kqkv[:R])
+        p[:, :k.qkv.n].copy_(b.kqkv[:R])
+        mm(b, b.normed[:R], k.fa, b.xs[:R], b.kfa[:R])
+        p[:, k.fa_off:k.fa_off + 128].copy_(b.kfa[:R])
+        mm(b, b.normed[:R], k.ga, b.xs[:R], b.kga[:R])
+        p[:, k.ga_off:k.ga_off + 128].copy_(b.kga[:R])
+        mm(b, b.normed[:R], k.b, b.xs[:R], b.kb[:R])
+        p[:, k.b_off:].copy_(b.kb[:R])
     fa = p[:, k.fa_off:k.fa_off + 128]
     ga = p[:, k.ga_off:k.ga_off + 128]
     pre = b.prefill
@@ -294,7 +337,13 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
 
     c = w.cfg
     a = layer.dsa
-    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+    if a.proj is not None:
+        mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+    else:                                   # the pack's separate q_a and kv_a groups
+        mm(b, b.normed[:R], a.q_a, b.xs[:R], b.dqa[:R])
+        mm(b, b.normed[:R], a.kv_a, b.xs[:R], b.dkv[:R])
+        b.dp[:R, :c.q_lora].copy_(b.dqa[:R])
+        b.dp[:R, c.q_lora:].copy_(b.dkv[:R])
     glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
     glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
     HL = a.heads
@@ -384,7 +433,13 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
 
 def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     m = layer.mlp
-    mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
+    if m.gu is not None:
+        mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
+    else:                                   # the pack's separate gate and up groups
+        mm(b, b.normed[:R], m.gate, b.xs[:R], b.mg[:R])
+        mm(b, b.normed[:R], m.up, b.xs[:R], b.mu[:R])
+        b.gu[:R, :m.gate.n].copy_(b.mg[:R])
+        b.gu[:R, m.gate.n:].copy_(b.mu[:R])
     glue.swiglu(b.gu[:R], b.act[:R], b.xs_act[:R], w.cfg.limit)
     return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
 
@@ -401,7 +456,13 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
         s = m.shared
-        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+        if s.gu is not None:
+            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+        else:                               # the pack's separate gate and up groups
+            mm(b, b.normed[:R], s.gate, b.xs[:R], b.mg[:R])
+            mm(b, b.normed[:R], s.up, b.xs[:R], b.mu[:R])
+            b.sgu[:R, :s.gate.n].copy_(b.mg[:R])
+            b.sgu[:R, s.gate.n:].copy_(b.mu[:R])
         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
         mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
         b.ey[:R, c.top_k].copy_(b.sy[:R])

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
+from tensorfold.cuda.exl3.linear import Exl3Linear
 from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
@@ -121,7 +121,11 @@ class HCW:
 
 @dataclass
 class KDAW:
-    proj: Q4                  # [q | k | v | f_a | g_a | b]
+    proj: Q4 | B16 | None     # [q | k | v | f_a | g_a | b] when one format serves all six
+    qkv: Exl3Linear | None    # the fused q|k|v EXL3 group (RED-SNOW's SAGE pack)
+    fa: Q4 | B16 | None       # the plain low-rank pair and b, when they split from the fused group
+    ga: Q4 | B16 | None
+    b: Q4 | B16 | None
     fb: Q4
     gb: Q4
     conv: torch.Tensor        # [3 HL 128, taps] bf16
@@ -130,6 +134,13 @@ class KDAW:
     norm: torch.Tensor        # [128] bf16
     o: Q4
     heads: int
+
+    @property
+    def out_n(self) -> int:
+        """The row width one KDA projection writes: the fused stack's, or the parts' sum."""
+
+        return self.proj.n if self.proj is not None else self.qkv.n + self.fa.n + self.ga.n + self.b.n
+
 
     @property
     def fa_off(self) -> int:
@@ -155,10 +166,9 @@ class IndexW:
     gate: torch.Tensor
     ape: torch.Tensor
 
-
 @dataclass
 class DSAW:
-    proj: Q4                  # [q_a | kv_a]
+    proj: Q4 | B16 | None     # [q_a | kv_a] when one format serves both
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     q_b: Q4
@@ -168,13 +178,19 @@ class DSAW:
     heads: int
     index: IndexW | None = None
     absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
+    q_a: Exl3Linear | None = None   # the pack's separate EXL3 groups, when they don't stack
+    kv_a: Exl3Linear | None = None
 
 
 @dataclass
 class MLPW:
-    gu: Q4                    # [gate | up]
-    down: Q4
+    gu: Q4 | B16 | None       # [gate | up] when one format serves both
+    gate: Exl3Linear | None   # the pack's separate EXL3 groups, when they don't stack
+    up: Exl3Linear | None
+    down: Q4 | B16 | Exl3Linear
     width: int
+
+
 
 
 @dataclass
@@ -287,20 +303,44 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             return stack_b16([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
+    def has(name: str) -> bool:
+        return PREFIX + name in rd.index
+
+    def exl3_linear(name: str) -> Exl3Linear:
+        """One EXL3 group (trellis, suh, svh; the pack's marker says mul1). The rank's splits are
+        already the tensor's: out-linears hold trellis tile columns and svh rows, in-linears trellis
+        tile rows and suh rows. The scales read as fp16, the form the linear kernel wants."""
+
+        return Exl3Linear.from_tensors(rd.get(PREFIX + name + ".trellis"), t(name + ".suh", torch.float16),
+                                       t(name + ".svh", torch.float16), "mul1", device=dev)
+
+    def dense(name: str) -> Q4 | B16 | Exl3Linear:
+        """A linear the pack may store as an EXL3 group (RED-SNOW) or a plain bf16 ``.weight`` (Mia's)."""
+
+        return exl3_linear(name) if has(name + ".trellis") else q4(name)
+
     def hc(i: int, site: str) -> HCW:
         return HCW(t(f"layers.{i}.hc_{site}_fn").contiguous(), t(f"layers.{i}.hc_{site}_base", torch.float32),
                    t(f"layers.{i}.hc_{site}_scale", torch.float32))
 
     def kda(i: int) -> KDAW:
         p = f"layers.{i}.self_attn."
+        conv = (torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]) if has(p + "q_conv1d.weight")
+                else t(p + "conv1d.weight")).reshape(3 * LL * 128, cfg.conv).contiguous()
+        common = (q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
+                  t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), dense(p + "o_proj"), LL)
+        if has(p + "qkv_proj.trellis"):    # RED-SNOW's SAGE pack: fused q|k|v group, plain bf16 low-rank pair
+            return KDAW(None, exl3_linear(p + "qkv_proj"), make_b16(t(p + "f_a_proj.weight")),
+                        make_b16(t(p + "g_a_proj.weight")), make_b16(t(p + "b_proj.weight")), *common)
         proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
-        conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
-        return KDAW(proj, q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
-                    t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), q4(p + "o_proj"), LL)
+        return KDAW(proj, None, None, None, None, *common)
 
     def dsa(i: int) -> DSAW:
         p = f"layers.{i}.self_attn."
-        proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
+        if has(p + "q_a_proj.trellis"):    # RED-SNOW: the two low projections are separate EXL3 groups
+            proj, q_a, kv_a = None, exl3_linear(p + "q_a_proj"), exl3_linear(p + "kv_a_proj_with_mqa")
+        else:
+            proj, q_a, kv_a = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"]), None, None
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
         if exl3:
@@ -324,12 +364,15 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
                     t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"),
                     t(p + "indexer.index_kpool_compress_gate", torch.bfloat16).contiguous(),
                     t(p + "indexer.index_kpool_compress_ape", torch.bfloat16).contiguous())
-        return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"),
-                    kv_k, kv_v, q4(p + "o_proj"), HL, ix, absorb)
+        return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), dense(p + "q_b_proj"),
+                    kv_k, kv_v, dense(p + "o_proj"), HL, ix, absorb, q_a, kv_a)
 
     def mlp(p: str) -> MLPW:
+        if has(p + "gate_proj.trellis"):   # RED-SNOW: every dense MLP linear is its own EXL3 group
+            gate, up = exl3_linear(p + "gate_proj"), exl3_linear(p + "up_proj")
+            return MLPW(None, gate, up, dense(p + "down_proj"), gate.n)
         gu = stack([p + "gate_proj", p + "up_proj"])
-        return MLPW(gu, q4(p + "down_proj"), gu.n // 2)
+        return MLPW(gu, None, None, q4(p + "down_proj"), gu.n // 2)
 
     def expert_names(i: int) -> list[str]:
         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""
@@ -438,7 +481,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         mtpw = None
         if cfg.mtp_layers and mtp:
             i = cfg.layers
-            mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
+            mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), dense(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
         w.meta.update(layers=which)
