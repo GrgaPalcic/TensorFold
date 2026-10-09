@@ -36,11 +36,11 @@ def test_tiles_divide(name, k, n, bits):
 
 
 def test_bits_of_widths():
+
     assert fmt.bits_of((256, 1536, 80)) == 5          # mul1 5-bit: RED-SNOW's mean
     assert fmt.bits_of((256, 1536, 64)) == 4
     assert fmt.bits_of((256, 1536, 96)) == 6
-    with pytest.raises(ValueError):
-        fmt.bits_of((256, 1536, 72))                  # 4.5: not in BITS yet (phase 5 open question)
+    assert fmt.bits_of((256, 1536, 72)) == 4.5        # a mul1 half-step width is legal
 
 
 def test_strips_layout_roundtrip():

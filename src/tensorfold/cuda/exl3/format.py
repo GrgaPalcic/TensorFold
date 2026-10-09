@@ -18,7 +18,7 @@ MCG_MUL, MUL1_MUL = 0xCBAC1FED, 0x83DCD12D
 MASK, FLIP = 0x8FFF8FFF, 0x3B603B60
 MUL1_SCALE, MUL1_BIAS = 0x1EEE, 0xC931                   # fp16 bit patterns
 HAD = 128
-BITS = (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8)          # every width ExLlamaV3 writes (x.5 with mul1 only)
+BITS = (1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8)   # every width ExLlamaV3 writes (x.5 with mul1 only)
 PARTS = ("trellis", "suh", "su", "svh", "sv", "mcg", "mul1", "bias")
 
 
