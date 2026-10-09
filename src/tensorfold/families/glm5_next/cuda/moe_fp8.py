@@ -110,7 +110,7 @@ def fp8_tile_reference(trellis, bits: float, cb: int, inv: float) -> torch.Tenso
 
 def stage(ex: generic.Exl3RoutedExperts, s: Scratch) -> None:
     """This layer's three expert matrices as e4m3 B tiles (column-major [N, K] per expert; gate and up share
-    one [E, 2I, D] buffer: gate at proj_off 0, up at proj_off I)."""
+    one [E, 2I, D] buffer: gate at proj_off 0, up at proj_off I * D)."""
 
     if s.staged is ex:
         return
@@ -118,7 +118,7 @@ def stage(ex: generic.Exl3RoutedExperts, s: Scratch) -> None:
     D, I, inv = ex.dims, ex.width, FP8_MAX / _codebook_max(ex.cb)
     rows = ex.gu_stride if ex.gu_stride else I >> 4
     ext.dequant_fp8(ex.gate_ptr, ex.gate_k2, s.b_gu, D, I, rows, 2 * I * D, 0, inv, ex.cb)
-    ext.dequant_fp8(ex.up_ptr, ex.up_k2, s.b_gu, D, I, rows, 2 * I * D, I, inv, ex.cb)
+    ext.dequant_fp8(ex.up_ptr, ex.up_k2, s.b_gu, D, I, rows, 2 * I * D, I * D, inv, ex.cb)
     ext.dequant_fp8(ex.down_ptr, ex.down_k2, s.b_d, I, D, D >> 4, D * I, 0, inv, ex.cb)
     s.staged = ex
 

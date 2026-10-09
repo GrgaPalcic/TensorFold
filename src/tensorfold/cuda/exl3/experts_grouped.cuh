@@ -350,11 +350,11 @@ __global__ void dequant_fp8_kernel(const int64_t* __restrict__ tp, const int* __
     }
     __syncthreads();
     if (threadIdx.x >= 64) return;
-    const uint8_t* src = &tile[threadIdx.x >> 2][(threadIdx.x & 3) << 2];
+    const uint8_t* src = &tile[threadIdx.x >> 2][(threadIdx.x & 3) << 5];
     uint8_t* dst = out + (size_t)e * stride_e + proj_off + (size_t)nt * 16 * K + (size_t)(threadIdx.x >> 2) * K;
-    const int k0 = j0 << 4, chunk = (threadIdx.x & 3) << 2;
+    const int k0 = j0 << 4, chunk = (threadIdx.x & 3) << 5;
 #pragma unroll
-    for (int j = 0; j < 32; ++j)
+    for (int j = 0; j < 8; ++j)
         *reinterpret_cast<uint32_t*>(dst + k0 + chunk + 4 * j) = *reinterpret_cast<const uint32_t*>(src + 4 * j);
 }
 
