@@ -1,12 +1,16 @@
 """--prefill-fp8 for GLM-5.3-Flash's routed EXL3 experts: the GEMMs run in e4m3 with TensorWise scales.
 
 The EXL3 GEMV is bandwidth-bound on the trellises (about 5.5 GiB a layer across TP2), so prefill keeps the
-bf16 GEMV while the GEMMs move to fp8: each layer's three expert matrices are decoded once into e4m3 B tiles
-(``dequant_fp8``, one scalar scale per matrix - e4m3's relative rounding is scale invariant), the grouped
-GEMMs run through the Triton grouped kernel (``moe_fp8_gemm``, one launch per GEMM; torch's grouped/_scaled_mm
-as fallbacks), and the shared
-expert stays a BF16 MLP. The routed path loses at most e4m3's ~2^-4 relative precision per matrix product;
-decode keeps the exact bf16 trellis GEMV.
+bf16 GEMV while the GEMMs move to fp8. Each layer's three expert matrices reach the GEMMs one of two ways:
+
+- fused (``moe_fp8_fused``, the default when its probe passes): one Triton launch per GEMM that decodes the
+  B tile straight from the expert's trellis in registers - no staging, no tile traffic, ~2.75 GiB/rank/layer
+  read once per row block;
+- staged: the matrices are decoded once into e4m3 B tiles (``dequant_fp8``, ~4.8 GB/rank/layer) and the
+  grouped GEMMs run through ``moe_fp8_gemm`` (Triton, then torch's grouped/_scaled_mm fallbacks).
+
+The shared expert stays a BF16 MLP either way. The routed path loses at most e4m3's ~2^-4 relative precision
+per matrix product; decode keeps the exact bf16 trellis GEMV.
 
 Per expert matrix (suh is Hadamard-folded into the pairs' activations by ``rot_in``, exactly as the bf16
 route does; svh folds into the epilogue):
@@ -15,8 +19,8 @@ route does; svh folds into the epilogue):
     Z = gemm(e4m3(H x suh), B8)                              (grouped, one tensor scale a matrix)
     Y = rotate(Z) * HAD_SCALE * svh                          (the epilogue's Hadamard and signs)
 
-The approximate workspace is the three e4m3 tile sets (2.4 + 1.2 GiB for 5.3-Flash on one rank) plus the
-pairs' fp8 activations, on top of the bf16 route's scratch.
+The staged route's workspace is the three e4m3 tile sets (2.4 + 1.2 GiB for 5.3-Flash on one rank) plus the
+pairs' fp8 activations, on top of the bf16 route's scratch; the fused route needs only the activations.
 """
 
 from __future__ import annotations
@@ -44,19 +48,50 @@ def enabled() -> bool:
 @lru_cache(maxsize=3)
 def _codebook_max(cb: int) -> float:
     """The largest absolute value a codebook state decodes to: the scale's bound (conservative is fine -
-    e4m3 rounding is relative, so any scale that cannot overflow gives the same ~2^-4 relative error)."""
+    e4m3 rounding is relative, so any scale that cannot overflow gives the same ~2^-4 relative error).
 
-    return float(abs(exl3_format.codebook(("3inst", "mcg", "mul1")[cb])).max())
+    mul1 (cb 2) is checked against the CUDA decode, not the numpy reference: the dp4a + hfma path rounds
+    differently (state 1 is -4.004 here, +0.641 in the numpy table) and peaks higher (5.102 vs 3.453), so
+    the numpy bound would saturate e4m3 on the largest states."""
+
+    if cb == 2:
+        from .moe_fp8_fused import cuda_codebook
+        return float(abs(cuda_codebook(2)).max())
+    return float(abs(exl3_format.codebook(("3inst", "mcg")[cb])).max())
+
+
+
+_FUSED: bool | None = None
+
+
+def _fused_ok(device) -> bool:
+    """One-time probe of the fused decode+GEMM (moe_fp8_fused.prime: compile, fp8-dot probe, tiny-GEMM
+    verify per codebook). Cached per process; False falls back to the staged tiles."""
+
+    global _FUSED
+    if _FUSED is None:
+        try:
+            from . import moe_fp8_fused
+            _FUSED = bool(moe_fp8_fused.prime(device))
+        except Exception:
+            _FUSED = False
+    return _FUSED
 
 
 class Scratch:
-    """The fp8 expert tiles of one layer at a time plus the GEMMs' tensor scale and Hadamard matrix."""
+    """The fp8 expert route's per-layer state: either the fused kernel's handles (no B tiles) or the staged
+    e4m3 tiles, plus the GEMMs' tensor scale and the Hadamard matrix."""
 
-    def __init__(self, ex: generic.Exl3RoutedExperts, rows: int, slots: int, device) -> None:
+    def __init__(self, ex: generic.Exl3RoutedExperts, rows: int, slots: int, device,
+                 fused: bool | None = None) -> None:
         E, D, I = ex.count, ex.dims, ex.width
         self.rows, self.slots = rows, slots
-        self.b_gu = torch.empty((E, 2 * I, D), dtype=torch.uint8, device=device)   # e4m3, gate | up stacked
-        self.b_d = torch.empty((E, D, I), dtype=torch.uint8, device=device)
+        self.fused = _fused_ok(device) if fused is None else fused   # probe, or the caller pins staged
+        if self.fused:                                   # the fused kernel decodes straight from the trellises
+            self.b_gu = self.b_d = None
+        else:
+            self.b_gu = torch.empty((E, 2 * I, D), dtype=torch.uint8, device=device)   # e4m3, gate | up stacked
+            self.b_d = torch.empty((E, D, I), dtype=torch.uint8, device=device)
         # tiles hold e4m3(W * inv), so dequant needs 1 / inv; one scalar covers every expert because the
         # checkpoint's experts share one codebook, whose bound is a valid tensor scale (it never overflows)
         self.b_scale = torch.full((1,), 1.0 / (FP8_MAX / _codebook_max(ex.cb)), dtype=torch.float32, device=device)
@@ -66,7 +101,8 @@ class Scratch:
     def nbytes(self) -> int:
         """The fp8 workspace's own bytes (the bf16 route's scratch is separate)."""
 
-        return self.b_gu.numel() + self.b_d.numel() + self.b_scale.numel() * 4 + self.h.numel() * 4
+        tiles = 0 if self.b_gu is None else self.b_gu.numel() + self.b_d.numel()
+        return tiles + self.b_scale.numel() * 4 + self.h.numel() * 4
 
 
 @lru_cache(maxsize=1)
@@ -179,13 +215,14 @@ def _grouped_ok() -> bool:
 
 
 def prime(device) -> None:
-    """Compile the Triton grouped GEMM and settle its fp8-dot support before any CUDA graph capture: the
+    """Compile the grouped GEMM kernels and settle their fp8-dot support before any CUDA graph capture: the
     engine calls this at Buffers creation, so first use is never inside a capture."""
 
     if not torch.cuda.is_available() or importlib.util.find_spec("triton") is None:
         return
     from . import moe_fp8_gemm
     moe_fp8_gemm.prime(device)
+    _fused_ok(device)                    # warm the fused path (no-op once the Scratch probe has run)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s: Scratch, acts, R: int,
@@ -196,6 +233,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     and up read the pairs' rotated activations (suh folded, one GEMM each), the SwiGLU keeps the bf16 route's
     roundings (act_mode 0), and down folds suh_d into its pairs' activations. TensorWise scales throughout:
     one scale a matrix (the GEMM's A scale comes from the routed pairs' amax, B's from the codebook bound).
+    The B side is the fused trellis-decode GEMM when the scratch probed clean, else the staged e4m3 tiles
+    (which this call stages when the layer changed - ``stage`` used to run only in tests).
     """
 
     D, I, E = ex.dims, ex.width, ex.count
@@ -211,9 +250,18 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     offs = counts.cumsum(0).to(torch.int32)
     a8_g, s_g = quantize_tensor(acts.xg[:P].index_select(0, order))   # the pairs' fp8 A tiles, expert order
     a8_u, s_u = quantize_tensor(acts.xu[:P].index_select(0, order))
-    b_gu = s.b_gu.view(torch.float8_e4m3fn).view(E, 2 * I, D)      # column-major [N, K] per expert
-    z_g = gemm(a8_g, s_g, b_gu[:, :I], s.b_scale, offs, E)
-    z_u = gemm(a8_u, s_u, b_gu[:, I:], s.b_scale, offs, E)
+    if s.fused:
+        # the fused kernel decodes each B tile from the trellis in registers: no staged tiles, one launch
+        from . import moe_fp8_fused
+        inv = FP8_MAX / _codebook_max(ex.cb)
+        rows_gu = ex.gu_stride if ex.gu_stride else I >> 4
+        z_g = moe_fp8_fused.grouped(a8_g, s_g, ex.gate_ptr, ex.gate_k2, rows_gu, inv, ex.cb, s.b_scale, offs, E, I)
+        z_u = moe_fp8_fused.grouped(a8_u, s_u, ex.up_ptr, ex.up_k2, rows_gu, inv, ex.cb, s.b_scale, offs, E, I)
+    else:
+        stage(ex, s)                     # the routed path is what stages the tiles
+        b_gu = s.b_gu.view(torch.float8_e4m3fn).view(E, 2 * I, D)      # column-major [N, K] per expert
+        z_g = gemm(a8_g, s_g, b_gu[:, :I], s.b_scale, offs, E)
+        z_u = gemm(a8_u, s_u, b_gu[:, I:], s.b_scale, offs, E)
     # the epilogue: Hadamard, signs, the SwiGLU with the bf16 route's roundings (act_mode 0)
     e_of = flat[order]
     gg = bf16r(rotate(z_g, s.h) * signs(ex.svh_g, e_of)).clamp_max(limit)
@@ -221,7 +269,10 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     act = bf16r(bf16r(gg * torch.sigmoid(gg)) * uu)
     xd = rotate(act * signs(ex.suh_d, e_of), s.h)
     a8_d, s_d = quantize_tensor(xd)                  # already in expert-sorted pair order
-    z = gemm(a8_d, s_d, s.b_d.view(torch.float8_e4m3fn).view(E, D, I), s.b_scale, offs, E)
+    if s.fused:
+        z = moe_fp8_fused.grouped(a8_d, s_d, ex.down_ptr, ex.down_k2, D >> 4, inv, ex.cb, s.b_scale, offs, E, D)
+    else:
+        z = gemm(a8_d, s_d, s.b_d.view(torch.float8_e4m3fn).view(E, D, I), s.b_scale, offs, E)
     # the down epilogue and the slot scatter (one fp32 write per routed pair)
     y = rotate(z, s.h) * signs(ex.svh_d, e_of)
     acts.y[:P].index_copy_(0, order, y)

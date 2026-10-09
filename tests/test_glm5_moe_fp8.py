@@ -122,8 +122,13 @@ def scenario():
 
 
 def test_the_codebook_bounds_hold():
-    for cb, name in enumerate(("3inst", "mcg", "mul1")):
+    for cb, name in enumerate(("3inst", "mcg")):
         assert moe_fp8._codebook_max(cb) == pytest.approx(abs(exl3_format.codebook(name)).max())
+    # mul1 (cb 2): the decode follows the CUDA dp4a + hfma path, which rounds differently from the numpy
+    # reference and peaks higher - the bound must cover the CUDA values or e4m3 would saturate
+    from tensorfold.families.glm5_next.cuda.moe_fp8_fused import cuda_codebook
+    assert moe_fp8._codebook_max(2) == pytest.approx(abs(cuda_codebook(2)).max())
+    assert moe_fp8._codebook_max(2) > abs(exl3_format.codebook("mul1")).max()
 
 
 def test_tensorwise_e4m3_keeps_the_normal_values():
@@ -205,7 +210,7 @@ def test_the_dequant_fp8_kernel_decodes_to_the_reference_tiles():
                            up_ptr=torch.tensor([t.data_ptr() for t in tu], dtype=torch.int64, device=dev),
                            down_ptr=torch.tensor([t.data_ptr() for t in td], dtype=torch.int64, device=dev),
                            gate_k2=k2, up_k2=k2, down_k2=k2, count=E, dims=D, width=I, cb=0, gu_stride=0)
-    s = moe_fp8.Scratch(stub, 4, SLOTS, dev)
+    s = moe_fp8.Scratch(stub, 4, SLOTS, dev, fused=False)      # this test checks the staged tiles
     moe_fp8.stage(stub, s)
     inv = moe_fp8.FP8_MAX / moe_fp8._codebook_max(ex.cb)
     for e in range(E):
@@ -215,3 +220,25 @@ def test_the_dequant_fp8_kernel_decodes_to_the_reference_tiles():
             f"expert {e}: the kernel's up tile differs from the reference"
         assert torch.equal(s.b_d[e].cpu(), moe_fp8.fp8_tile_reference(ex.td[e], ex.bits, ex.cb, inv)), \
             f"expert {e}: the kernel's down tile differs from the reference"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the fused Triton kernel)")
+@pytest.mark.parametrize("k2", [4, 5, 12])
+@pytest.mark.parametrize("cb", [0, 1, 2])
+def test_the_fused_kernel_decodes_from_the_trellis(k2, cb):
+    """The fused kernel's tiny GEMM against the numpy decode (``_verify``): the packed window table, the
+    in-register codebook, the pointer cast and the ragged masking, over three codebooks and k2 shapes, with
+    an empty expert segment in the schedule."""
+
+    from tensorfold.families.glm5_next.cuda import moe_fp8_fused
+    moe_fp8_fused._verify("cuda", cb, k2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the fused Triton kernel)")
+def test_the_fused_scratch_skips_the_tiles():
+    """When the fused probe passes, the scratch holds no B tiles (that is the memory win)."""
+
+    stub = SimpleNamespace(count=E, dims=D, width=I, cb=0)
+    s = moe_fp8.Scratch(stub, 4, SLOTS, "cuda", fused=True)
+    assert s.b_gu is None and s.b_d is None
+    assert s.nbytes() == 4 + 128 * 128 * 4
