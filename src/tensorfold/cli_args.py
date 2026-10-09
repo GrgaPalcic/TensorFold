@@ -133,7 +133,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                       help="with --tp 2 or 4: this machine's rank; rank 0 serves HTTP, the others follow it")
     cuda.add_argument("--master", default="", help="with --tp 2 or 4: rank 0's address on the link between the machines")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2 or 4: rank 0's rendezvous port")
-    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
+    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4", "fp8"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
