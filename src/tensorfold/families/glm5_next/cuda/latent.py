@@ -248,11 +248,13 @@ def _dense_chunks(QA, LC, SC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
         for t in range(CH // KTT):
             ki = start + t * KTT + tl.arange(0, KTT)
             ok = ki <= limit
-            kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0)
             if FP8:
-                kv = (kv.to(tl.float32) * tl.load(SC + ki, mask=ok, other=1.0)[:, None]).to(tl.bfloat16)
+                # triton 3.8 cannot take an int ``other`` on an fp8 load: mask after the float conversion
+                kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0.0)
+                kv = (kv.to(tl.float32) * tl.load(SC + ki, mask=ok, other=1.0)[:, None])
+                kv = tl.where(ok[:, None], kv, 0.0).to(tl.bfloat16)
             else:
-                kv = kv.to(tl.bfloat16)
+                kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
             m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
     base = (c * R + r) * H + hh
     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
@@ -280,11 +282,12 @@ def _sparse_chunks(QA, LC, SC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
             idx = c * CH + t * KTT + tl.arange(0, KTT)
             ok = idx < n
             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
-            kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0)
             if FP8:
-                kv = (kv.to(tl.float32) * tl.load(SC + tok, mask=ok, other=1.0)[:, None]).to(tl.bfloat16)
+                kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0.0)
+                kv = (kv.to(tl.float32) * tl.load(SC + tok, mask=ok, other=1.0)[:, None])
+                kv = tl.where(ok[:, None], kv, 0.0).to(tl.bfloat16)
             else:
-                kv = kv.to(tl.bfloat16)
+                kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
             m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
     base = (c * R + r) * H + hh
     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
