@@ -64,6 +64,7 @@ class Config:
     mtp_layers: int
     group_size: int
     bits: int
+    codebook: str = "mcg"      # the EXL3 codebook: Mia's packs "mcg", RED-SNOW's SAGE "mul1"
     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
 
     @classmethod
@@ -102,7 +103,8 @@ class Config:
             index_topk=int(t.get("index_topk", 2048)), kpool=int(t.get("index_kpool", 4)),
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
-            bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
+            bits=bits_of(quant), codebook=str(quant.get("codebook") or "mcg"),
+            quant=str(quant.get("quant_method") or "mlx").lower(),
         )
 
     @property
@@ -307,12 +309,11 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         return PREFIX + name in rd.index
 
     def exl3_linear(name: str) -> Exl3Linear:
-        """One EXL3 group (trellis, suh, svh; the pack's marker says mul1). The rank's splits are
-        already the tensor's: out-linears hold trellis tile columns and svh rows, in-linears trellis
-        tile rows and suh rows. The scales read as fp16, the form the linear kernel wants."""
-
+        """One EXL3 group (trellis, suh, svh). The rank's splits are already the tensor's:
+        out-linears hold trellis tile columns and svh rows, in-linears trellis tile rows and
+        suh rows. The scales read as fp16, the form the linear kernel wants."""
         return Exl3Linear.from_tensors(rd.get(PREFIX + name + ".trellis"), t(name + ".suh", torch.float16),
-                                       t(name + ".svh", torch.float16), "mul1", device=dev)
+                                       t(name + ".svh", torch.float16), cfg.codebook, device=dev)
 
     def dense(name: str) -> Q4 | B16 | Exl3Linear:
         """A linear the pack may store as an EXL3 group (RED-SNOW) or a plain bf16 ``.weight`` (Mia's)."""
@@ -410,7 +411,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             [(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.suh").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.svh").to(dev)) for e in range(cfg.experts)],
-            "mcg", device=dev)
+            cfg.codebook, device=dev)
         return gate
 
     def moe(i: int) -> MoEW:
