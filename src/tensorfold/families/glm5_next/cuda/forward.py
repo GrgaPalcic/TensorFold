@@ -189,6 +189,7 @@ class State:
         self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
         self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
         self.scratch = self.scratch_set.views if n else []
+        self.latent = latent.ENABLED
         if fp8 and not self.latent:
             raise ValueError("fp8 KV needs the latent cache (TF_GLM_LATENT=1)")
         self.kv_fp8 = fp8
