@@ -84,7 +84,7 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = ()) -> None:
+                 taps: tuple[int, ...] = (), fp8: bool = False) -> None:
         self.w = w
         w.meta["long_context"] = long_context
         self.rows, self.prefill_rows = max_rows, prefill_rows
@@ -94,7 +94,7 @@ class Engine:
             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
         self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
-        self.st = State(w, capacity, max_rows)
+        self.st = State(w, capacity, max_rows, fp8=fp8)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = w.head.n
@@ -280,13 +280,18 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
 
 def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
     """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
-    views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+    views = [kc[:n] for kc in st.kc]
+    if getattr(st, "kv_fp8", False):
+        views += [s[:n] for s in st.lat_scales]
+    views += [vc[:n] for vc in st.vc if vc is not None]
     idx = st.index or []
     main_idx = idx[:len(st.kc)]
     for ik, ig, pk in main_idx:
         views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
+        if getattr(st, "kv_fp8", False) and getattr(st, "mtp_scales", None) is not None:
+            views.append(st.mtp_scales[:m])
         if getattr(st, "mtp_vc", None) is not None:
             views.append(st.mtp_vc[:m])
         if len(idx) > len(st.kc):

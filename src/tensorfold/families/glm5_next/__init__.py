@@ -204,10 +204,13 @@ def memory_fraction(ram_bytes: int) -> float | None:
 
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
 CUDA_QUANTIZATION = (4, 64)
+# the CUDA engine's latent KV cache dtypes (serve_options validates --kv-dtype against these)
+CUDA_KV_DTYPES = ("bf16", "fp8")
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
+                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
+                kv_dtype: str = "bf16", **options: Any):
     """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
 
     if int(tp) != 2:
@@ -223,10 +226,12 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
     else:
         policy = str(int(mtp_drafts))
+    if kv_dtype not in CUDA_KV_DTYPES:
+        raise ValueError(f"kv-dtype {kv_dtype!r}: this engine serves {' or '.join(CUDA_KV_DTYPES)}")
     return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
                      drafter=Path(drafter) if drafter and not no_drafts else None,
                      context=options.get("context"), context_explicit=options.get("context_explicit"),
-                     serial_only=bool(no_drafts))
+                     serial_only=bool(no_drafts), kv_dtype=kv_dtype)
 
 
 def __getattr__(name: str) -> Any:

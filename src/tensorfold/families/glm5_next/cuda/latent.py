@@ -188,17 +188,27 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------------------------------------------ caches ---
 
 @triton.jit
-def _lat_write(LAT, lat_stride, LC, POS, LW: tl.constexpr):
+def _lat_write(LAT, lat_stride, LC, POS, SC, LW: tl.constexpr, FP8: tl.constexpr):
     r = tl.program_id(0)
     P = tl.load(POS).to(tl.int64)
     k = tl.arange(0, LW)
-    tl.store(LC + (P + r) * LW + k, tl.load(LAT + r * lat_stride + k))
+    if FP8:
+        row = tl.load(LAT + r * lat_stride + k).to(tl.float32)
+        amax = tl.max(tl.abs(row), 0)
+        s = tl.where(amax > 0, amax / 448.0, 1.0)       # e4m3fn's 448: the row's largest value fills the range
+        tl.store(SC + P + r, s)
+        tl.store(LC + (P + r) * LW + k, (row / s).to(tl.float8e4nv))
+    else:
+        tl.store(LC + (P + r) * LW + k, tl.load(LAT + r * lat_stride + k))
 
 
-def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor) -> None:
-    """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device)."""
-    _lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, pos, LW=cache.shape[1], num_warps=4)
-
+def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor,
+                 scales: torch.Tensor | None = None) -> None:
+    """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device); with ``scales``
+    (fp32 [capacity]) the cache holds e4m3fn rows and a per-token f32 scale (amax / 448) is written too."""
+    fp8 = scales is not None
+    _lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, pos, scales if fp8 else cache, LW=cache.shape[1],
+                                FP8=fp8, num_warps=4)
 
 # --------------------------------------------------------------------------------------------- attention ---
 
@@ -218,8 +228,8 @@ def _tile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
 
 
 @triton.jit
-def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
-                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
+def _dense_chunks(QA, LC, SC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, FP8: tl.constexpr):
     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH)."""
     r = tl.program_id(0)
     hb = tl.program_id(1)
@@ -238,7 +248,11 @@ def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
         for t in range(CH // KTT):
             ki = start + t * KTT + tl.arange(0, KTT)
             ok = ki <= limit
-            kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+            kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0)
+            if FP8:
+                kv = (kv.to(tl.float32) * tl.load(SC + ki, mask=ok, other=1.0)[:, None]).to(tl.bfloat16)
+            else:
+                kv = kv.to(tl.bfloat16)
             m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
     base = (c * R + r) * H + hh
     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
@@ -247,8 +261,8 @@ def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
 
 
 @triton.jit
-def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
-                   CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
+def _sparse_chunks(QA, LC, SC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                   CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, FP8: tl.constexpr):
     """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order."""
     r = tl.program_id(0)
     hb = tl.program_id(1)
@@ -266,7 +280,11 @@ def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.const
             idx = c * CH + t * KTT + tl.arange(0, KTT)
             ok = idx < n
             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
-            kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+            kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0)
+            if FP8:
+                kv = (kv.to(tl.float32) * tl.load(SC + tok, mask=ok, other=1.0)[:, None]).to(tl.bfloat16)
+            else:
+                kv = kv.to(tl.bfloat16)
             m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
     base = (c * R + r) * H + hh
     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
@@ -316,8 +334,10 @@ class LatentScratch:
 
 
 def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: LatentScratch, *, scale: float,
-              nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
-    """Dense causal attention of qa [R, H, 512] through pos + R - 1 in nch 512-key chunks; a row ignores the others."""
+              nch: int, out: torch.Tensor, hb: int | None = None,
+              scales: torch.Tensor | None = None) -> torch.Tensor:
+    """Dense causal attention of qa [R, H, 512] through pos + R - 1 in nch 512-key chunks; a row ignores the others.
+    ``scales``: fp32 [capacity] per-token scales for an e4m3fn cache (None: a bf16 cache)."""
     R, H, LW = qa.shape
     if nch > s.nch or R > s.part_rows or LW != s.lw:
         raise ValueError(f"latent attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
@@ -326,15 +346,18 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
     hb = head_block(R) if hb is None else hb
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
-    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
+    fp8 = scales is not None
+    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if fp8 else cache, pos, s.po[:n * LW], s.pm[:n],
+                                                s.pl[:n], R, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
+                                                FP8=fp8, num_warps=8, num_stages=1)
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
 
 def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
-                     out: torch.Tensor, scale: float) -> None:
-    """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone."""
+                     out: torch.Tensor, scale: float, scales: torch.Tensor | None = None) -> None:
+    """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone.
+    ``scales``: fp32 [capacity] per-token scales for an e4m3fn cache (None: a bf16 cache)."""
     R, H, LW = qa.shape
     W = tokens.shape[1]
     nch = triton.cdiv(W, CHUNK)
@@ -343,8 +366,10 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
     hb = head_block(R)
-    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
+    fp8 = scales is not None
+    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if fp8 else cache, tokens, counts, po, pm, pl, R,
+                                                 W=W, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
+                                                 FP8=fp8, num_warps=8, num_stages=1)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 
