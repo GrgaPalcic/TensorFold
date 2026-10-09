@@ -272,8 +272,9 @@ def exl3_mm(x: torch.Tensor, lin: Exl3Linear, out: torch.Tensor) -> torch.Tensor
         return lin(x, out=out)
     o = torch.empty((min(m, 128), lin.n), dtype=out.dtype, device=out.device)
     for r in range(0, m, 128):
-        lin(x[r:r + 128], out=o)
-        out[r:r + 128].copy_(o)
+        n = min(m - r, 128)
+        lin(x[r:r + n], out=o[:n])
+        out[r:r + n].copy_(o[:n])
     return out
 
 
