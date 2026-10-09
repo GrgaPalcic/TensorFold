@@ -17,8 +17,10 @@ KERNEL_DEPENDENCIES = ("tensorfold.kernels.qwen.flash_next.v1.prefill_mm",)
 KERNEL_VERSION = "v1"
 # the storage formats each engine reads: MLX affine on a Mac; that or EXL3 routed experts on CUDA
 QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
-# the EXL3 variant the CUDA kernels read (4-bit trellis, the "mcg" codebook, routed experts only)
+# the EXL3 variants the CUDA kernels read: Mia's (4-bit trellis, "mcg", routed experts only) and
+# RED-SNOW's (config "bits 5" average, "mul1" codebook, dense+routed groups; per-tensor 6-8 bits)
 EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
+EXL3_VARIANTS = (EXL3_VARIANT, {"bits": 5, "codebook": "mul1", "scope": None})
 # buffers of 200 ops and 200 MB, so a prompt chunk's memory frees as it runs; no TF32: row kernels repeat fp32
 MLX_ENV = {"MLX_MAX_OPS_PER_BUFFER": "200", "MLX_MAX_MB_PER_BUFFER": "200", "MLX_ENABLE_TF32": "0"}
 
@@ -46,10 +48,12 @@ def check(model_dir: str | Path) -> None:
     if method == "exl3":
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
-        got = {k: found.get(k) for k in EXL3_VARIANT}
-        if {k: (int(v) if k == "bits" and v is not None else v) for k, v in got.items()} != EXL3_VARIANT:
+        got = {k: (int(v) if k == "bits" and v is not None else v)
+               for k, v in {k: found.get(k) for k in EXL3_VARIANT}.items()}
+        if got not in EXL3_VARIANTS:
             raise ValueError(f"GLM-5.3-Flash's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed "
-                             f"experts and BF16 elsewhere ({MODELS[1]}); this one has "
+                             f"experts and BF16 elsewhere ({MODELS[1]}), or the RED-SNOW 5-bit mul1 SAGE pack "
+                             f"(per-tensor 6-8 bits); this one has "
                              + ", ".join(f"{k} {v}" for k, v in got.items()) + f". {OWN_MODEL_HELP}")
         print("[tensorfold] EXL3 support is experimental: replies are exact, but the MLX checkpoint "
               f"({MODELS[0]}) is tested more and runs faster (docs/recipes/glm-5.3-flash.md)", flush=True)
