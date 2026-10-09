@@ -314,12 +314,20 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def has(name: str) -> bool:
         return PREFIX + name in rd.index
 
+    def as_int16(t: torch.Tensor) -> torch.Tensor:
+        """GLM-family packs may store trellis words as 4-byte (int32/uint32) pairs — half as
+        many words, the same bytes. Every EXL3 consumer wants the int16 view; a rank's byte
+        slice is the same either way, so view after slicing."""
+
+        return t.view(torch.int16) if t.element_size() == 4 else t
+
     def exl3_linear(name: str) -> Exl3Linear:
         """One EXL3 group (trellis, suh, svh). The rank's splits are already the tensor's:
         out-linears hold trellis tile columns and svh rows, in-linears trellis tile rows and
         suh rows. The scales read as fp16, the form the linear kernel wants."""
 
-        return Exl3Linear.from_tensors(rd.get(PREFIX + name + ".trellis"), t(name + ".suh", torch.float16),
+        return Exl3Linear.from_tensors(as_int16(rd.get(PREFIX + name + ".trellis")),
+                                       t(name + ".suh", torch.float16),
                                        t(name + ".svh", torch.float16), cfg.codebook, device=dev)
 
     def exl3_qkv(name: str) -> Exl3Linear:
@@ -328,7 +336,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         [q|k|v] linear the chain kernel reads. The q|k|v order is the pack fusion order; the
         layer-parity phase is what catches a differently ordered pack."""
 
-        trellis = rd.get(PREFIX + name + ".trellis")            # [K/16, 3N/16, words]
+        trellis = as_int16(rd.get(PREFIX + name + ".trellis"))  # [K/16, 3N/16, words] in the int16 view
         suh = t(name + ".suh", torch.float16)                   # [K]: input scales, already whole
         svh = rd.get(PREFIX + name + ".svh")                    # [3N]: output scales per block
         t_runs = fused_rank_runs(trellis.shape[1], 3, rank, world)
@@ -427,13 +435,13 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def moe_exl3(p: str) -> Exl3Experts:
         from tensorfold.cuda.exl3 import experts as generic
         gate = generic.prepare(
-            [(rd.get(PREFIX + p + f"experts.{e}.gate_proj.trellis").to(dev),
+            [(as_int16(rd.get(PREFIX + p + f"experts.{e}.gate_proj.trellis")).to(dev),
               rd.get(PREFIX + p + f"experts.{e}.gate_proj.suh").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.gate_proj.svh").to(dev)) for e in range(cfg.experts)],
-            [(rd.get(PREFIX + p + f"experts.{e}.up_proj.trellis").to(dev),
+            [(as_int16(rd.get(PREFIX + p + f"experts.{e}.up_proj.trellis")).to(dev),
               rd.get(PREFIX + p + f"experts.{e}.up_proj.suh").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.up_proj.svh").to(dev)) for e in range(cfg.experts)],
-            [(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis").to(dev),
+            [(as_int16(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis")).to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.suh").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.svh").to(dev)) for e in range(cfg.experts)],
             cfg.codebook, device=dev)
