@@ -13,8 +13,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from tensorfold.families.glm5_next.cuda.split import read_header      # noqa: E402
 
 
 def serve_view(pack: Path, head_file: Path, out: Path, expect_sha256: str | None = None) -> None:
@@ -40,16 +43,15 @@ def serve_view(pack: Path, head_file: Path, out: Path, expect_sha256: str | None
                  "chat_template.jinja"):
         if (pack / name).exists() and not (out / name).exists():
             (out / name).symlink_to((pack / name).resolve())
-    head_out = out / "lm_head.safetensors"
     if head_file.is_dir():
-        raise IsADirectoryError(f"{head_file}: pass the BF16 file holding lm_head.weight, not a repo")
+        raise IsADirectoryError(f"{head_file}: pass the BF16 shard file holding lm_head.weight, not a repo")
+    if "lm_head.weight" not in read_header(head_file)[0]:
+        raise ValueError(f"{head_file.name} holds no lm_head.weight: pick the BF16 repo's shard that does")
+    head_out = out / "head-source.safetensors"
     if not head_out.exists():
-        if head_out.parent.samefile(head_file.parent):
-            head_out.symlink_to(head_file.resolve())
-        else:                                   # cheap enough once (1.2 GiB) and safe against source edits
-            shutil.copyfile(head_file, head_out)
+        head_out.symlink_to(head_file.resolve())
     kept = {n: f for n, f in weight_map.items() if n not in head_parts}
-    kept["lm_head.weight"] = "lm_head.safetensors"
+    kept["lm_head.weight"] = "head-source.safetensors"
     (out / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": kept, "metadata": {"format": "pt", "head_source": str(head_file)}}))
     print(f"serve view: {out} — {len(kept)} tensors, head {head_file.name} "

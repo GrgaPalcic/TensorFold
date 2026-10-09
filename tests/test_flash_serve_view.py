@@ -40,10 +40,11 @@ def test_serve_view_replaces_head(pack_with_head, tmp_path):
     serve_view(pack, head_file, out)
     index = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
     assert "lm_head.weight" in index and not any(n.startswith("lm_head.") and n != "lm_head.weight" for n in index)
-    assert index["lm_head.weight"] == "lm_head.safetensors"
+    assert index["lm_head.weight"] == "head-source.safetensors"
     assert index[f"{L}.input_layernorm.weight"] == "shard.safetensors"
     assert (out / "shard.safetensors").is_symlink()                      # pack bytes never copied
-    assert load_file(str(out / "lm_head.safetensors"))["lm_head.weight"].tobytes() == head.tobytes()
+    assert (out / "head-source.safetensors").is_symlink()                # the BF16 shard linked, not copied
+    assert load_file(str(out / "head-source.safetensors"))["lm_head.weight"].tobytes() == head.tobytes()
 
 
 def test_serve_view_readable_by_rankreader(pack_with_head, tmp_path):
