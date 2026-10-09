@@ -207,7 +207,8 @@ def memory_fraction(ram_bytes: int) -> float | None:
 CUDA_QUANTIZATION = (4, 64)
 # the CUDA engine's latent KV cache dtypes (serve_options validates --kv-dtype against these)
 CUDA_KV_DTYPES = ("bf16", "fp8")
-
+# --prefill-fp8: the EXL3 checkpoint's routed experts have an FP8 prompt route (moe_fp8); the MLX checkpoint has none
+CUDA_PREFILL_FP8 = True
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,

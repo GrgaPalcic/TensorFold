@@ -370,3 +370,28 @@ void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
         (int)slots);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+void exl3x_dequant_fp8_cuda(const at::Tensor& TP, const at::Tensor& k2s, at::Tensor& out, int64_t K, int64_t N,
+                            int64_t row_tiles, int64_t stride_e, int64_t proj_off, double inv, int64_t cb) {
+    const int E = (int)TP.size(0);
+    TORCH_CHECK(N % 16 == 0 && K % 128 == 0, "fp8 dequant: K % 128 == 0 and N % 16 == 0");
+    TORCH_CHECK(row_tiles == 0 || row_tiles >= N / 16, "row_tiles (trellis stride in tiles) must be 0 or >= N/16");
+    TORCH_CHECK(k2s.is_cuda() && k2s.scalar_type() == at::kInt && k2s.is_contiguous() && k2s.numel() == E,
+                "k2s: int32 [E]");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kByte && out.is_contiguous() &&
+                out.numel() >= E * stride_e, "out: uint8 [E, stride_e + proj_off * ...] of e4m3 bytes");
+    c10::cuda::CUDAGuard guard(TP.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    switch (cb) {
+        case 0: tf_exl3x::dequant_fp8_launch<0>(TP.data_ptr<int64_t>(), k2s.data_ptr<int>(),
+                                                out.data_ptr<uint8_t>(), E, (int)K, (int)N, (int)row_tiles,
+                                                (int64_t)stride_e, (int64_t)proj_off, (float)inv, stream); break;
+        case 1: tf_exl3x::dequant_fp8_launch<1>(TP.data_ptr<int64_t>(), k2s.data_ptr<int>(),
+                                                out.data_ptr<uint8_t>(), E, (int)K, (int)N, (int)row_tiles,
+                                                (int64_t)stride_e, (int64_t)proj_off, (float)inv, stream); break;
+        default: tf_exl3x::dequant_fp8_launch<2>(TP.data_ptr<int64_t>(), k2s.data_ptr<int>(),
+                                                 out.data_ptr<uint8_t>(), E, (int)K, (int)N, (int)row_tiles,
+                                                 (int64_t)stride_e, (int64_t)proj_off, (float)inv, stream); break;
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

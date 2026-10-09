@@ -6,6 +6,8 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t, int64_t);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3x_dequant_fp8_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+                            int64_t, double, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
@@ -55,6 +57,20 @@ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
     TORCH_CHECK(out.numel() == K * N, "out must be [K, N]");
     c10::cuda::CUDAGuard guard(T.device());
     exl3x_dequant_cuda(T, out, K, N, k2, cb);
+}
+
+// One expert matrix's trellis decoded to e4m3 bytes with one scalar scale: the fp8 grouped GEMM's
+// column-major B tile. TP int64 [E] of trellis pointers; k2s int32 [E] bits per expert; out uint8, the bytes
+// written at e * stride_e + proj_off + col * K + row (proj_off splits a fused gate|up buffer into projections).
+void dequant_fp8(const at::Tensor& TP, const at::Tensor& k2s, at::Tensor out, int64_t K, int64_t N, int64_t row_tiles,
+                 int64_t stride_e, int64_t proj_off, double inv, int64_t cb) {
+    TORCH_CHECK(TP.is_cuda() && TP.scalar_type() == at::kLong && TP.is_contiguous() && TP.dim() == 1,
+                "TP: int64 [E] of trellis pointers");
+    const int64_t E = TP.size(0);
+    TORCH_CHECK(row_tiles > 0 && (K % 128) == 0 && (N % 16) == 0, "K % 128 == 0 and N % 16 == 0 required");
+    TORCH_CHECK(proj_off >= 0 && proj_off + N <= stride_e, "projection must fit the expert's tile row stride");
+    c10::cuda::CUDAGuard guard(TP.device());
+    exl3x_dequant_fp8_cuda(TP, k2s, out, K, N, row_tiles, stride_e, proj_off, inv, cb);
 }
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
@@ -134,6 +150,7 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("dequant", &dequant);
+    m.def("dequant_fp8", &dequant_fp8);
     m.def("group", &group);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);

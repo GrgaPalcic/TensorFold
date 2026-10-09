@@ -11,7 +11,10 @@ On CUDA GLM-5.3-Flash runs on two ranks from Brandon M. Music's EXL3/TR3 checkpo
 (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, re-hosted as `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`; experimental;
 [EXL3](#exl3)) or from the MLX 4-bit checkpoint, the portable option that a 256 GB Mac serves too.
 No NVFP4 checkpoint of it is read. `tensorfold serve` loads the checkpoint you name; it picks none by itself. Prompt
-precision does not change here: neither checkpoint has an FP8 prompt kernel, so `--prefill-fp8` is refused.
+precision: an EXL3 checkpoint accepts `--prefill-fp8`, which keeps the routed experts' prefill GEMMs in e4m3
+(decode stays exact bf16; the dense layers and the shared expert keep their bf16 prefill). It is approximate -
+expect prompt logits to drift slightly - and it needs about 4.7 GiB more prefill workspace. The MLX 4-bit
+checkpoint has no FP8 prompt kernel, so it refuses the flag.
 
 Use the [two-rank container setup](../../RUNBOOK.md#nvidia-gpus) and pull the same checkpoint on both ranks:
 

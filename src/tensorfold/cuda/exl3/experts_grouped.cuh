@@ -1,7 +1,7 @@
 // Grouped EXL3 expert GEMV (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): rows stay independent, K ranges fixed by shape, warps summed in order.
 #pragma once
 
-#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -305,7 +305,67 @@ __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict_
     }
 }
 
-struct GroupedArgs {
+// e4m3 of a decoded tile value: round-to-nearest, saturating at the fp8 GEMM's codebook ceiling (moe_fp8.py).
+__device__ __forceinline__ uint8_t e4m3(float v) { return __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3); }
+
+// One warp decodes a 16x16 tile into the block's [16 n][128 k] byte slab (values already scaled to e4m3).
+template <int CB, int K2>
+__device__ __forceinline__ void fp8_tile(const uint32_t* T, int row_tiles, uint8_t (&tile)[16][128], int kt, int nt,
+                                         int j, int lane, float inv) {
+    uint32_t w[Fmt<K2>::LW];
+    load_words<K2>(w, T + ((size_t)kt * row_tiles + nt) * Fmt<K2>::TW + lane, lane);
+    const LaneMap<K2> map(lane);
+    uint32_t b0[2], b1[2];
+    decode_tile<CB, K2>(w, map, lane, b0, b1);
+    const int g = lane >> 2, t = lane & 3;
+    uint32_t v[4] = {b0[0], b0[1], b1[0], b1[1]};
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        half2 h = *reinterpret_cast<half2*>(&v[q]);
+        const int col = g + 8 * (q >> 1), row = j * 16 + 2 * t + 8 * (q & 1);
+        tile[col][row] = e4m3(__low2float(h) * inv);
+        tile[col][row + 1] = e4m3(__high2float(h) * inv);
+    }
+}
+
+// One expert matrix's trellis decoded to e4m3 bytes: the fp8 grouped GEMM's column-major B tile [N, K]
+// (families/glm5_next/cuda/moe_fp8.py). A block (128 threads) decodes the 8 k-tiles of one 16-column group
+// into a shared slab and stores it in 16-byte-per-column runs instead of scattered single bytes.
+template <int CB>
+__global__ void dequant_fp8_kernel(const int64_t* __restrict__ tp, const int* __restrict__ k2s,
+                                   uint8_t* __restrict__ out, int K, int N, int row_tiles, int64_t stride_e,
+                                   int64_t proj_off, float inv) {
+    const int e = blockIdx.x, nt = blockIdx.y, j0 = blockIdx.z << 3, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    __shared__ uint8_t tile[16][128];
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(tp[e]);
+    const int k2 = k2s[e];
+    for (int j = 2 * warp; j < 2 * warp + 2; ++j) {
+        switch (k2) {
+#define TF_F8(K2_) case K2_: fp8_tile<CB, K2_>(T, row_tiles, tile, j0 + j, nt, j, lane, inv); break;
+            TF_F8(2) TF_F8(3) TF_F8(4) TF_F8(5) TF_F8(6) TF_F8(7) TF_F8(8) TF_F8(9) TF_F8(10) TF_F8(11)
+            TF_F8(12) TF_F8(13) TF_F8(14) TF_F8(15) TF_F8(16)
+#undef TF_F8
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x >= 64) return;
+    const uint8_t* src = &tile[threadIdx.x >> 2][(threadIdx.x & 3) << 2];
+    uint8_t* dst = out + (size_t)e * stride_e + proj_off + (size_t)nt * 16 * K + (size_t)(threadIdx.x >> 2) * K;
+    const int k0 = j0 << 4, chunk = (threadIdx.x & 3) << 2;
+#pragma unroll
+    for (int j = 0; j < 32; ++j)
+        *reinterpret_cast<uint32_t*>(dst + k0 + chunk + 4 * j) = *reinterpret_cast<const uint32_t*>(src + 4 * j);
+}
+
+template <int CB>
+void dequant_fp8_launch(const int64_t* tp, const int* k2s, uint8_t* out, int E, int K, int N, int row_tiles,
+                        int64_t stride_e, int64_t proj_off, float inv, cudaStream_t stream) {
+    dim3 grid((unsigned)E, (unsigned)(N >> 4), (unsigned)(K >> 7));
+    dequant_fp8_kernel<CB><<<grid, 128, 0, stream>>>(tp, k2s, out, K, N, row_tiles, stride_e, proj_off, inv);
+}
+
+ struct GroupedArgs {
     const half* x0;
     const half* x1;
     const int64_t* tp0;

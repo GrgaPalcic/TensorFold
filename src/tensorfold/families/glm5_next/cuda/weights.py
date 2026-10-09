@@ -248,6 +248,12 @@ class Weights:
     draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
 
     @property
+    def fast_prefill(self) -> bool:
+        """Whether the checkpoint's routed experts have an FP8 prompt kernel (run when prompts take FP8)."""
+
+        return self.cfg.quant == "exl3"
+
+    @property
     def vocab_offset(self) -> int:
         return self.rank * (self.cfg.vocab // self.world)
 

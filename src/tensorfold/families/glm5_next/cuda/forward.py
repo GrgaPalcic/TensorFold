@@ -13,6 +13,7 @@ import triton.language as tl
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.exl3.linear import Exl3Linear
+from . import moe_fp8
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
@@ -119,9 +120,13 @@ class Buffers:
         self.ey = None if exl3 else torch.empty((rows, slots, D), dtype=bf if prefill else f32, device=dev)
         self.plan = None if exl3 else grouped.Plan(rows, slots, c.experts + 1, dev, prefill=prefill)
         self.exl3 = None
+        self.fp8 = None
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+            ex0 = next((l.moe.experts for l in w.layers
+                        if l.moe is not None and hasattr(l.moe.experts, "gate_ptr")), None)
+            self.fp8 = moe_fp8.Scratch(ex0, rows, slots, dev) if ex0 is not None and moe_fp8.enabled() else None
             self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
             self.ey = self.exl3.y.view(rows, slots, D)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
@@ -472,8 +477,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         if m.shared is None:
             grouped.route(b.pick[:R], b.plan)
     if m.shared is not None:
-        # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+        # EXL3: the routed slots through the trellis kernels (the GEMMs in fp8 when prompts take FP8), the
+        # shared expert (last slot) through BF16 matmuls
+        if b.fp8 is not None:
+            moe_fp8.routed(b.normed[:R], b.pick[:R], m.experts, b.fp8, b.exl3, R, c.limit)
+        else:
+            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
         s = m.shared
         if s.gu is not None:
             mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
