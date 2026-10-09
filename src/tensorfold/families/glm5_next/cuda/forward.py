@@ -481,7 +481,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         # shared expert (last slot) through BF16 matmuls
         # fp8 route: prefill chunks only — the captured decode path (R <= MAX_ROWS) stays exact bf16 and
         # capture-legal (routed() syncs on host, which is illegal inside a graph)
-        if b.fp8 is not None and R > MAX_ROWS:
+        if b.fp8 is not None and R > 8:      # engine's MAX_ROWS: the widest captured verify window
             moe_fp8.routed(b.normed[:R], b.pick[:R], m.experts, b.fp8, b.exl3, R, c.limit)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
