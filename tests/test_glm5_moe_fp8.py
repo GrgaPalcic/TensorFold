@@ -58,15 +58,15 @@ def reference_gemm(a8, sa, b8, sb, offs, total_e):
     for e in range(total_e):
         end = int(ends[e])
         if end > start:
-            a = a8[start:end].float() * sa[start:end, None]
-            b = b8[e].float() * sb[e][None, :]                     # [N, K] -> [K, N]
+            a = a8[start:end].float() * sa                         # TensorWise singleton scales
+            b = b8[e].float() * sb                                 # [N, K] -> [K, N]
             out[start:end] = (a @ b.t()).to(torch.bfloat16)
         start = end
     return out
 
 
 def reference_tiles(ex, scratch):
-    """The fp8 B tiles and the per-column scales, as the dequant_fp8 kernel leaves them."""
+    """The fp8 B tiles, as the dequant_fp8 kernel leaves them."""
 
     inv = moe_fp8.FP8_MAX / moe_fp8._codebook_max(ex.cb)
     for e in range(E):
@@ -126,12 +126,13 @@ def test_the_codebook_bounds_hold():
         assert moe_fp8._codebook_max(cb) == pytest.approx(abs(exl3_format.codebook(name)).max())
 
 
-def test_per_row_e4m3_stays_within_the_relative_bound():
+def test_tensorwise_e4m3_keeps_the_normal_values():
     x = torch.randn(64, 512) * torch.linspace(1e-3, 1e3, 64)[:, None]
-    x8, s = moe_fp8.quantize_rows(x)
-    back = x8.float() * s[:, None]
+    x8, s = moe_fp8.quantize_tensor(x)
+    assert s.numel() == 1 and s.dtype == torch.float32             # TensorWise: what _scaled_mm accepts
+    back = x8.float() * s
     err = (back - x).abs()
-    big = x.abs() >= x.abs().amax(-1, keepdim=True) * 2 ** -6      # normal e4m3 values of the row's scale
+    big = x.abs() >= x.abs().amax() * 2 ** -6                      # normal e4m3 values of the tensor's scale
     assert (err[big] / x.abs()[big]).max() < 2 ** -3.5             # e4m3's worst relative rounding, with headroom
 
 
@@ -187,8 +188,8 @@ def test_the_scratch_holds_the_expected_workspace():
     assert s.b_gu.shape == (E, 2 * I, D) and s.b_d.shape == (E, D, I)
     assert s.b_gu.dtype == torch.uint8 and s.b_d.dtype == torch.uint8
     inv = moe_fp8.FP8_MAX / moe_fp8._codebook_max(ex.cb)
-    assert torch.all(s.s_g == 1.0 / inv) and torch.all(s.s_d == 1.0 / inv)
-    assert s.nbytes() == (E * 2 * I * D + E * D * I + 2 * E * I + E * D) + 128 * 128 * 4
+    assert torch.all(s.b_scale == 1.0 / inv) and s.b_scale.numel() == 1     # the TensorWise dequant scale
+    assert s.nbytes() == (E * 2 * I * D + E * D * I) + 4 + 128 * 128 * 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the dequant_fp8 kernel)")

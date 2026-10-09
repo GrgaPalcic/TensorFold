@@ -1,4 +1,4 @@
-"""--prefill-fp8 for GLM-5.3-Flash's routed EXL3 experts: the GEMMs run in e4m3 with per-row/per-column scales.
+"""--prefill-fp8 for GLM-5.3-Flash's routed EXL3 experts: the GEMMs run in e4m3 with TensorWise scales.
 
 The EXL3 GEMV is bandwidth-bound on the trellises (about 5.5 GiB a layer across TP2), so prefill keeps the
 bf16 GEMV while the GEMMs move to fp8: each layer's three expert matrices are decoded once into e4m3 B tiles
@@ -11,7 +11,7 @@ Per expert matrix (suh is Hadamard-folded into the pairs' activations by ``rot_i
 route does; svh folds into the epilogue):
 
     B8 = e4m3(W_q / s)          s = codebook_max / 448      (the kernel's decode, K-major output)
-    Z = gemm(e4m3(H x suh), B8)                              (grouped, row scales from the e4m3 input)
+    Z = gemm(e4m3(H x suh), B8)                              (grouped, one tensor scale a matrix)
     Y = rotate(Z) * HAD_SCALE * svh                          (the epilogue's Hadamard and signs)
 
 The approximate workspace is the three e4m3 tile sets (2.4 + 1.2 GiB for 5.3-Flash on one rank) plus the
@@ -48,25 +48,23 @@ def _codebook_max(cb: int) -> float:
 
 
 class Scratch:
-    """The fp8 expert tiles of one layer at a time plus the grouped GEMM's scales and Hadamard matrix."""
+    """The fp8 expert tiles of one layer at a time plus the GEMMs' tensor scale and Hadamard matrix."""
 
     def __init__(self, ex: generic.Exl3RoutedExperts, rows: int, slots: int, device) -> None:
         E, D, I = ex.count, ex.dims, ex.width
         self.rows, self.slots = rows, slots
         self.b_gu = torch.empty((E, 2 * I, D), dtype=torch.uint8, device=device)   # e4m3, gate | up stacked
         self.b_d = torch.empty((E, D, I), dtype=torch.uint8, device=device)
-        scale = 1.0 / (FP8_MAX / _codebook_max(ex.cb))   # tiles hold e4m3(W * inv), so dequant needs 1 / inv
-        self.s_g = torch.full((E, I), scale, dtype=torch.float32, device=device)   # the columns' e4m3 scales
-        self.s_u = torch.full((E, I), scale, dtype=torch.float32, device=device)
-        self.s_d = torch.full((E, D), scale, dtype=torch.float32, device=device)
+        # tiles hold e4m3(W * inv), so dequant needs 1 / inv; one scalar covers every expert because the
+        # checkpoint's experts share one codebook, whose bound is a valid tensor scale (it never overflows)
+        self.b_scale = torch.full((1,), 1.0 / (FP8_MAX / _codebook_max(ex.cb)), dtype=torch.float32, device=device)
         self.h = hadamard(device)
         self.staged = None               # the layer whose tiles are in place (identity check)
 
     def nbytes(self) -> int:
         """The fp8 workspace's own bytes (the bf16 route's scratch is separate)."""
 
-        return (self.b_gu.numel() + self.b_d.numel() + self.s_g.numel() + self.s_u.numel() + self.s_d.numel()) \
-            + self.h.numel() * 4
+        return self.b_gu.numel() + self.b_d.numel() + self.b_scale.numel() * 4 + self.h.numel() * 4
 
 
 @lru_cache(maxsize=1)
@@ -91,12 +89,14 @@ def rotate(x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     return y.reshape(shape)
 
 
-def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """e4m3 with one scale a row: (x / s) rounded to e4m3, s = amax / 448 (0-rows at 1)."""
+def quantize_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """e4m3 with one scale for the whole matrix (SM121's _scaled_mm only takes TensorWise scales): s = amax / 448
+    over every element (0-matrices at 1). e4m3's wide dynamic range keeps outliers from drowning small values;
+    the epilogues stay in bf16/fp32 either way."""
 
-    amax = x.float().abs().amax(-1)
-    s = torch.where(amax > 0, amax * (1.0 / FP8_MAX), torch.ones_like(amax))
-    return (x.float() / s[:, None]).to(torch.float8_e4m3fn).contiguous(), s
+    amax = x.float().abs().amax()
+    s = torch.where(amax > 0, amax * (1.0 / FP8_MAX), torch.ones_like(amax)).reshape(1)
+    return (x.float() / s).to(torch.float8_e4m3fn).contiguous(), s
 
 
 def fp8_tile_reference(trellis, bits: float, cb: int, inv: float) -> torch.Tensor:
@@ -123,14 +123,15 @@ def stage(ex: generic.Exl3RoutedExperts, s: Scratch) -> None:
 
 def grouped_mm(a8: torch.Tensor, sa: torch.Tensor, b8: torch.Tensor, sb: torch.Tensor, offs: torch.Tensor,
                E: int) -> torch.Tensor:
-    """The grouped fp8 GEMM: a8 [P, K] e4m3 rows with per-row scales ``sa``, b8 [E, N, K] e4m3 (column-major
-    per expert) with per-column scales ``sb``, offs [E] int32 cumulative row ends -> [P, N] bf16."""
+    """The grouped fp8 GEMM: a8 [P, K] e4m3, b8 [E, N, K] e4m3 (column-major per expert), offs [E] int32
+    cumulative row ends -> [P, N] bf16. Both scales are TensorWise singletons: what SM121's _scaled_mm
+    accepts (its row-wise scaling is rejected, and _scaled_grouped_mm is unsupported below SM100)."""
 
     ok = _grouped_ok()
     if ok:
         try:
             return torch._scaled_grouped_mm(a8, b8.transpose(-2, -1), sa, sb, offs=offs, out_dtype=torch.bfloat16)
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             globals()["_GROUPED"] = False
     # per-expert fallback (one host sync to read the group sizes)
     out = torch.empty((a8.shape[0], b8.shape[1]), dtype=torch.bfloat16, device=a8.device)
@@ -139,8 +140,7 @@ def grouped_mm(a8: torch.Tensor, sa: torch.Tensor, b8: torch.Tensor, sb: torch.T
     for e in range(E):
         end = int(ends[e])
         if end > start:
-            out[start:end] = torch._scaled_mm(a8[start:end], b8[e].t(), sa[start:end, None], sb[e][None, :],
-                                              out_dtype=torch.bfloat16)
+            out[start:end] = torch._scaled_mm(a8[start:end], b8[e].t(), sa, sb, out_dtype=torch.bfloat16)
         start = end
     return out
 
@@ -162,8 +162,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     """The routed slots' fp8 prefill: acts.y[:R * slots] as fp32 (the caller supplies the shared slot) -> [R, slots, D].
 
     Same arithmetic as the bf16 route's rot_in / grouped GEMV / epilogue, with the three GEMMs in e4m3: gate
-    and up read the pairs' rotated activations (suh folded, one GEMM each because their scales differ), the
-    SwiGLU keeps the bf16 route's roundings (act_mode 0), and down folds suh_d into its pairs' activations.
+    and up read the pairs' rotated activations (suh folded, one GEMM each), the SwiGLU keeps the bf16 route's
+    roundings (act_mode 0), and down folds suh_d into its pairs' activations. TensorWise scales throughout:
+    one scale a matrix (the GEMM's A scale comes from the routed pairs' amax, B's from the codebook bound).
     """
 
     D, I, E = ex.dims, ex.width, ex.count
@@ -177,19 +178,19 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     order = torch.argsort(flat)[: R * (slots - 1)]          # pair indices, sorted by expert
     counts = torch.bincount(flat.long(), minlength=E + 1)[:E]
     offs = counts.cumsum(0).to(torch.int32)
-    a8_g, s_g = quantize_rows(acts.xg[:P].index_select(0, order))   # the pairs' fp8 A tiles, expert order
-    a8_u, s_u = quantize_rows(acts.xu[:P].index_select(0, order))
+    a8_g, s_g = quantize_tensor(acts.xg[:P].index_select(0, order))   # the pairs' fp8 A tiles, expert order
+    a8_u, s_u = quantize_tensor(acts.xu[:P].index_select(0, order))
     b_gu = s.b_gu.view(torch.float8_e4m3fn).view(E, 2 * I, D)      # column-major [N, K] per expert
-    z_g = gemm(a8_g, s_g, b_gu[:, :I], s.s_g, offs, E)
-    z_u = gemm(a8_u, s_u, b_gu[:, I:], s.s_u, offs, E)
+    z_g = gemm(a8_g, s_g, b_gu[:, :I], s.b_scale, offs, E)
+    z_u = gemm(a8_u, s_u, b_gu[:, I:], s.b_scale, offs, E)
     # the epilogue: Hadamard, signs, the SwiGLU with the bf16 route's roundings (act_mode 0)
     e_of = flat[order]
     gg = bf16r(rotate(z_g, s.h) * signs(ex.svh_g, e_of)).clamp_max(limit)
     uu = bf16r(rotate(z_u, s.h) * signs(ex.svh_u, e_of)).clamp(-limit, limit)
     act = bf16r(bf16r(gg * torch.sigmoid(gg)) * uu)
     xd = rotate(act * signs(ex.suh_d, e_of), s.h)
-    a8_d, s_d = quantize_rows(xd)                    # already in expert-sorted pair order
-    z = gemm(a8_d, s_d, s.b_d.view(torch.float8_e4m3fn).view(E, D, I), s.s_d, offs, E)
+    a8_d, s_d = quantize_tensor(xd)                  # already in expert-sorted pair order
+    z = gemm(a8_d, s_d, s.b_d.view(torch.float8_e4m3fn).view(E, D, I), s.b_scale, offs, E)
     # the down epilogue and the slot scatter (one fp32 write per routed pair)
     y = rotate(z, s.h) * signs(ex.svh_d, e_of)
     acts.y[:P].index_copy_(0, order, y)
