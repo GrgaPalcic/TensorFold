@@ -125,6 +125,8 @@ class Buffers:
             self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
             self.ey = self.exl3.y.view(rows, slots, D)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
+            self.smg = torch.empty((rows, sl), dtype=bf, device=dev)
+            self.smu = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
             self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
             self.sy = torch.empty((rows, D), dtype=f32, device=dev)
@@ -459,10 +461,10 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         if s.gu is not None:
             mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
         else:                               # the pack's separate gate and up groups
-            mm(b, b.normed[:R], s.gate, b.xs[:R], b.mg[:R])
-            mm(b, b.normed[:R], s.up, b.xs[:R], b.mu[:R])
-            b.sgu[:R, :s.gate.n].copy_(b.mg[:R])
-            b.sgu[:R, s.gate.n:].copy_(b.mu[:R])
+            mm(b, b.normed[:R], s.gate, b.xs[:R], b.smg[:R])
+            mm(b, b.normed[:R], s.up, b.xs[:R], b.smu[:R])
+            b.sgu[:R, :s.gate.n].copy_(b.smg[:R])
+            b.sgu[:R, s.gate.n:].copy_(b.smu[:R])
         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
         mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
         b.ey[:R, c.top_k].copy_(b.sy[:R])
