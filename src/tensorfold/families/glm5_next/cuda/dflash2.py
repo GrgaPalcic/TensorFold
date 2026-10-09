@@ -170,6 +170,89 @@ class DraftLayer:
     down: qmm.Q4              # [D, this rank's MLP width]: a row-parallel partial
 
 
+def tree_chains(tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, succ: np.ndarray, pred: np.ndarray,
+                anchor: int, first: int, sampling: Sampling | None, *, fanout: int, depth: int,
+                confidence: float = 0.0, budget: int = 7) -> tuple[list[int], list[int]]:
+    """A draft tree over one block pass's candidates: level 0 the anchor's top-``fanout`` candidates, deeper
+    levels the greedy chain's forced pick plus the next-best children over all live nodes (a beam). A branch
+    dies at a token already drafted that level (it merges into that node) or below the cumulative confidence
+    floor. Returns (tokens, parents), parents[i] token i's flat parent index (-1: the anchor). The tree walks
+    out depth-first, a node's chain child first, so the greedy chain is the flat list's prefix."""
+    depth = min(depth, tokens.shape[0])
+    k = tokens.shape[1]
+    sampled = sampling is not None and sampling.temperature > 0
+    temp = float(sampling.temperature) if sampled else 1.0
+    noise = None
+    if sampled:
+        noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
+    built: list[tuple[int, int, float, float, bool]] = []   # token, parent flat index, confidence, pick, chain?
+    nodes = [(anchor, -1, 1.0)]                        # the last level's (token, flat index, cumulative confidence)
+    chain_alive = True
+    for d in range(depth):
+        if len(built) >= budget or not nodes:
+            break
+        used: set[int] = set()
+        level: list[tuple[int, int, float, float, bool]] = []
+        picks = []
+        for prev, _, _ in nodes:
+            edge = succ[tokens[d]].astype(np.float64) @ (pred[prev].astype(np.float64) * proj[d])
+            score = (values[d] + EDGE * edge) / temp
+            pick = score + NOISE * noise[d] if noise is not None else score
+            probs = np.exp(score - score.max()) if confidence > 0 else None
+            picks.append((pick, probs))
+        chain_arg = -1
+        if chain_alive:
+            pick, probs = picks[0]
+            j = int(np.argmax(pick))
+            conf = nodes[0][2]
+            if confidence > 0:
+                conf *= float(probs[j] / probs.sum())
+            if not (confidence > 0 and d > 0 and conf < confidence):
+                level.append((int(tokens[d, j]), nodes[0][1], conf, float(pick[j]), True))
+                used.add(int(tokens[d, j]))
+                chain_arg = j
+            else:
+                chain_alive = False
+        pool = []                                      # (pick, node, candidate), the chain's argmax already taken
+        for ni, (pick, probs) in enumerate(picks):
+            for j in range(k):
+                if ni == 0 and j == chain_arg:
+                    continue
+                pool.append((float(pick[j]), ni, j, probs))
+        pool.sort(key=lambda t: -t[0])
+        for pj, ni, j, probs in pool:
+            if len(built) >= budget or len(level) >= fanout:
+                break
+            tok = int(tokens[d, j])
+            if tok in used:
+                continue
+            conf = nodes[ni][2]
+            if confidence > 0:
+                conf *= float(probs[j] / probs.sum())
+                if d > 0 and conf < confidence:
+                    continue
+            level.append((tok, nodes[ni][1], conf, pj, False))
+            used.add(tok)
+        flat = []
+        for tok, pflat, conf, pj, is_chain in level:
+            flat.append((tok, len(built), conf))
+            built.append((tok, pflat, conf, pj, is_chain))
+        nodes = flat
+    kids: dict[int, list[int]] = {}
+    for i, node in enumerate(built):
+        kids.setdefault(node[1], []).append(i)
+    for i in kids:
+        kids[i].sort(key=lambda c: (not built[c][4], -built[c][3]))     # a node's chain child first, then by pick
+    order: list[int] = []
+    stack = list(reversed(kids.get(-1, [])))
+    while stack:
+        i = stack.pop()
+        order.append(i)
+        stack.extend(reversed(kids.get(i, [])))
+    new = {old: i for i, old in enumerate(order)}
+    return [built[i][0] for i in order], [new[built[i][1]] if built[i][1] >= 0 else -1 for i in order]
+
+
 class Drafter:
     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
 
@@ -479,3 +562,15 @@ class Drafter:
             return []
         tokens, values, proj = self.candidates(pending, depth)
         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
+
+    def propose_tree(self, pending: int, depth: int, fanout: int, sampling: Sampling | None, confidence: float = 0.0,
+                     budget: int = 7) -> tuple[list[int], list[int]]:
+        """A draft tree for the positions after the pending token (which sits at context_end): tokens in flat
+        order and each token's parent index (-1: the anchor), at most ``budget`` nodes."""
+
+        depth = min(depth, self.block - 1)
+        if depth < 1 or self.context_end == 0 or fanout < 1:
+            return [], []
+        tokens, values, proj = self.candidates(pending, depth)
+        return tree_chains(tokens, values, proj, self.succ, self.pred, pending, self.context_end + 1, sampling,
+                           fanout=fanout, depth=depth, confidence=confidence, budget=budget)

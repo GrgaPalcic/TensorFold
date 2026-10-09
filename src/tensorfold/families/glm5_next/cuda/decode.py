@@ -492,6 +492,16 @@ class DepthPolicy:
         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
 
 
+class TreePolicy:
+    """DFlash2 tree drafting: `fanout` chains of up to `depth` drafts a round (policy t<FANOUT>d<DEPTH>)."""
+
+    def __init__(self, fanout: int, depth: int, confidence: float = 0.0) -> None:
+        self.fanout, self.depth, self.confidence = fanout, depth, confidence
+
+    def __repr__(self) -> str:
+        return f"TreePolicy(fanout={self.fanout}, depth={self.depth}, confidence={self.confidence})"
+
+
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
                stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -550,13 +560,122 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
+def accepted_path(drafts: Sequence[int], parents: Sequence[int], sampled: Sequence[int],
+                  eos: frozenset[int] | set[int], stop_eos: bool) -> list[int]:
+    """The longest accepted root path's row indices (excluding the pending row 0). A node is accepted when its
+    sample matches its draft and its parent was accepted and not a sampled EOS, so the path is a connected chain
+    to the anchor. Ties keep the earliest row, so the greedy chain wins an equal-length path."""
+    depth = [0] * len(drafts)
+    best_len, best_end = 0, -1
+    for i, (draft, got) in enumerate(zip(drafts, sampled)):
+        p = parents[i]
+        if got != draft or (stop_eos and 0 <= p and sampled[p] in eos):
+            continue
+        depth[i] = depth[p] + 1 if 0 <= p else 1
+        if depth[i] > best_len:
+            best_len, best_end = depth[i], i
+    path = []
+    i = best_end
+    while i >= 0 and depth[i] > 0:
+        path.append(i)
+        i = parents[i]
+    path.reverse()
+    return path
+
+
+@torch.no_grad()
+def tree_round(e: Engine, drafter, pending: int, sampling: Sampling | None, *, fanout: int, depth: int,
+               confidence: float, stop_eos: bool, stages: dict) -> tuple[list[int], int, int]:
+    """One DFlash2 tree round: the drafter proposes `fanout` chains of up to `depth` drafts, every node is
+    verified in one window, and the longest accepted root path is committed. A path that leaves the window's
+    row prefix is re-verified in its own window first: rows that shared the window with sibling branches attend
+    non-ancestor context (attention masks by position, and KDA has no tree masks to replay a branched path), so
+    only the row-prefix chain's samples are the serial ones. If the clean re-verify accepts less than the chain
+    prefix did, the round falls back to a third forward on the chain prefix. Returns (kept tokens, forward rows,
+    proposed nodes)."""
+    w, st, b = e.w, e.st, e.buf
+    t0 = time.perf_counter()
+    full, parents_full = drafter.propose_tree(pending, depth, fanout, sampling, confidence, budget=e.rows - 1)
+    t1 = time.perf_counter()
+    tokens = e.verify_window([pending] + full)
+    n = len(tokens) - 1                      # a grammar may cut the proposal: a prefix keeps parents aligned
+    drafts, parents = full[:n], parents_full[:n]
+    R = 1 + n
+    logits = e.forward(tokens)
+    torch.cuda.synchronize()
+    t2 = time.perf_counter()
+    sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+    keep = 1
+    for i, d in enumerate(drafts):
+        if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+            break
+        keep += 1
+    path = accepted_path(drafts, parents, sampled, w.cfg.eos, stop_eos)
+    t3 = time.perf_counter()
+    if len(path) <= keep - 1:
+        # the greedy chain is the best accepted path: commit its prefix as a chain round would
+        commit(w, st, b, R, keep)
+        drafter.add_taps(e.tap_rows(keep))
+        kept = sampled[:keep]
+        t4 = time.perf_counter()
+        stages["draft"] += t1 - t0
+        stages["forward"] += t2 - t1
+        stages["sample"] += t3 - t2
+        stages["commit"] += t4 - t3
+        return kept, R, len(full)
+    # the winning path leaves the row prefix: re-verify it alone, where its rows are the serial ones
+    tokens2 = e.verify_window([pending] + [drafts[i] for i in path])
+    R2 = len(tokens2)
+    logits = e.forward(tokens2)
+    torch.cuda.synchronize()
+    t3b = time.perf_counter()
+    sampled2 = e.sample(logits[:R2], [st.pos + 1 + r for r in range(R2)], sampling)
+    keep2 = 1
+    for i, d in enumerate(tokens2[1:]):
+        if sampled2[i] != d or (stop_eos and sampled2[i] in w.cfg.eos):
+            break
+        keep2 += 1
+    t4 = time.perf_counter()
+    if keep2 >= keep:
+        R, sampled, keep = R2, sampled2, keep2
+        commit(w, st, b, R, keep)
+        drafter.add_taps(e.tap_rows(keep))
+        kept = sampled[:keep]
+        t5 = time.perf_counter()
+        stages["draft"] += t1 - t0
+        stages["forward"] += (t2 - t1) + (t3b - t3)
+        stages["sample"] += (t3 - t2) + (t4 - t3b)
+        stages["commit"] += t5 - t4
+        return kept, R, len(full)
+    # the contaminated window flattered the path: re-verify the accepted chain prefix cleanly instead
+    tokens3 = e.verify_window([pending] + drafts[:keep - 1])
+    R3 = len(tokens3)
+    keep = min(keep, R3)                     # a grammar may cut the chain's clean window below its prefix
+    logits = e.forward(tokens3)
+    torch.cuda.synchronize()
+    t6 = time.perf_counter()
+    sampled3 = e.sample(logits[:R3], [st.pos + 1 + r for r in range(R3)], sampling)
+    R = R3
+    commit(w, st, b, R, keep)
+    drafter.add_taps(e.tap_rows(keep))
+    kept = sampled3[:keep]
+    t7 = time.perf_counter()
+    stages["draft"] += t1 - t0
+    stages["forward"] += (t2 - t1) + (t3b - t3) + (t6 - t4)
+    stages["sample"] += (t3 - t2) + (t4 - t3b) + (t7 - t6)
+    stages["commit"] += t7 - t6
+    return kept, R, len(full)
+
+
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
-                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+                  policy: DepthPolicy | TreePolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
     """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy(3, fixed=True)
+    if isinstance(policy, TreePolicy):
+        return tree_decode(e, drafter, pending, count, sampling, policy=policy, stop_eos=stop_eos, on_tokens=on_tokens)
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
@@ -600,5 +719,37 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+    _sync(w)
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+
+
+@torch.no_grad()
+def tree_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *, policy: TreePolicy,
+                stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+    """DFlash2 tree rounds: the longest accepted root path commits a round, replies equal serial. k chains of
+    per-draft acceptance p a round commit 1 + E[max of k geometric(p)] tokens, with E[max] the alternating sum
+    of C(k, j) p^j / (1 - p^j): about 4.27 a round for 2 chains where one chain commits 2.70, at p = 0.73, when
+    the extra rows' verify time pays."""
+    w = e.w
+    out = [pending]
+    stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    rounds = drafted = accepted = 0
+    depths: list[int] = []
+    keeps: list[int] = []
+    _sync(w)
+    start = time.perf_counter()
+    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        depth = min(policy.depth, count - len(out))
+        kept, rows, proposed = tree_round(e, drafter, out[-1], sampling, fanout=policy.fanout, depth=depth,
+                                          confidence=policy.confidence, stop_eos=stop_eos, stages=stages)
+        rounds += 1
+        drafted += proposed
+        accepted += len(kept) - 1
+        depths.append(proposed)
+        keeps.append(len(kept))
+        e.follow(kept)
+        out.extend(kept)
+        if on_tokens is not None:
+            on_tokens(kept[:max(0, count - (len(out) - len(kept)))])
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)

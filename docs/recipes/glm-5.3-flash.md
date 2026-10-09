@@ -67,6 +67,7 @@ A request can select a policy after `@` in its model ID, such as `bench@c3:0.35`
 | `a:LOW:HIGH` | MTP depth from running acceptance |
 | `cN:P` | MTP chain capped at N and a probability-product threshold |
 | `fN`, `fcN:P`, `fa:...` | Corresponding DFlash2 policies, requiring its checkpoint |
+| `t<FANOUT>d<DEPTH>` | DFlash2 tree: `FANOUT` chains of up to `DEPTH` drafts (1-4 by 1-7, `FANOUT * DEPTH` at most 7) |
 
 The default context is 2,051 tokens, where attention stays dense. A larger positive `--context` enables
 sparse attention beyond that boundary if the startup memory estimate admits it on both ranks.
@@ -89,6 +90,13 @@ of 10 KiB a rank for every token of the window). A kept prompt DFlash2 can resum
 (20 MiB a rank, within `TF_GLM_CACHE_GIB`). The drafts are the same bits. `TF_GLM_DRAFT_RING=0` keeps the
 whole-window buffer instead (give both ranks the same value). The memory estimate counts the draft model as it is
 held (4-bit copies and its selector's codebooks, 0.63 GiB a rank), not at 4 bytes a checkpoint value.
+
+A tree policy rounds DFlash2's chain into a tree: the drafter proposes `FANOUT` chains a round (the greedy
+chain plus its next-best alternatives, beams off the live nodes), the target verifies every node in one window,
+and the longest accepted root path commits — a path that leaves the window's row prefix is re-verified in its
+own window first, since rows that shared the window with sibling branches attend non-ancestor context. Two
+chains accept about 4.27 tokens a round where one accepts 2.70 (at the measured 0.73 a draft), when the wider
+window's verify time pays.
 
 ### Long contexts: the latent cache
 

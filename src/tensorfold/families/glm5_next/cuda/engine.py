@@ -25,8 +25,9 @@ def encode_policy(spec: str) -> list[int]:
     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
 
     spec = str(spec).strip()
-    bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
-                     f"these after f (N from 1 to {MAX_ROWS - 1})")
+    bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, "
+                     f"t<FANOUT>d<DEPTH>, or one of these after f (N from 1 to {MAX_ROWS - 1}, FANOUT from 1 to 4, "
+                     f"FANOUT * DEPTH at most {MAX_ROWS - 1})")
     try:
         if spec == "auto" or spec.startswith("auto:"):
             parts = spec.split(":")
@@ -39,6 +40,12 @@ def encode_policy(spec: str) -> list[int]:
         if spec.startswith("f"):
             code = encode_policy(spec[1:])
             return [code[0] + 10] + code[1:] if code[0] else code
+        if spec.startswith("t"):
+            fanout_text, sep, depth_text = spec[1:].partition("d")
+            fanout, depth = int(fanout_text), int(depth_text)
+            if not sep or not 1 <= fanout <= 4 or not 1 <= depth <= MAX_ROWS - 1 or fanout * depth > MAX_ROWS - 1:
+                raise bad
+            return [6, depth, fanout, 0]
         if spec.startswith("a"):
             parts = spec.split(":")
             if parts[0] != "a" or len(parts) not in (1, 3):
@@ -62,12 +69,14 @@ def encode_policy(spec: str) -> list[int]:
 def decode_policy(code: list[int]):
     """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
 
-    from .decode import DepthPolicy
+    from .decode import DepthPolicy, TreePolicy
 
     kind, most, a, b = code
     if kind in (4, 5):
         return ("auto", most, a, b / 1e6, kind == 5)
     kind %= 10
+    if kind == 6:
+        return TreePolicy(fanout=a, depth=min(most, MAX_ROWS - 1))
     if kind == 2:
         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
     if kind == 3:
@@ -345,13 +354,15 @@ class GlmEngine:
             return encode_policy(EXL3_AUTO)
         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
             return encode_policy(DFLASH_POLICY) if code[0] in (4, 5) else [code[0] + 10] + code[1:]
+        if code[0] % 10 == 6 and self.drafter is None:
+            raise ValueError("draft policy t<FANOUT>d<DEPTH> needs the DFlash2 draft model (--drafter)")
         return code
 
     def _drafters(self, code: list[int]) -> tuple[bool, bool, bool]:
         """(auto, MTP drafts, DFlash2 drafts) for a policy code."""
 
         auto = code[0] in (4, 5)
-        dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+        dflash = (auto or code[0] // 10 == 1 or code[0] % 10 == 6) and self.drafter is not None
         return auto, auto or not dflash, dflash
 
     def _resume(self, prompt: list[int], code: list[int]):

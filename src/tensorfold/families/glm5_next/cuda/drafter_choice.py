@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, draft
+from .decode import DecodeResult, DepthPolicy, Engine, TreePolicy, _sync, absorb, draft, tree_round
 from .forward import commit
 
 
@@ -68,7 +68,7 @@ class DrafterChoice:
 @torch.no_grad()
 def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                 choice: DrafterChoice | None,
-                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+                m_policy: DepthPolicy, f_policy: DepthPolicy | TreePolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
     """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
 
     w, st, b = e.w, e.st, e.buf
@@ -93,6 +93,37 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         arm = choice.pick() if choice is not None else "m"
         room = count - len(out)
         t0 = time.perf_counter()
+        if arm == "f" and isinstance(f_policy, TreePolicy):
+            # a tree round: verify every node in one window, commit the longest accepted root path
+            backlog = n_f
+            if n_f:
+                drafter.add_taps(f_taps[:n_f])
+                n_f = 0
+            kept, R, n_drafts = tree_round(e, drafter, out[-1], sampling, fanout=f_policy.fanout,
+                                           depth=min(f_policy.depth, room), confidence=f_policy.confidence,
+                                           stop_eos=stop_eos, stages=stages)
+            keep = len(kept)
+            if len(m_next) + keep > cap:
+                absorb(e, m_rows[:len(m_next)], m_next)
+                m_next = []
+            m_rows[len(m_next):len(m_next) + keep].copy_(e.main_hidden(slice(0, keep)))
+            m_next.extend(kept)
+            # tree_round already fed the drafter this round's taps: they are not buffered with the older rounds'
+            if choice is not None:
+                choice.record("f", R, 0, backlog, keep)
+            last["f"] = (n_drafts, keep - 1)
+            rounds += 1
+            drafted += n_drafts
+            accepted += keep - 1
+            depths.append(n_drafts)
+            keeps.append(keep)
+            arms.append("f")
+            e.follow(kept)
+            out.extend(kept)
+            if on_tokens is not None:
+                on_tokens(kept[:max(0, count - (len(out) - keep))])
+            continue
+
         if arm == "m":
             backlog = len(m_next)
             depth = max(1, min(m_policy.next(*last["m"]), room))
