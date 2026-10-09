@@ -360,7 +360,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
         else:                          # the fused taps: q|k|v blocks, the rank's share is three runs
             conv = torch.cat([t(p + "conv1d.weight")[s] for s in
-                              fused_rank_runs(3 * cfg.lin_heads * 128, 3, rank, world)]).contiguous()
+                              fused_rank_runs(3 * cfg.lin_heads * 128, 3, rank, world)]).reshape(-1, cfg.conv).contiguous()
         common = (q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
                   t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), dense(p + "o_proj"), LL)
         if has(p + "qkv_proj.trellis"):    # RED-SNOW's SAGE pack: fused q|k|v group, plain bf16 low-rank pair
