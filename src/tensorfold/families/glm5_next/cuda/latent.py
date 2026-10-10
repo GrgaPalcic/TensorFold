@@ -296,8 +296,8 @@ def _lat_write(LAT, lat_stride, LC, POS, SC, LW: tl.constexpr, FP8: tl.constexpr
         s = tl.where(amax > 0, tl.exp2(tl.ceil(tl.log2(amax / 7.0))), 1.0)
         tl.store(SC + P + r, s)
         codes = tl.minimum(tl.maximum(tl.floor(row / s + 0.5), -8.0), 7.0).to(tl.int32)
-        pairs = tl.reshape(codes, (LW // 2, 2))
-        packed = (pairs[:, 0] & 0xF) | (pairs[:, 1] << 4)     # element 2k low, 2k + 1 high, two's complement
+        lo, hi = tl.split(tl.reshape(codes, (LW // 2, 2)))
+        packed = (lo & 0xF) | (hi << 4)                       # element 2k low, 2k + 1 high, two's complement
         tl.store(LC + (P + r) * (LW // 2) + tl.arange(0, LW // 2), packed.to(tl.uint8))
     else:
         k = tl.arange(0, LW)
