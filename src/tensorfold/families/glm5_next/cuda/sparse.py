@@ -71,37 +71,40 @@ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln
 
 @triton.jit
 def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
-            D: tl.constexpr, BP: tl.constexpr, RB: tl.constexpr):
-    """Program (RB rows, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to each row's position, heads padded to HP; RB never changes a row's bits."""
+            D: tl.constexpr, BP: tl.constexpr, L: tl.constexpr):
+    """Program (row, L pool blocks): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to the row's position, heads
+    padded to HP. One row and L blocks a program, the row's queries and head weights loaded once for them (rows a
+    program and one block reloaded a row's queries for every block); each block computes exactly as a 1-block
+    program did, the same bits."""
 
-    rb = tl.program_id(0)
-    pb = tl.program_id(1)
+    r = tl.program_id(0)
+    g = tl.program_id(1)
     P = tl.load(POS)
-    p = pb * BP + tl.arange(0, BP)
-    # tiles past this row block's last visible complete pool store -inf without dot products (the same allocations)
-    visible = (P + tl.minimum((rb + 1) * RB, R)) // 4
-    if pb * BP >= visible:
-        for i in tl.static_range(RB):
-            r = rb * RB + i
-            if r < R:
-                tl.store(OUT + r * NP + p, float("-inf"), mask=p < NP)
-        return
     d = tl.arange(0, D)
     hh = tl.arange(0, HP)
     hok = hh < H
-    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < (P + rb * RB + RB) // 4)[:, None],
-                other=0.0).to(tl.bfloat16)                                              # [BP, D]
-    for i in tl.static_range(RB):
-        r = rb * RB + i
-        if r < R:
-            npool = (P + r + 1) // 4
-            q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
-            kr = tl.where((p < npool)[:, None], k, 0.0)
-            dots = tl.dot(q, tl.trans(kr))                                                # [HP, BP] fp32
-            w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
-            sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
-            sc = tl.where(p < npool, sc, float("-inf"))
-            tl.store(OUT + r * NP + p, sc, mask=p < NP)
+    npool = (P + r + 1) // 4
+    q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
+    w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
+    for j in range(0, L):
+        pb = g * L + j
+        p = pb * BP + tl.arange(0, BP)
+        if pb * BP < NP:
+            # blocks past the row's last visible complete pool store -inf without dot products (speed only: their
+            # dots would be masked to -inf below)
+            if pb * BP >= npool:
+                tl.store(OUT + r * NP + p, float("-inf"), mask=p < NP)
+            else:
+                kok = p < npool
+                k = tl.load(PK + p[:, None] * D + d[None, :], mask=kok[:, None], other=0.0).to(tl.bfloat16)
+                dots = tl.dot(q, tl.trans(k))                     # [HP, BP] fp32; keys past npool loaded as 0
+                sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+                sc = tl.where(p < npool, sc, float("-inf"))
+                tl.store(OUT + r * NP + p, sc, mask=p < NP)
+
+
+SCORE_LOOP = 32            # pool blocks a _scores program takes (speed only; GB10: 32 >= 16 > 8 > 4)
+
 
 
 def _top_pools(scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -196,9 +199,10 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
     for a in range(0, R, B):
         n = min(B, R - a)
         at = pos_dev if a == 0 else pos_dev + a                        # the block's first row's position
-        _scores[(n, triton.cdiv(np_max, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pk, scores, at, n, np_max,
-                                             D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
-                                             BP=64, RB=1, num_warps=4)
+        _scores[(n, triton.cdiv(triton.cdiv(np_max, 64), SCORE_LOOP))](qi[a:a + n], wts[a:a + n], wts.stride(0),
+                                                                       pk, scores, at, n, np_max, D ** -0.5,
+                                                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)),
+                                                                       D=D, BP=64, L=SCORE_LOOP, num_warps=4)
         blocks.append(top_pools(scores[:n], TOPK_POOLS, at))                           # ascending pool index
     del scores
     pools = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
