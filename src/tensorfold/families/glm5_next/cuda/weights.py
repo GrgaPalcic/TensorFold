@@ -182,6 +182,8 @@ class DSAW:
     q_b: Q4
     kv_k: Q4 | B16 | None      # key rows of kv_b for the local heads, when the latent path holds no absorb copy
     kv_v: Q4 | B16 | None      # value rows
+    o: Q4 | B16                # o_proj
+    heads: int                 # local attention heads, for the o_proj grouping
     index: IndexW | None = None
     absorb: object = None     # latent.AbsorbW | AbsorbF8 | AbsorbQ4: kv_b split per head, for attention on the latent cache
     q_a: Exl3Linear | None = None   # the pack's separate EXL3 groups, when they don't stack
