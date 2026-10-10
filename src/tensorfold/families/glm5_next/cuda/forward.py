@@ -339,7 +339,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
     if cut is None:
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
-                            st.rec[1 - cur, li])
+                            st.rec[1 - cur, li], pos=st.pos if pre else None)
     else:
         n = cut.point
         first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
