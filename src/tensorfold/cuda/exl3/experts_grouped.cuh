@@ -135,46 +135,107 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
     }
 }
 
-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
-template <int CB, int K2, int NT, int PF>
+// 16 bytes of trellis words at one 16B-aligned address; asm volatile keeps it where it stands (after patches/0580
+// of jayleaton/glm53-tensorfold-spark, Apache-2.0, Copyright 2026 Jay Leaton).
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight. LD 1 (even K2: the tile
+// blocks are 16B-aligned; odd K2 keeps the 32-bit loads) reads a step's NT * TW words as NV 16-byte
+// ld.global.nc loads a lane into `stage` (the kernel's `red` shared array, reused; two __syncwarp a step) and
+// reads word `lane` of each tile back — the same words per lane as the 32-bit path, so the decode and sums are
+// the same bits. PD steps in flight (the PF ring's structure with PD as the depth).
+template <int CB, int K2, int NT, int PF, int LD = 0, int PD = 1>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
                                            const half* x0, const half* x1, bool ok0, bool ok1, int lane,
-                                           float (&acc)[NT][2][4]) {
+                                           float (&acc)[NT][2][4], uint32_t* stage) {
     constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
     const LaneMap<K2> map(lane);
     const size_t kstride = (size_t)NTILES * TW;
     const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + lane;
+    if constexpr (LD && TW % 8 == 0) {
+        constexpr int NV = (NT * TW + 127) / 128;         // 16-byte loads a lane a step (TW 32 gives NT / 4)
+        uint4 rv[PD][NV];
+        const uint32_t* tb = tp - lane;
+#pragma unroll
+        for (int d = 0; d < PD; ++d)
+            if (d < nkt)
+#pragma unroll
+                for (int v = 0; v < NV; ++v)
+                    if (128 * v + 4 * lane < NT * TW) rv[d][v] = ldg_nc_v4(tb + d * kstride + 128 * v + 4 * lane);
+        for (int ib = 0; ib < nkt; ib += PD) {
+#pragma unroll
+            for (int d = 0; d < PD; ++d) {
+                const int it = ib + d;
+                if (it < nkt) {
+                    __syncwarp();                         // every lane has read the previous step back
+#pragma unroll
+                    for (int v = 0; v < NV; ++v)
+                        if (128 * v + 4 * lane < NT * TW)
+                            *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
+                    if (it + PD < nkt)
+#pragma unroll
+                        for (int v = 0; v < NV; ++v)
+                            if (128 * v + 4 * lane < NT * TW)
+                                rv[d][v] = ldg_nc_v4(tb + (size_t)(it + PD) * kstride + 128 * v + 4 * lane);
+                    __syncwarp();                         // the step is staged before any lane reads it back
+                    uint32_t w[NT][LW];
+#pragma unroll
+                    for (int i = 0; i < NT; ++i) {
+                        w[i][0] = stage[i * TW + lane];
+                        if constexpr (LW > 1) w[i][1] = stage[i * TW + 32 + lane];
+                    }
+                    const int k = (kt0 + it) * 16;
+                    uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                                     load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+                    for (int i = 0; i < NT; ++i) {
+                        uint32_t b0[2], b1[2];
+                        decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                        mma16816(acc[i][0], a, b0);
+                        mma16816(acc[i][1], a, b1);
+                    }
+                }
+            }
+        }
+        __syncwarp();                                     // `stage` is red[warp]: staged words out before the epilogue
+    } else {
+        uint32_t pf[PF][NT][LW];
+#pragma unroll
+        for (int d = 0; d < PF; ++d)
+            if (d < nkt)
+#pragma unroll
+                for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
 
-    uint32_t pf[PF][NT][LW];
+        for (int ib = 0; ib < nkt; ib += PF) {
 #pragma unroll
-    for (int d = 0; d < PF; ++d)
-        if (d < nkt)
-#pragma unroll
-            for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
-
-    for (int ib = 0; ib < nkt; ib += PF) {
-#pragma unroll
-        for (int d = 0; d < PF; ++d) {
-            const int it = ib + d;
-            if (it < nkt) {
-                uint32_t w[NT][LW];
-#pragma unroll
-                for (int i = 0; i < NT; ++i)
-#pragma unroll
-                    for (int l = 0; l < LW; ++l) w[i][l] = pf[d][i][l];
-                if (it + PF < nkt)
+            for (int d = 0; d < PF; ++d) {
+                const int it = ib + d;
+                if (it < nkt) {
+                    uint32_t w[NT][LW];
 #pragma unroll
                     for (int i = 0; i < NT; ++i)
-                        load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
-                const int k = (kt0 + it) * 16;
-                uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
-                                 load_pair(x1 + k + 8, ok1)};
 #pragma unroll
-                for (int i = 0; i < NT; ++i) {
-                    uint32_t b0[2], b1[2];
-                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
-                    mma16816(acc[i][0], a, b0);
-                    mma16816(acc[i][1], a, b1);
+                        for (int l = 0; l < LW; ++l) w[i][l] = pf[d][i][l];
+                    if (it + PF < nkt)
+#pragma unroll
+                        for (int i = 0; i < NT; ++i)
+                            load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
+                    const int k = (kt0 + it) * 16;
+                    uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                                     load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+                    for (int i = 0; i < NT; ++i) {
+                        uint32_t b0[2], b1[2];
+                        decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                        mma16816(acc[i][0], a, b0);
+                        mma16816(acc[i][1], a, b1);
+                    }
                 }
             }
         }
@@ -187,7 +248,7 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
-template <int CB, int NT, int W, int PF, int LO, int HI>
+template <int CB, int NT, int W, int PF, int LO, int HI, int LD = 0, int PD = 1>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -231,11 +292,14 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
+    // warps' partial sums through shared memory, added in warp order; LD 1 stages its 16-byte loads in red[warp]
+    __shared__ __align__(16) float red[W][16][NT * 16];
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
+            warp_tiles<CB, K2_, NT, PF, LD, PD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane,  \
+                                                acc, reinterpret_cast<uint32_t*>(red[warp]));                   \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -259,8 +323,6 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             __trap();
     }
 
-    // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -379,6 +441,7 @@ void dequant_fp8_launch(const int64_t* tp, const int* k2s, uint8_t* out, int E, 
     int K, N, P, SK, maxm, slots;
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
+    int ld = 0;          // 0: 32-bit loads; 1 / 2 / 4: 16-byte staged loads, that many steps in flight
     int ns = 0;          // trellis row stride in tiles (0 = N/16)
 };
 
@@ -386,8 +449,9 @@ template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    const int LD_ = a.ld != 0, PD_ = a.ld ? a.ld : 1;
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
+    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, LD_, PD_><<<grid, W_ * 32, 0, stream>>>(                         \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
         a.slots, a.ns)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \

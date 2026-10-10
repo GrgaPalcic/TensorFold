@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -20,13 +21,27 @@ GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
 
 
+LOADS = {"0": 0, "ldg": 0, "nc": 1, "nc1": 1, "nc2": 2, "nc4": 4}
+
+
+def loads() -> int:
+    """TF_GLM_EXL3_LOADS: the grouped kernel's trellis loads (bit-identical for every value). ``0`` / ``ldg``
+    (default): 32-bit loads; ``nc`` / ``nc1``, ``nc2``, ``nc4``: 16-byte ld.global.nc.L1::no_allocate loads 1, 2
+    or 4 k steps ahead through a staging area (after jayleaton/glm53-tensorfold-spark patches/0580, Apache-2.0)."""
+
+    v = (os.environ.get("TF_GLM_EXL3_LOADS", "") or "0").strip().lower()
+    if v not in LOADS:
+        raise ValueError(f"TF_GLM_EXL3_LOADS: 0, nc, nc2 or nc4, not {v!r}")
+    return LOADS[v]
+
+
 @lru_cache(maxsize=1)
 def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -193,12 +208,13 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.group(pick, ids, s.count, members, R, slots, E)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = s.cfg_gu
+    ld = loads()
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.gu_stride)
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.gu_stride, ld)
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0)
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0, ld)
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]
