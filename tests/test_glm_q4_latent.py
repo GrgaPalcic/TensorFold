@@ -10,10 +10,10 @@ from tensorfold.cuda.geometry import mla_geometry  # noqa: E402
 
 
 def _quantize(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The kernel's scheme: s = 2^ceil(log2(amax / 7)) (1.0 for an all-zero row), codes floor(x / s + 0.5)
+    """The kernel's scheme: s = amax / 7 (1.0 for an all-zero row), codes floor(x / s + 0.5)
     clamped to [-8, 7], two codes a byte (element 2k low, 2k + 1 high, each nibble the code's two's complement)."""
     amax = rows.float().abs().amax(-1, keepdim=True)
-    s = torch.where(amax > 0, torch.exp2(torch.ceil(torch.log2(amax / 7.0))), torch.ones_like(amax))
+    s = torch.where(amax > 0, amax / 7.0, torch.ones_like(amax))
     codes = torch.clamp(torch.floor(rows.float() / s + 0.5), -8, 7).to(torch.int32)
     pairs = codes.view(-1, rows.shape[1] // 2, 2)
     packed = ((pairs[:, :, 0] & 0xF) | (pairs[:, :, 1] << 4)).to(torch.uint8)
@@ -31,10 +31,10 @@ def test_q4_latent_roundtrip_error_bound():
     rows = torch.randn((4096, 512), generator=gen)          # unit-normal rows, the latents' scale
     got = _dequant(*_quantize(rows))
     rel = (got - rows).norm() / rows.norm()
-    assert rel < 0.25                                       # ~0.19: 16 codes over the row's range
+    assert rel < 0.15                                       # amax/7: ~0.135 on unit-normal rows (was 0.19 with the power-of-two ceiling)
     # the codes never clip the row's largest value: amax <= 7 s holds by the scale's construction
     amax = rows.float().abs().amax(1)
-    s = torch.exp2(torch.ceil(torch.log2(amax / 7.0)))
+    s = amax / 7.0
     assert (amax <= 7.0 * s + 1e-5).all()
     # an all-zero row keeps zeros (scale 1, no 0 / 0)
     zero = _dequant(*_quantize(torch.zeros((1, 512))))

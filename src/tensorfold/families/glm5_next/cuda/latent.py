@@ -2,10 +2,10 @@
 
 The cache stores one row a token and DSA layer as bf16, or quantized: fp8 (e4m3fn codes with a per-token f32
 scale, amax / 448) or q4 — 256 uint8 bytes a row, two signed 4-bit codes a byte (element 2k in the low nibble,
-2k + 1 in the high, each nibble the code's two's complement), plus a per-token f32 power-of-two scale in
-``lat_scales``: s = 2^ceil(log2(amax / 7)) (1.0 for an all-zero row), codes floor(x / s + 0.5) clamped to
-[-8, 7]. The row's largest value never clips (amax <= 7 s; the fp32 log2's rounding aside, where the clamp
-bounds the loss at s), so decode is x ~= s * code, read as bf16 into the attention's dots with the scale folded
+2k + 1 in the high, each nibble the code's two's complement), plus a per-token f32 scale in ``lat_scales``:
+s = amax / 7 (1.0 for an all-zero row; the fp8 cache's amax / 448 convention), codes floor(x / s + 0.5) clamped
+to [-8, 7]. The row's largest value maps to code 7 (the fp32 division's rounding aside, where the clamp bounds
+the loss at s), so decode is x ~= s * code, read as bf16 into the attention's dots with the scale folded
 into the scores like the fp8 cache's."""
 
 from __future__ import annotations
@@ -293,7 +293,7 @@ def _lat_write(LAT, lat_stride, LC, POS, SC, LW: tl.constexpr, FP8: tl.constexpr
         k = tl.arange(0, LW)
         row = tl.load(LAT + r * lat_stride + k).to(tl.float32)
         amax = tl.max(tl.abs(row), 0)
-        s = tl.where(amax > 0, tl.exp2(tl.ceil(tl.log2(amax / 7.0))), 1.0)
+        s = tl.where(amax > 0, amax / 7.0, 1.0)
         tl.store(SC + P + r, s)
         codes = tl.minimum(tl.maximum(tl.floor(row / s + 0.5), -8.0), 7.0).to(tl.int32)
         lo, hi = tl.split(tl.reshape(codes, (LW // 2, 2)))
