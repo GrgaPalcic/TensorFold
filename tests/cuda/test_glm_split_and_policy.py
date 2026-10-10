@@ -204,7 +204,7 @@ def test_the_noisy_dflash2_policies(allocations):
 
     assert encode_policy("fnc5:0.3:1.5") == [17, 5, 300000, 1500000]
     assert encode_policy("fcost4:noisy") == [18, 4, 2000000, 0]
-    for bad in ("fnc5", "fnc6:0.3", "fnc5:1.2", "fcost5", "fcost5:loud", "fcost6:noisy"):
+    for bad in ("fnc5", "fnc8:0.3", "fnc5:1.2", "fcost5", "fcost5:loud", "fcost8:noisy"):
         with pytest.raises(ValueError):
             encode_policy(bad)
     p = decode_policy(encode_policy("fnc5:0.3"))

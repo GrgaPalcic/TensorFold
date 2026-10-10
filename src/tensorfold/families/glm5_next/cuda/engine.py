@@ -14,8 +14,9 @@ from typing import Any, Callable
 DEFAULT_POLICY = "auto"
 DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
-GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
-MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows captured as CUDA graphs
+MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts)
+MTP_ROWS = 8                          # the MTP head's decode windows: at most this many rows
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
@@ -169,6 +170,7 @@ class GlmEngine:
         from tensorfold.cuda.comm import open_comm
         from .decode import Engine
         from .weights import Config, load
+        from .qmm import KVB_KINDS, kvb_kind, kvb_weights
         from .split import rule
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda import prompt_precision
@@ -194,7 +196,7 @@ class GlmEngine:
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
+        weights_estimate = kvb_weights(split_weights(rule), kvb_kind() if cfg.quant == "exl3" else "bf16")
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
@@ -209,7 +211,8 @@ class GlmEngine:
         # both ranks must run the same calls: refuse to start when they were given different settings
         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, int(self.mtp_on), int(DRAFT_RING), int(fp8), int(prompt_precision.fp8())]
+                prefill_rows, int(self.mtp_on), int(DRAFT_RING), int(fp8), int(prompt_precision.fp8()),
+                KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16")]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -244,10 +247,10 @@ class GlmEngine:
         if drafter is not None:
             from .dflash2 import Drafter
 
-            self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+            self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
-                        fp8=fp8)
+                        fp8=fp8, mtp_rows=MTP_ROWS)
         if self.drafter is not None:
             self.drafter.capture()
         self.costs = self._calibrate()
@@ -284,7 +287,7 @@ class GlmEngine:
             return [int(t) for t in rng.integers(0, vocab, n)]
 
         prefill(e, tokens(64), None, mtp=True, drafter=self.drafter)
-        hidden = e.pbuf.fnormed[:MAX_ROWS].clone()          # rows for timing the draft steps
+        hidden = e.pbuf.fnormed[:8].clone()          # rows for timing the draft steps
         one, six = tokens(1), tokens(6)
         start = st.mtp_len
 
@@ -292,7 +295,7 @@ class GlmEngine:
             st.set_mtp_len(start)
             st.mtp_drafted = 0
 
-        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, MAX_ROWS + 1)}
+        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, max(GRAPH_ROWS) + 1)}
         if self.w.mtp is not None:
             pieces["m1"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 1, None), rewind)
             pieces["m3"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 3, None), rewind)
@@ -331,7 +334,7 @@ class GlmEngine:
         e.reset()
         if self.drafter is not None:
             self.drafter.reset()
-        rows = list(range(2, MAX_ROWS + 1))
+        rows = list(range(2, max(GRAPH_ROWS) + 1))
         ys = [both[f"v{r}"] for r in rows]
         slope = statistics.median((ys[j] - ys[i]) / (rows[j] - rows[i]) for i in range(len(rows))
                                   for j in range(i + 1, len(rows)))

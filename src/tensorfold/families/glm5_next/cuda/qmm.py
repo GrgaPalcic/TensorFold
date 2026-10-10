@@ -150,6 +150,33 @@ class B16:
         return self.weight.numel() * self.weight.element_size()
 
 
+
+F8_BLOCK = 128           # fp8 columns a scale covers (the latent path's kv_b rows)
+
+
+@dataclass
+class F8:
+    """An FP8 e4m3 matrix [n, k] with an fp32 scale per ``F8_BLOCK`` columns (the latent path's kv_b rows)."""
+
+    weight: torch.Tensor      # [n, k] float8_e4m3fn
+    scale: torch.Tensor       # [n, k // F8_BLOCK] fp32
+    n: int
+    k: int
+
+    def nbytes(self) -> int:
+        return self.weight.numel() * self.weight.element_size() + self.scale.numel() * self.scale.element_size()
+
+
+def make_f8(weight: torch.Tensor) -> F8:
+    """BF16 rows as e4m3, a scale (the 128-column block's amax / 448) a block; lossy, W ~ q * scale."""
+
+    n, k = weight.shape
+    blocks = weight.float().reshape(n, k // F8_BLOCK, F8_BLOCK)
+    scale = (blocks.abs().amax(-1, keepdim=True) / 448.0).clamp_min(1e-12)
+    q = (blocks / scale).to(torch.float8_e4m3fn).reshape(n, k)
+    return F8(q.contiguous(), scale.reshape(n, k // F8_BLOCK).contiguous(), n, k)
+
+
 def make_b16(weight: torch.Tensor) -> B16:
     w = weight.to(torch.bfloat16).contiguous()
     return B16(w, int(w.shape[0]), int(w.shape[1]))
@@ -174,6 +201,48 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
             part |= q[..., j] << (4 * j)
         words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, scale, bias
     return make_q4(words, scales.contiguous(), biases.contiguous())
+
+
+def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
+    """bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings (1.0 down to 0.55
+    of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
+
+    return make_q4(*quantize4_mse_raw(w, chunk, grid))
+
+
+def quantize4_mse_raw(w: torch.Tensor, chunk: int = 4096,
+                      grid: int = 16) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``quantize4_mse``'s groups in MLX's layout, untiled: words [n, k / 8] int32 (8 nibbles low to high), scales and
+    biases [n, k / 64] bf16 (what ``latent.AbsorbQ4`` reads)."""
+
+    n, k = w.shape
+    words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
+    scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
+    biases = torch.empty_like(scales)
+    for r in range(0, n, chunk):
+        g = w[r:r + chunk].float().view(-1, k // 64, 64)
+        lo, hi = g.amin(-1), g.amax(-1)
+        best_s, best_b, best_q, best_err = None, None, None, None
+        for t in range(grid):                                   # each group's range 1.0 .. 0.55 of its min / max
+            f = 1.0 - 0.45 * t / (grid - 1)
+            s = ((hi - lo) * f / 15).clamp_min(1e-8).to(torch.bfloat16).float()
+            b = lo.to(torch.bfloat16).float()
+            q = torch.round((g - b[..., None]) / s[..., None]).clamp(0, 15)
+            err = ((q * s[..., None] + b[..., None] - g) ** 2).sum(-1)
+            if best_err is None:
+                best_s, best_b, best_q, best_err = s, b, q, err
+                continue
+            better = err < best_err
+            best_s = torch.where(better, s, best_s)
+            best_b = torch.where(better, b, best_b)
+            best_q = torch.where(better[..., None], q, best_q)
+            best_err = torch.where(better, err, best_err)
+        q = best_q.view(-1, k // 8, 8).to(torch.int32)
+        part = torch.zeros(q.shape[:2], dtype=torch.int32, device=w.device)
+        for j in range(8):
+            part |= q[..., j] << (4 * j)
+        words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
+    return words, scales.contiguous(), biases.contiguous()
 
 
 def stack_b16(parts: list[torch.Tensor]) -> B16:
@@ -265,3 +334,39 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
         total = m * q.n
         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
     return out
+
+
+KVB_KINDS = ("bf16", "fp8", "q4")
+
+
+def kvb_kind(env=None) -> str:
+    """TF_GLM_KVB: how an EXL3 checkpoint's kv_b_proj is held for the latent path's absorb and expand (the kernels
+    every decode round runs once a DSA layer): bf16 (as stored, the default), fp8 (e4m3, an fp32 scale per row and
+    128 latent columns, ``make_f8``'s layout) or q4 (MSE-searched affine groups of 64 along the latent, the MLX
+    checkpoint's kernels). fp8 and q4 are lossy, like the rest of TF_GLM_DENSE; a row's bits still never depend on its
+    window's other rows, so drafted replies equal serial ones under each."""
+
+    import os
+
+    kind = (os.environ if env is None else env).get("TF_GLM_KVB", "bf16").strip() or "bf16"
+    if kind not in KVB_KINDS:
+        raise ValueError(f"TF_GLM_KVB is bf16, fp8 or q4, not {kind!r}")
+    return kind
+
+
+def kvb_weights(base, kind: str):
+    """A split_weights transform for TF_GLM_KVB: kv_b_proj at a byte a value plus fp32 scales a 128 block (fp8), or
+    half a byte plus a bf16 scale and bias a group of 64 (q4); the latent path then holds no other copy of it."""
+
+    def transform(name: str, info: dict) -> tuple[int, int]:
+        total, extra = base(name, info)
+        shape = info.get("shape") or []
+        if kind == "bf16" or not total or "kv_b_proj" not in name or info.get("dtype") != "BF16" or len(shape) != 2:
+            return total, extra
+        n = total // 2
+        if kind == "fp8" and shape[-1] % F8_BLOCK == 0:
+            return n + n // F8_BLOCK * 4, extra
+        if kind == "q4" and shape[-1] % 64 == 0:
+            return n // 2 + n // 64 * 4, extra
+        return total, extra
+    return transform

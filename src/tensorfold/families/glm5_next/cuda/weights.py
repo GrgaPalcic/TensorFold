@@ -14,7 +14,7 @@ from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .qmm import B16, Q4, as_i32, kvb_kind, make_b16, make_q4, quantize4, stack_b16, stack_q4
 
 PREFIX = "model.language_model."
 
@@ -180,12 +180,10 @@ class DSAW:
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     q_b: Q4
-    kv_k: Q4                  # key rows of kv_b for the local heads
-    kv_v: Q4                  # value rows
-    o: Q4
-    heads: int
+    kv_k: Q4 | B16 | None      # key rows of kv_b for the local heads, when the latent path holds no absorb copy
+    kv_v: Q4 | B16 | None      # value rows
     index: IndexW | None = None
-    absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
+    absorb: object = None     # latent.AbsorbW | AbsorbF8 | AbsorbQ4: kv_b split per head, for attention on the latent cache
     q_a: Exl3Linear | None = None   # the pack's separate EXL3 groups, when they don't stack
     kv_a: Exl3Linear | None = None
 
@@ -266,6 +264,8 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
+            elif isinstance(t, (latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
+                total += t.nbytes()
             elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
                 for v in vars(t).values():
                     add(v)
@@ -295,6 +295,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
+    kvb = kvb_kind() if exl3 else "bf16"     # TF_GLM_KVB: how the latent path holds kv_b (absorb and expand)
     dev = torch.device(device)
     rd = RankReader(model_dir, rank)
     HL = cfg.heads // world
@@ -385,7 +386,6 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
         if exl3:
             w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
         else:
             w, s, b = trip(p + "kv_b_proj")
@@ -393,8 +393,11 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
-        elif exl3:
-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
+            if exl3:
+                kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
+        elif exl3:        # the latent path holds kv_b itself, per head, in TF_GLM_KVB's format (no second copy)
+            absorb = latent.from_bf16(w[krows], w[vrows], HL, kvb)
+            kv_k = kv_v = None
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
         else:

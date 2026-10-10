@@ -84,7 +84,8 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = (), fp8: bool = False) -> None:
+                 taps: tuple[int, ...] = (), fp8: bool = False, mtp_rows: int | None = None) -> None:
+        """``mtp_rows``: the MTP head's decode windows, at most ``max_rows`` (None: as many)."""
         self.w = w
         w.meta["long_context"] = long_context
         self.rows, self.prefill_rows = max_rows, prefill_rows
@@ -93,7 +94,7 @@ class Engine:
         if taps:
             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+        self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
         self.st = State(w, capacity, max_rows, fp8=fp8)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
@@ -103,8 +104,10 @@ class Engine:
         if graphs:
             from .graphs import Graphs
 
-            self.graphs = Graphs(self, graph_rows, graph_rows)
+            self.graphs = Graphs(self, tuple(r for r in graph_rows if r <= max_rows),
+                                 tuple(r for r in graph_rows if self.mbuf is None or r <= self.mbuf.rows))
             self.reset()
+
 
     def reset(self) -> None:
         self.st.reset()
@@ -445,6 +448,36 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+class _Clock:
+    """A first call's start time, then the seconds since it (the wall clock a decode run reports)."""
+
+    def __init__(self) -> None:
+        self.t0 = time.perf_counter()
+
+    def __call__(self) -> float:
+        return time.perf_counter() - self.t0
+
+
+class _Late:
+    """A token handler called once a round's rows are really done (a ``torch.cuda.synchronize``): the rows a call
+    produced buffer here and the handler gets them when the caller flushes, at the end of a decode run. A row list of
+    None flushes what has piled up."""
+
+    def __init__(self, on_tokens, rows: list[int] | None = None) -> None:
+        self.on_tokens = on_tokens
+        self.rows = [] if rows is None else rows
+
+    def __call__(self, rows) -> None:
+        if rows is None:
+            if self.rows:
+                self.on_tokens(self.rows)
+                self.rows = []
+            return
+        self.rows.extend(rows)
+
+
+
+
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -453,6 +486,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
     w, st, b = e.w, e.st, e.buf
     out = [pending]
     stages = dict(forward=0.0, sample=0.0, commit=0.0)
+    deliver = _Late(on_tokens) if on_tokens is not None else None
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
@@ -469,9 +503,11 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         out.append(tok)
-        if on_tokens is not None:
-            on_tokens([tok])
+        if deliver is not None:
+            deliver([tok])
     _sync(w)
+    if deliver is not None:
+        deliver(None)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
 
@@ -521,6 +557,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     policy = policy or DepthPolicy()
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    deliver = _Late(on_tokens) if on_tokens is not None else None
     rounds = drafted = accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
@@ -554,8 +591,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        if deliver is not None:
+            deliver(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
@@ -567,6 +604,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
                         policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
     _sync(w)
+    if deliver is not None:
+        deliver(None)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
@@ -688,6 +727,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         return tree_decode(e, drafter, pending, count, sampling, policy=policy, stop_eos=stop_eos, on_tokens=on_tokens)
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    deliver = _Late(on_tokens) if on_tokens is not None else None
     rounds = drafted = accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
@@ -723,14 +763,16 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        if deliver is not None:
+            deliver(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
     _sync(w)
+    if deliver is not None:
+        deliver(None)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
@@ -744,6 +786,7 @@ def tree_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     w = e.w
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    deliver = _Late(on_tokens) if on_tokens is not None else None
     rounds = drafted = accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
@@ -759,8 +802,9 @@ def tree_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         depths.append(proposed)
         keeps.append(len(kept))
         e.follow(kept)
-        out.extend(kept)
-        if on_tokens is not None:
-            on_tokens(kept[:max(0, count - (len(out) - len(kept)))])
+        if deliver is not None:
+            deliver(kept[:max(0, count - (len(out) - len(kept)))])
     _sync(w)
+    if deliver is not None:
+        deliver(None)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)

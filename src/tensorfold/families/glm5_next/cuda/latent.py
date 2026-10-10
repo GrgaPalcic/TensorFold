@@ -76,7 +76,90 @@ class AbsorbQ4:
         return sum(t.numel() * t.element_size() for t in (self.wkw, self.wks, self.wkb, self.wvw, self.wvs, self.wvb))
 
 
+F8_BLOCK = 128     # latent columns a scale covers (qmm.make_f8's block)
+
+
+class AbsorbF8:
+    """kv_b split per head as FP8 e4m3 (TF_GLM_KVB=fp8): wk [H, qk_dim, latent], wv [H, v_dim, latent] and fp32
+    scales [H, dim, latent / 128], qmm.make_f8's rows as they are (W ~ q * scale). Lossy; half AbsorbW's bytes."""
+
+    def __init__(self, k, v, heads: int) -> None:
+        def per_head(q):
+            return (q.weight.reshape(heads, -1, q.k).contiguous(),
+                    q.scale.reshape(heads, -1, q.k // F8_BLOCK).contiguous())
+
+        self.wk, self.sk = per_head(k)
+        self.wv, self.sv = per_head(v)
+        self.heads, self.qk_dim, self.lw = self.wk.shape
+        self.v_dim = self.wv.shape[1]
+        if self.lw % F8_BLOCK or self.wv.shape[2] != self.lw:
+            raise ValueError("AbsorbF8: expected 128-column blocks along the latent")
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.wk, self.sk, self.wv, self.sv))
+
+
+def from_bf16(k_rows: torch.Tensor, v_rows: torch.Tensor, heads: int, kind: str = "bf16"):
+    """An EXL3 checkpoint's kv_b rows (bf16, head order: k_rows [heads * qk_dim, latent], v_rows alike) as the latent
+    path holds them for TF_GLM_KVB ``kind``: AbsorbW (bf16, as stored), AbsorbF8 (fp8) or AbsorbQ4 (q4, MSE-searched
+    groups of 64 along the latent). A latent width the format does not tile stays bf16."""
+
+    from . import qmm
+
+    if kind not in ("bf16", "fp8", "q4"):
+        raise ValueError(f"kv_b as bf16, fp8 or q4, not {kind!r}")
+    lw = k_rows.shape[1]
+    if kind == "fp8" and lw % F8_BLOCK == 0:
+        return AbsorbF8(qmm.make_f8(k_rows), qmm.make_f8(v_rows), heads)
+    if kind == "q4" and lw % 64 == 0:
+        return AbsorbQ4(qmm.quantize4_mse_raw(k_rows), qmm.quantize4_mse_raw(v_rows), heads)
+    return AbsorbW.from_rows(k_rows, v_rows, heads)
+
+
 # ----------------------------------------------------------------------------------------- absorb, expand ---
+
+F8_ABSORB_BN = 64          # FP8 absorb columns per decode program: 64-byte weight rows, inside one scale block
+if F8_BLOCK % F8_ABSORB_BN:
+    raise ValueError("the FP8 absorb tiles must sit inside 128-column scale blocks")
+
+
+@triton.jit
+def _absorb_q8(Q, WK, SK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
+    """_absorb_q over FP8 weights: the program's [D, BN] block (inside one 128-column scale block) dequantized to
+    fp32 once, then each row's one sum over k, whatever R is."""
+
+    h = tl.program_id(0)
+    n0 = tl.program_id(1) * BN
+    KB: tl.constexpr = LW // 128
+    k = tl.arange(0, D)
+    n = n0 + tl.arange(0, BN)
+    w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :]).to(tl.bfloat16).to(tl.float32)     # [D, BN], exact
+    s = tl.load(SK + (h * D + k) * KB + n0 // 128)                                              # [D]
+    w = w * s[:, None]
+    for r in range(R):
+        q = tl.load(Q + (r * H + h) * D + k).to(tl.float32)
+        acc = tl.sum(q[:, None] * w, axis=0)
+        tl.store(QA + (r * H + h) * LW + n, acc.to(tl.bfloat16))
+
+
+@triton.jit
+def _expand_v8(OL, WV, SV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
+    """_expand_v over FP8 weights: the program's [BN, LW] rows dequantized to fp32 once (a scale a 128 block), then
+    each row's output as one fp32 sum over the latent, whatever R is."""
+
+    h = tl.program_id(0)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    KB: tl.constexpr = LW // 128
+    k = tl.arange(0, LW)
+    w = tl.load(WV + (h * DV + n[:, None]) * LW + k[None, :]).to(tl.bfloat16).to(tl.float32)   # [BN, LW], exact
+    s = tl.load(SV + (h * DV + n[:, None]) * KB + (k // 128)[None, :])                          # [BN, LW]
+    w = w * s
+    for r in range(R):
+        x = tl.load(OL + (r * H + h) * LW + k).to(tl.float32)
+        acc = tl.sum(w * x[None, :], axis=1)
+        tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
+
+
 
 @triton.jit
 def _absorb_q(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
@@ -162,6 +245,9 @@ def row_block(R: int) -> int:
 def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16."""
     R, H, D = q.shape
+    if isinstance(a, AbsorbF8):
+        _absorb_q8[(H, a.lw // F8_ABSORB_BN)](q, a.wk, a.sk, out, R, H=H, D=D, LW=a.lw, BN=F8_ABSORB_BN, num_warps=4)
+        return out
     if isinstance(a, AbsorbQ4):
         rb = row_block(R)
         _absorb_q4[(H, a.lw // 64, triton.cdiv(R, rb))](q, a.wkw, a.wks, a.wkb, out, R, H=H, D=D, LW=a.lw, RB=rb,
@@ -175,6 +261,10 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
 def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16."""
     R, H, _ = o_lat.shape
+    if isinstance(a, AbsorbF8):
+        BN = 16
+        _expand_v8[(H, a.v_dim // BN)](o_lat, a.wv, a.sv, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN, num_warps=4)
+        return out
     if isinstance(a, AbsorbQ4):
         BN = 16
         _expand_v4[(H, a.v_dim // BN)](o_lat, a.wvw, a.wvs, a.wvb, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN,
