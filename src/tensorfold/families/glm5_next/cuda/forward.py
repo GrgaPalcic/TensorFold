@@ -583,9 +583,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels (the GEMMs in fp8 when prompts take FP8), the
         # shared expert (last slot) through BF16 matmuls
-        # fp8 route: prefill chunks only — the captured decode path (R <= MAX_ROWS) stays exact bf16 and
-        # capture-legal (routed() syncs on host, which is illegal inside a graph)
-        if b.fp8 is not None and R > 8:      # engine's MAX_ROWS: the widest captured verify window
+        # fp8 route: actual prefill chunks only — decode (captured graphs and eager verify windows) stays
+        # exact bf16 and capture-legal (routed() syncs on host, which is illegal inside a graph)
+        if b.fp8 is not None and b.prefill:
             moe_fp8.routed(b.normed[:R], b.pick[:R], m.experts, b.fp8, b.exl3, R, c.limit)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
