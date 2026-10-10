@@ -31,8 +31,8 @@ def encode_policy(spec: str) -> list[int]:
 
     spec = str(spec).strip()
     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, "
-                     f"t<FANOUT>d<DEPTH>, or one of these after f (N from 1 to {MAX_ROWS - 1}, FANOUT from 1 to 4, "
-                     f"FANOUT * DEPTH at most {MAX_ROWS - 1}, fncN:P[:B] or fcostN:noisy[:B] with N up to "
+                     f"t<FANOUT>d<DEPTH>, or one of these after f (N from 1 to {len(GRAPH_ROWS) - 1}, FANOUT from 1 to 4, "
+                     f"FANOUT * DEPTH at most {len(GRAPH_ROWS) - 1}, fncN:P[:B] or fcostN:noisy[:B] with N up to "
                      f"{len(GRAPH_ROWS) - 1})")
     try:
         if spec == "auto" or spec.startswith("auto:"):
@@ -51,7 +51,7 @@ def encode_policy(spec: str) -> list[int]:
         if spec.startswith("t"):
             fanout_text, sep, depth_text = spec[1:].partition("d")
             fanout, depth = int(fanout_text), int(depth_text)
-            if not sep or not 1 <= fanout <= 4 or not 1 <= depth <= MAX_ROWS - 1 or fanout * depth > MAX_ROWS - 1:
+            if not sep or not 1 <= fanout <= 4 or not 1 <= depth <= len(GRAPH_ROWS) - 1 or fanout * depth > len(GRAPH_ROWS) - 1:
                 raise bad
             return [6, depth, fanout, 0]
         if spec.startswith("a"):
@@ -63,13 +63,13 @@ def encode_policy(spec: str) -> list[int]:
         if spec.startswith("c"):
             most_text, conf = spec[1:].split(":")
             most = int(most_text)
-            if not 0 < most < MAX_ROWS:
+            if not 0 < most < len(GRAPH_ROWS):
                 raise bad
             return [3, most, int(round(float(conf) * 1e6)), 0]
         most = int(spec)
     except ValueError:
         raise bad from None
-    if not 0 <= most < MAX_ROWS:
+    if not 0 <= most < len(GRAPH_ROWS):
         raise bad
     return [1 if most > 0 else 0, most, 0, 0]
 
@@ -106,18 +106,18 @@ def decode_policy(code: list[int], costs: dict | None = None):
         return ("auto", most, a, b / 1e6, kind == 5)
     kind %= 10
     if kind == 6:
-        return TreePolicy(fanout=a, depth=min(most, MAX_ROWS - 1))
+        return TreePolicy(fanout=a, depth=min(most, len(GRAPH_ROWS) - 1))
     if kind == 2:
-        return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
+        return DepthPolicy(min(most, len(GRAPH_ROWS) - 1), low=a / 1e6, high=b / 1e6)
     if kind == 3:
-        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6)
+        return DepthPolicy(min(most, len(GRAPH_ROWS) - 1), fixed=True, confidence=a / 1e6)
     if kind == 7:
-        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
+        return DepthPolicy(min(most, len(GRAPH_ROWS) - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
     if kind == 8:
         if costs is None:
             raise ValueError("the fcost policy needs the engine's cost table")
-        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
-    return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+        return DepthPolicy(min(most, len(GRAPH_ROWS) - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
+    return DepthPolicy(min(most, len(GRAPH_ROWS) - 1), fixed=True) if kind == 1 else None
 
 
 def round_costs(costs: dict) -> tuple[float, ...]:
