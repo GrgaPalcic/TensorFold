@@ -69,12 +69,16 @@ def _fused_ok(device) -> bool:
     verify per codebook). Cached per process; False falls back to the staged tiles."""
 
     global _FUSED
+    import os
     if _FUSED is None:
         try:
             from . import moe_fp8_fused
             _FUSED = bool(moe_fp8_fused.prime(device))
-        except Exception:
+        except Exception as exc:                     # surfaced: a silent probe failure pins the slow staged path
+            print(f"[tensorfold] fp8 fused probe failed: {type(exc).__name__}: {exc}", flush=True)
             _FUSED = False
+        if os.environ.get("TF_GLM_FP8_DEBUG") == "1":
+            print(f"[tensorfold] fp8 fused probe: {_FUSED}", flush=True)
     return _FUSED
 
 
