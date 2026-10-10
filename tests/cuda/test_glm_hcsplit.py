@@ -94,10 +94,13 @@ def test_hc_post_pair_sums_like_hc_post():
 
 @cuda
 def test_glue_pieces_match_the_whole_rows():
+    gen = torch.Generator().manual_seed(5)
+    rows, d = 70, 256
     fn = torch.randn((24, 4 * d), generator=gen).to(torch.bfloat16).cuda()          # [24, S*D]
     norm_w = torch.randn((d,), generator=gen).to(torch.bfloat16).cuda()
     base = torch.randn((24,), generator=gen).float().cuda()
     scale = torch.randn((3,), generator=gen).float().cuda()
+    x = torch.randn((rows, 4 * d), generator=gen).to(torch.bfloat16).cuda()
 
     out_full = torch.empty((rows, d), dtype=torch.bfloat16, device="cuda")
     xs_full = torch.empty((rows, d // 64), dtype=torch.float32, device="cuda")
