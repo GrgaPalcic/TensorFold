@@ -15,7 +15,6 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.exl3.linear import Exl3Linear
 from . import moe_fp8
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
-from tensorfold.cuda.geometry import PREFILL_ROWS
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
 from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
@@ -584,9 +583,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels (the GEMMs in fp8 when prompts take FP8), the
         # shared expert (last slot) through BF16 matmuls
-        # fp8 route: full prefill chunks only (R >= PREFILL_ROWS) — decode and short prompts stay exact bf16
-        # (fp8 loses to bf16 below ~2K rows, and capture-legal: routed() syncs on host, illegal in a graph)
-        if b.fp8 is not None and b.prefill and R >= PREFILL_ROWS:
+        # fp8 route: full prefill chunks only (R >= the buffer's piece size) — decode and short prompts stay
+        # exact bf16 (fp8 loses to bf16 below ~2K rows; capture-legal: routed() syncs on host, illegal in a graph)
+        if b.fp8 is not None and b.prefill and R >= b.rows:
             moe_fp8.routed(b.normed[:R], b.pick[:R], m.experts, b.fp8, b.exl3, R, c.limit)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)

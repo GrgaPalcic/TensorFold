@@ -9,6 +9,8 @@ from typing import Sequence
 
 import numpy as np
 import torch
+_TORCH_PROFILE = os.environ.get("TF_GLM_TORCH_PROFILE", "")       # a chrome-trace path: one decode round's CUDA kernels
+
 
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
@@ -742,8 +744,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        profile_round = (os.environ.get("TF_GLM_TORCH_PROFILE", "").strip().endswith(".json") and rounds == 1
-                         and not globals().get("_TORCH_PROFILE_DONE"))
+        profile_round = _TORCH_PROFILE and rounds == 1 and not globals().get("_TORCH_PROFILE_DONE")
         if profile_round:
             from torch.profiler import ProfilerActivity, profile
             prof_ctx = profile(activities=[ProfilerActivity.CUDA])
@@ -759,8 +760,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         torch.cuda.synchronize()
         if profile_round:
             prof_ctx.__exit__(None, None, None)
-            path = os.environ.get("TF_GLM_TORCH_PROFILE", "")
-            prof_ctx.export_chrome_trace(path if path.endswith(".json") else "/home/spark/decode_trace.json")
+            prof_ctx.export_chrome_trace(_TORCH_PROFILE)
             globals()["_TORCH_PROFILE_DONE"] = True
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
