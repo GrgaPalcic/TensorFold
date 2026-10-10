@@ -124,6 +124,7 @@ class Buffers:
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             sl = c.shared_width // w.world
             shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
+            self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
             ex0 = next((l.moe.experts for l in w.layers
                         if l.moe is not None and hasattr(l.moe.experts, "gate_ptr")), None)
             self.fp8 = moe_fp8.Scratch(ex0, rows, slots, dev) if ex0 is not None and moe_fp8.enabled() else None
