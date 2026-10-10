@@ -178,6 +178,7 @@ class GlmEngine:
         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
                                               split_weights)
 
+        prefill_rows = PREFILL_ROWS if prefill_rows is None else prefill_rows   # rank-sync and Engine() need the real value
         encode_policy(policy)                           # a bad default fails here, not in the first request
         torch.cuda.set_device(0)
         self.torch = torch
