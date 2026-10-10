@@ -41,10 +41,9 @@ def test_mla_geometry_counts_fp8_latent_rows():
          "index_n_heads": 8, "index_head_dim": 128}
     layers = 4
     bf16 = mla_geometry(t, 1, 8, latent=True).bytes_at(1024)
-    fp8 = mla_geometry(t, 1, 8, latent=True, fp8=True).bytes_at(1024)
-    layers = 4
+    fp8 = mla_geometry(t, 1, 8, latent=True, kv_dtype="fp8").bytes_at(1024)
     assert bf16 - fp8 == layers * 1024 * (512 * 2 - (512 + 4))    # 2 B a latent element -> 1 B + 4 B a token
-    assert mla_geometry(t, 1, 8, latent=False, fp8=True).bytes_at(1024) == \
+    assert mla_geometry(t, 1, 8, latent=False, kv_dtype="fp8").bytes_at(1024) == \
         mla_geometry(t, 1, 8, latent=False).bytes_at(1024)        # the non-latent path ignores fp8
 
 

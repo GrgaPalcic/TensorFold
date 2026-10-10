@@ -253,9 +253,10 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 mtp: bool | None = None, fp8: bool = False) -> Geometry:
+                 mtp: bool | None = None, kv_dtype: str = "bf16") -> Geometry:
     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one);
-    ``fp8``: the latent cache keeps e4m3fn rows plus a per-token f32 scale (the non-latent path ignores fp8)."""
+    ``kv_dtype``: the latent cache keeps e4m3fn rows plus a per-token f32 scale (fp8) or two packed 4-bit codes a
+    byte plus one (q4); the non-latent path ignores it."""
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -287,7 +288,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
         scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
         if latent:
             # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
-            cache = count * capacity * (lw + 4 if fp8 else lw * 2)   # 1 B a row element + 4 B a token's scale
+            cache = count * capacity * (lw + 4 if kv_dtype == "fp8" else lw // 2 + 4 if kv_dtype == "q4" else lw * 2)
             dense = min(capacity, minimum_slots) + PREFILL_ROWS
             scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
                         + 4 * PREFILL_ROWS * heads * lw)

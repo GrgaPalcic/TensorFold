@@ -206,7 +206,7 @@ def memory_fraction(ram_bytes: int) -> float | None:
 # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
 CUDA_QUANTIZATION = (4, 64)
 # the CUDA engine's latent KV cache dtypes (serve_options validates --kv-dtype against these)
-CUDA_KV_DTYPES = ("bf16", "fp8")
+CUDA_KV_DTYPES = ("bf16", "fp8", "q4")
 # --prefill-fp8: the EXL3 checkpoint's routed experts have an FP8 prompt route (moe_fp8); the MLX checkpoint has none
 CUDA_PREFILL_FP8 = True
 

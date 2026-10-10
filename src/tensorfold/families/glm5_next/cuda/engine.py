@@ -191,9 +191,10 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
-        fp8 = kv_dtype == "fp8"
-        if fp8 and not LATENT:
-            raise ValueError("kv-dtype fp8 needs the latent cache (TF_GLM_LATENT=1); the per-head K/V path stays bf16")
+        if kv_dtype not in ("bf16", "fp8", "q4"):
+            raise ValueError(f"kv-dtype {kv_dtype!r}: this engine serves bf16, fp8 or q4")
+        if kv_dtype != "bf16" and not LATENT:
+            raise ValueError(f"kv-dtype {kv_dtype} needs the latent cache (TF_GLM_LATENT=1); the per-head K/V path stays bf16")
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
@@ -202,7 +203,7 @@ class GlmEngine:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT, mtp=self.mtp_on, fp8=fp8),
+                                                             latent=LATENT, mtp=self.mtp_on, kv_dtype=kv_dtype),
                                    weights_estimate, rank=rank, world=2, gather=self._gather_ints,
                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
                                    draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
@@ -216,7 +217,7 @@ class GlmEngine:
         # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
         self.split = SplitSettings.from_env() if split is None else split
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, int(self.mtp_on), int(DRAFT_RING), int(fp8), int(prompt_precision.fp8()),
+                prefill_rows, int(self.mtp_on), int(DRAFT_RING), ("bf16", "fp8", "q4").index(kv_dtype),
                 KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16")] + self.split.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
@@ -225,7 +226,7 @@ class GlmEngine:
         both = self._gather_ints(mine + [spare >> 20])
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, kv-dtype, prompt precision): "
+                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, kv-dtype, prompt precision, "
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
@@ -256,7 +257,7 @@ class GlmEngine:
             self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
-                        fp8=fp8, mtp_rows=MTP_ROWS, split=self.split)
+                        kv=kv_dtype, mtp_rows=MTP_ROWS, split=self.split)
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
@@ -271,6 +272,11 @@ class GlmEngine:
                    if w.mtp is not None else "")
             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
                   f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
+        if rank == 0 and kv_dtype != "bf16":
+            print(f"[tensorfold] kv-dtype {kv_dtype}: the DSA latent cache holds " +
+                  ("e4m3fn rows with a per-token f32 scale (amax / 448)" if kv_dtype == "fp8" else
+                   "packed 4-bit codes with a per-token power-of-two scale") +
+                  " (lossy; drafted replies still equal serial ones)", flush=True)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)

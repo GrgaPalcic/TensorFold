@@ -177,7 +177,7 @@ class Buffers:
 class State:
     """Committed caches of one sequence (and of the MTP head's attention layer)."""
 
-    def __init__(self, w: Weights, capacity: int, rows: int, fp8: bool = False) -> None:
+    def __init__(self, w: Weights, capacity: int, rows: int, kv: str = "bf16") -> None:
         c = w.cfg
         dev = w.device
         HL = c.heads // w.world
@@ -199,12 +199,18 @@ class State:
         self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
         self.scratch = self.scratch_set.views if n else []
         self.latent = latent.ENABLED
-        if fp8 and not self.latent:
-            raise ValueError("fp8 KV needs the latent cache (TF_GLM_LATENT=1)")
-        self.kv_fp8 = fp8
+        if kv not in ("bf16", "fp8", "q4"):
+            raise ValueError(f"kv-dtype {kv!r}: this engine serves bf16, fp8 or q4")
+        if kv != "bf16" and not self.latent:
+            raise ValueError(f"kv-dtype {kv} needs the latent cache (TF_GLM_LATENT=1); the per-head K/V path stays bf16")
+        self.kv_kind = kv
         if self.latent:              # one 512-wide latent a token and layer (kc), no separate values (vc)
-            if fp8:                  # e4m3fn rows with a per-token f32 scale (amax / 448)
+            if kv == "fp8":          # e4m3fn rows with a per-token f32 scale (amax / 448)
                 self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.float8_e4m3fn, device=dev)
+                           for _ in dsa_layers]
+                self.lat_scales = [torch.zeros((capacity,), dtype=torch.float32, device=dev) for _ in dsa_layers]
+            elif kv == "q4":         # two packed 4-bit codes a byte with a per-token f32 power-of-two scale
+                self.kc = [torch.zeros((capacity, c.kv_lora // 2), dtype=torch.uint8, device=dev)
                            for _ in dsa_layers]
                 self.lat_scales = [torch.zeros((capacity,), dtype=torch.float32, device=dev) for _ in dsa_layers]
             else:
@@ -218,8 +224,11 @@ class State:
         self.mtp_drafted = 0
         if w.mtp is not None:
             if self.latent:
-                if fp8:
+                if kv == "fp8":
                     self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.float8_e4m3fn, device=dev)
+                    self.mtp_scales = torch.zeros((capacity,), dtype=torch.float32, device=dev)
+                elif kv == "q4":
+                    self.mtp_kc = torch.zeros((capacity, c.kv_lora // 2), dtype=torch.uint8, device=dev)
                     self.mtp_scales = torch.zeros((capacity,), dtype=torch.float32, device=dev)
                 else:
                     self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
@@ -266,10 +275,12 @@ class State:
         other.mtp_pos_dev = self.mtp_pos_dev.clone()
         other.kc = [x.clone() for x in self.kc]
         other.vc = [x.clone() if x is not None else None for x in self.vc]
+        other.lat_scales = [x.clone() if x is not None else None for x in self.lat_scales]
         if self.index is not None:
             other.index = [tuple(x.clone() for x in trio) for trio in self.index]
         if hasattr(self, "mtp_kc"):
             other.mtp_kc = self.mtp_kc.clone()
+            other.mtp_scales = self.mtp_scales.clone() if self.mtp_scales is not None else None
             other.mtp_vc = self.mtp_vc.clone() if self.mtp_vc is not None else None
         return other
 
@@ -545,7 +556,7 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | 
     with prof.timed("dsa (total)"):
         return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
                          st.index[di] if st.index is not None else None, host_pos, sparse_np,
-                         st.lat_scales[di] if st.kv_fp8 else None)
+                         st.lat_scales[di] if st.kv_kind != "bf16" else None)
 
 
 def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
