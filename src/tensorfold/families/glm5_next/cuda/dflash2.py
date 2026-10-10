@@ -568,7 +568,7 @@ class Drafter:
             order = np.lexsort((tokens, -values), axis=-1)[:, :k]
             values = np.take_along_axis(values, order, axis=1)
             tokens = np.take_along_axis(tokens, order, axis=1)
-        return tokens, values, self.cand_host[self.cand_n:].view(depth, -1).numpy().astype(np.float64)
+        return tokens, values, self.cand_host[self.cand_n:].view(-1, self.hproj.shape[0])[:depth].numpy().astype(np.float64)
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
               sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
