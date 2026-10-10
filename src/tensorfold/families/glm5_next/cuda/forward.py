@@ -15,6 +15,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.cuda.exl3.linear import Exl3Linear
 from . import moe_fp8
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+from tensorfold.cuda.geometry import PREFILL_ROWS
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
 from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
@@ -127,7 +128,7 @@ class Buffers:
             self.exl3 = Exl3Scratch(shape, rows, slots, device=dev)
             ex0 = next((l.moe.experts for l in w.layers
                         if l.moe is not None and hasattr(l.moe.experts, "gate_ptr")), None)
-            self.fp8 = moe_fp8.Scratch(ex0, rows, slots, dev) if ex0 is not None and moe_fp8.enabled() else None
+            self.fp8 = moe_fp8.Scratch(ex0, rows, slots, dev) if prefill and ex0 is not None and moe_fp8.enabled() else None
             if self.fp8 is not None:
                 moe_fp8.prime(dev)             # compile the grouped GEMM before any CUDA graph capture
             self.ey = self.exl3.y.view(rows, slots, D)
@@ -583,9 +584,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels (the GEMMs in fp8 when prompts take FP8), the
         # shared expert (last slot) through BF16 matmuls
-        # fp8 route: actual prefill chunks only — decode (captured graphs and eager verify windows) stays
-        # exact bf16 and capture-legal (routed() syncs on host, which is illegal inside a graph)
-        if b.fp8 is not None and b.prefill:
+        # fp8 route: full prefill chunks only (R >= PREFILL_ROWS) — decode and short prompts stay exact bf16
+        # (fp8 loses to bf16 below ~2K rows, and capture-legal: routed() syncs on host, illegal in a graph)
+        if b.fp8 is not None and b.prefill and R >= PREFILL_ROWS:
             moe_fp8.routed(b.normed[:R], b.pick[:R], m.experts, b.fp8, b.exl3, R, c.limit)
         else:
             exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)

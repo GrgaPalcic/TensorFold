@@ -32,10 +32,12 @@ def test_q4_latent_roundtrip_error_bound():
     got = _dequant(*_quantize(rows))
     rel = (got - rows).norm() / rows.norm()
     assert rel < 0.15                                       # amax/7: ~0.135 on unit-normal rows (was 0.19 with the power-of-two ceiling)
-    # the codes never clip the row's largest value: amax <= 7 s holds by the scale's construction
-    amax = rows.float().abs().amax(1)
-    s = amax / 7.0
-    assert (amax <= 7.0 * s + 1e-5).all()
+    # the kernel's own scale must never clip the row's largest value (checks the returned scale, not a restatement)
+    packed, s = _quantize(rows)
+    assert (rows.float().abs().amax(1) <= 7.0 * s + 1e-5).all()
+    # codes reach the full range on typical rows: some code hits +7
+    b = packed.int()
+    assert ((b & 0xF).eq(7) | ((b >> 4) & 0xF).eq(7)).any()     # codes reach the top of the range
     # an all-zero row keeps zeros (scale 1, no 0 / 0)
     zero = _dequant(*_quantize(torch.zeros((1, 512))))
     assert zero.eq(0).all()

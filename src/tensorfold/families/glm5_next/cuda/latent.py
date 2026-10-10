@@ -315,7 +315,7 @@ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor,
                  scales: torch.Tensor | None = None) -> None:
     """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device); with ``scales``
     (fp32 [capacity]) the cache holds quantized rows: e4m3fn codes with a per-token f32 scale (amax / 448), or
-    a uint8 cache: two packed 4-bit codes a byte and a per-token power-of-two scale (the module docstring's q4)."""
+    a uint8 cache: two packed 4-bit codes a byte and a per-token amax/7 scale (the module docstring's q4)."""
     q4 = cache.dtype == torch.uint8
     _lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, pos, scales if scales is not None else cache,
                                 LW=lat.shape[1], FP8=scales is not None and not q4, Q4=q4, num_warps=4)
