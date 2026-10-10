@@ -117,3 +117,33 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## RED-SNOW dense-EXL3 serving on two DGX Sparks (`redsnow-v1` branch)
+
+This branch serves the RED-SNOW-5.3-FLASH EXL3 SAGE pack with the `glm5_next` CUDA engine at TP=2. Several of
+its changes port designs from MiaAI-Lab's
+[GLM-5.3-Flash EXL3 on 2x DGX Spark with TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+patch series (at commit `b5808ac620c795ec9c0640f3ca2a2f7be21aaa63`), Apache License, Version 2.0, Copyright 2026
+MiaAI-Lab (license text: `LICENSES/Apache-2.0.txt`). The series' NOTICE reads: "GLM-5.3-Flash EXL3 on 2x DGX Spark
+with TensorFold / Copyright 2026 MiaAI-Lab". Each port was re-implemented against this tree; its commit message
+names the patch it follows:
+
+- `patches/0010-glm-hc-split.patch`: the row-split hyper-connection glue of a prompt chunk
+  (`families/glm5_next/cuda/hcsplit.py`, `glue.py`, `forward.py`).
+- `patches/0012-glm-kda-chunked.patch`, `0039-glm-kda-chunked-kernel.patch`, `0014-glm-kda-chunked-gb10.patch`:
+  KDA prompt chunks in chunked (WY) form (`kda_chunk.cu`, `kda_chunk.cpp`, `kda_chunked.py`, `kda.py`).
+- `patches/0013-glm-decode-rounds.patch`: decode-round windows (GRAPH_ROWS, MAX_ROWS, MTP_ROWS), pinned candidate
+  delivery and the kv_b latent formats, including the q4 latent cache (`decode.py`, `engine.py`, `latent.py`,
+  `qmm.py`, `weights.py`, `geometry.py`).
+- `patches/0018-glm-noise-policies.patch`: DFlash2 noise-aware stop rules (`dflash2.py`, `decode.py`, `engine.py`).
+- `patches/0033-glm-prefill-overlap2.patch`: the next block's front overlapped with the split glue exchanges
+  (`hcsplit.py`, `forward.py`).
+- `patches/0086-glm-prompt-scores-loop.patch`: pool scores one row and 32 blocks a program (`sparse.py`).
+- `patches/0047-glm-exl3-decode-loads.patch` and `patches/0090-glm-expert-launch-order.patch`: the 16-byte
+  no-allocate trellis loads (`TF_GLM_EXL3_LOADS`) and the launch-order knob (`TF_GLM_EXL3_SWZ`) of the grouped EXL3
+  decode kernel (`src/tensorfold/cuda/exl3/experts_grouped.cuh`, `experts.cu`, `experts.cpp`, `experts.py`). MiaAI-Lab
+  adapted both from [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) (patch 0580 for
+  the loads), Apache License, Version 2.0, Copyright 2026 Jay Leaton.
+
+The base of this branch, `vcruz305/TensorFold` `glm53-tp4-spark` (TensorFold 0.6.5 with the full GLM-5.3 TP=4 CUDA
+engine by drowzeys and fixes by vcruz305), is kept commit for commit with its original authors.
