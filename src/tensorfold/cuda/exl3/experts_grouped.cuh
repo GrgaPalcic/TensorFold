@@ -253,13 +253,23 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int NS) {
-    const int u = blockIdx.x;
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int NS, int swz) {
+    // SWZ 1 / 2 change only which blocks run together (n block or k slice fastest): same reads, same writes,
+    // different L2 timing (MiaAI 0090, adapted from jayleaton/glm53-tensorfold-spark, Apache-2.0,
+    // Copyright 2026 Jay Leaton).
+    int u = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+    if (swz != 0) {
+        const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        const unsigned r = lid / gridDim.y;
+        nblock = (int)(lid % gridDim.y);
+        if (swz == 1) { u = (int)(r % gridDim.x); zz = (int)(r / gridDim.x); }
+        else { zz = (int)(r % gridDim.z); u = (int)(r / gridDim.z); }
+    }
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = zz % MT;
+    const int split = (zz / MT) % SK;
+    const int mat = zz / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -282,7 +292,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = nblock * NT;
 
     float acc[NT][2][4];
 #pragma unroll
@@ -443,26 +453,32 @@ void dequant_fp8_launch(const int64_t* tp, const int* k2s, uint8_t* out, int E, 
     int mats, nt, warps, pf, lo, hi;
     int ld = 0;          // 0: 32-bit loads; 1 / 2 / 4: 16-byte staged loads, that many steps in flight
     int ns = 0;          // trellis row stride in tiles (0 = N/16)
+    int swz = 0;         // launch order: 0 as launched, 1 / 2 a k slice's blocks together
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
-    const int LD_ = a.ld != 0, PD_ = a.ld ? a.ld : 1;
-#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, LD_, PD_><<<grid, W_ * 32, 0, stream>>>(                         \
+#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_, LD_, PD_)                                                              \
+    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, LD_, PD_><<<grid, W_ * 32, 0, stream>>>(                          \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots, a.ns)
-#define TF_RANGES(NT_, W_, PF_)                                                                                 \
-    if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
-    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
-    else TF_LAUNCH(NT_, W_, PF_, 2, 16);
+        a.slots, a.ns, a.swz)
+#define TF_LD(NT_, W_, PF_, LO_, HI_)                                                                            \
+    if (a.ld == 0) TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 0, 1);                                                      \
+    else if (a.ld == 1) TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 1, 1);                                                 \
+    else if (a.ld == 2) TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 1, 2);                                                 \
+    else TF_LAUNCH(NT_, W_, PF_, LO_, HI_, 1, 4)
+#define TF_RANGES(NT_, W_, PF_)                                                                                  \
+    if (a.lo == 8 && a.hi == 8) TF_LD(NT_, W_, PF_, 8, 8);                                                       \
+    else if (a.lo >= 2 && a.hi <= 10) TF_LD(NT_, W_, PF_, 2, 10);                                                \
+    else TF_LD(NT_, W_, PF_, 2, 16);
     if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1) }
     else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
     else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
 #undef TF_RANGES
+#undef TF_LD
 #undef TF_LAUNCH
 }
 
