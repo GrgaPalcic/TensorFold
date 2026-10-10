@@ -175,8 +175,10 @@ def grouped_mm(a8: torch.Tensor, sa: torch.Tensor, b8: torch.Tensor, sb: torch.T
         try:
             from . import moe_fp8_gemm
             return moe_fp8_gemm.grouped(a8, sa, b8, sb, offs, E)
-        except (RuntimeError, ValueError, triton_compilation_error()):
+        except (RuntimeError, ValueError, triton_compilation_error()) as exc:
             globals()["_TRITON"] = False
+            print(f"[tensorfold] the fp8 grouped-GEMM Triton kernel failed once: {type(exc).__name__}: {exc};"
+                  " the torch grouped GEMMs take over", flush=True)
 
     ok = _grouped_ok()
     if ok:
