@@ -683,7 +683,7 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
                     b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters)
         done = None                              # rows whose front the glue already ran (TF_GLM_PREFILL_OVERLAP=2)
         for i, layer in enumerate(layers):
-            _mixer(layer, w, st, b, R, nch, host_pos, None, done)
+            _mixer(layer, w, st, b, R, nch, host_pos, None, None, done)
             front = ffn_front(layer, w, b) if fronts else None
             with prof.timed("hc"):
                 sp.glue(layer.ffn_hc, layer.post_norm, front=front)
