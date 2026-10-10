@@ -125,11 +125,11 @@ def scenario():
 def test_the_codebook_bounds_hold():
     for cb, name in enumerate(("3inst", "mcg")):
         assert moe_fp8._codebook_max(cb) == pytest.approx(abs(exl3_format.codebook(name)).max())
-    # mul1 (cb 2): the decode follows the CUDA dp4a + hfma path, which rounds differently from the numpy
-    # reference and peaks higher - the bound must cover the CUDA values or e4m3 would saturate
+    # mul1 (cb 2): the dp4a path sums UNSIGNED bytes and lands them at fp16 1024 + sum, one hfma
+    # rounding - bit-identical to the numpy table, so the bound is that table's absmax (3.453)
     from tensorfold.families.glm5_next.cuda.moe_fp8_fused import cuda_codebook
     assert moe_fp8._codebook_max(2) == pytest.approx(abs(cuda_codebook(2)).max())
-    assert moe_fp8._codebook_max(2) > abs(exl3_format.codebook("mul1")).max()
+    assert moe_fp8._codebook_max(2) == pytest.approx(abs(exl3_format.codebook("mul1")).max())
 
 
 def test_tensorwise_e4m3_keeps_the_normal_values():
@@ -221,6 +221,29 @@ def test_the_dequant_fp8_kernel_decodes_to_the_reference_tiles():
             f"expert {e}: the kernel's up tile differs from the reference"
         assert torch.equal(s.b_d[e].cpu(), moe_fp8.fp8_tile_reference(ex.td[e], ex.bits, ex.cb, inv)), \
             f"expert {e}: the kernel's down tile differs from the reference"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the dequant_fp8 kernel)")
+@pytest.mark.parametrize("bits", [4, 5, 6])
+def test_the_ext_decode_matches_the_reference_for_mul1(bits):
+    """Regression: the mul1 fp8 decode once summed the dp4a bytes SIGNED, garbling every state with a
+    high byte bit. The ext kernel (production) and the numpy table must agree bit for bit; the live
+    GLM-5.3-Flash checkpoints are mul1 with mixed per-expert bits (k2 8/10/12)."""
+
+    from tensorfold.cuda.exl3 import experts as exl3_experts
+    rng = np.random.default_rng(int(bits) + 30)
+    k2 = int(2 * bits)
+    shape = (D // 16, I // 16, 8 * k2)
+    ts = [torch.from_numpy(rng.integers(-32768, 32767, shape, dtype=np.int16)).to("cuda").contiguous()
+          for _ in range(3)]
+    ptrs = torch.tensor([t.data_ptr() for t in ts], dtype=torch.int64, device="cuda")
+    k2s = torch.full((3,), k2, dtype=torch.int32, device="cuda")
+    inv = moe_fp8.FP8_MAX / moe_fp8._codebook_max(2)
+    out = torch.empty((3, I * D), dtype=torch.uint8, device="cuda")
+    exl3_experts._ext().dequant_fp8(ptrs, k2s, out, D, I, I >> 4, I * D, 0, inv, 2)
+    for e, t in enumerate(ts):
+        assert torch.equal(out[e].view(I, D).cpu(), moe_fp8.fp8_tile_reference(t.cpu().numpy(), bits, 2, inv)), \
+            f"k2 {k2} expert {e}: the ext decode differs from the numpy mul1 table"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the fused Triton kernel)")

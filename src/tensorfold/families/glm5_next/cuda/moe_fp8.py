@@ -50,9 +50,9 @@ def _codebook_max(cb: int) -> float:
     """The largest absolute value a codebook state decodes to: the scale's bound (conservative is fine -
     e4m3 rounding is relative, so any scale that cannot overflow gives the same ~2^-4 relative error).
 
-    mul1 (cb 2) is checked against the CUDA decode, not the numpy reference: the dp4a + hfma path rounds
-    differently (state 1 is -4.004 here, +0.641 in the numpy table) and peaks higher (5.102 vs 3.453), so
-    the numpy bound would saturate e4m3 on the largest states."""
+    All three codebooks decode identically under the numpy and CUDA paths (mul1's dp4a sums UNSIGNED
+    bytes and lands them at fp16 1024 + sum, one hfma rounding = the float64 formula), so the bound is
+    the shared table's absmax (mul1: 3.453)."""
 
     if cb == 2:
         from .moe_fp8_fused import cuda_codebook

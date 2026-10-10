@@ -102,9 +102,9 @@ def _jit():
                           & 0xFFFF).to(tl.uint32)
             if CB == 2:                                 # mul1: the dp4a byte sum, the hfma constants
                 x = st * 0x83DCD12D
-                sm = ((x & 0xFF).to(tl.int8).to(tl.int32) + ((x >> 8) & 0xFF).to(tl.int8).to(tl.int32)
-                      + ((x >> 16) & 0xFF).to(tl.int8).to(tl.int32) + ((x >> 24) & 0xFF).to(tl.int8).to(tl.int32)
-                      + 0x6400)
+                sm = ((x & 0xFF).to(tl.int32) + ((x >> 8) & 0xFF).to(tl.int32)
+                      + ((x >> 16) & 0xFF).to(tl.int32) + ((x >> 24) & 0xFF).to(tl.int32)
+                      + 0x6400)                         # unsigned bytes: 0x6400 lands the sum at fp16 1024 + sum
                 hv = (sm & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
                 sc = tl.full((1,), 0x1EEE, tl.uint16).to(tl.float16, bitcast=True)
                 bi = tl.full((1,), 0xC931, tl.uint16).to(tl.float16, bitcast=True)
@@ -194,24 +194,13 @@ def grouped(a8: torch.Tensor, sa: torch.Tensor, ptrs: torch.Tensor, k2s: torch.T
 def cuda_codebook(cb: int) -> np.ndarray:
     """The [65536] fp16 state table per the CUDA kernels' arithmetic (``cb_pair`` in experts_grouped.cuh).
 
-    For the 3inst and mcg codebooks this is bit-identical to ``exl3_format.codebook``; mul1's dp4a path
-    (signed byte sum + 0x6400, then the hfma constants) rounds differently from the numpy reference, so the
-    fused kernel's mul1 tiles are checked against this table, which is what the staged tiles hold too."""
+    Bit-identical to ``exl3_format.codebook`` for every codebook: mul1's dp4a sums UNSIGNED bytes and the
+    +0x6400 lands the sum at fp16 1024 + sum, and the hfma is one fp16 rounding — the same single rounding
+    the float64 numpy formula makes."""
 
-    s = np.arange(65536, dtype=np.uint64)
-    if cb == 2:
-        x = (s * 0x83DCD12D) & 0xFFFFFFFF
-
-        def sbyte(sh):
-            b = ((x >> sh) & 0xFF).astype(np.int64)
-            return np.where(b > 127, b - 256, b)
-
-        tot = sbyte(0) + sbyte(8) + sbyte(16) + sbyte(24) + 0x6400
-        f16 = lambda v: np.float32(np.array(v, dtype=np.uint16).view(np.float16))
-        hv = (tot & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)
-        mul = (hv * f16(0x1EEE)).astype(np.float16).astype(np.float32)      # hfma2: fp16 mul, then fp16 add
-        return (mul + f16(0xC931)).astype(np.float16)
     from tensorfold.cuda.exl3 import format as exl3_format
+    if cb == 2:
+        return exl3_format.codebook("mul1")
     return exl3_format.codebook(("3inst", "mcg")[cb])
 
 
