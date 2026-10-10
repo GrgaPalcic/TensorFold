@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -741,6 +742,12 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        profile_round = (os.environ.get("TF_GLM_TORCH_PROFILE", "").strip().endswith(".json") and rounds == 1
+                         and not globals().get("_TORCH_PROFILE_DONE"))
+        if profile_round:
+            from torch.profiler import ProfilerActivity, profile
+            prof_ctx = profile(activities=[ProfilerActivity.CUDA])
+            prof_ctx.__enter__()
         t0 = time.perf_counter()
         drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
                   if depth > 0 else [])
@@ -750,6 +757,11 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         R = len(tokens)
         logits = e.forward(tokens)
         torch.cuda.synchronize()
+        if profile_round:
+            prof_ctx.__exit__(None, None, None)
+            path = os.environ.get("TF_GLM_TORCH_PROFILE", "")
+            prof_ctx.export_chrome_trace(path if path.endswith(".json") else "/home/spark/decode_trace.json")
+            globals()["_TORCH_PROFILE_DONE"] = True
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
