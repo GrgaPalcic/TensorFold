@@ -162,8 +162,9 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None, kv_dtype: str = "bf16") -> None:
-        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
+                 prefill_rows: int | None = None, kv_dtype: str = "bf16", split=None) -> None:
+        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+        ``split``: a ``hcsplit.SplitSettings`` instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests)."""
 
         import torch
 
@@ -209,10 +210,14 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+        from .hcsplit import SplitSettings
+
+        # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
+        # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
+        self.split = SplitSettings.from_env() if split is None else split
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, int(self.mtp_on), int(DRAFT_RING), int(fp8), int(prompt_precision.fp8()),
-                KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16")]
+                KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16")] + self.split.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -221,6 +226,7 @@ class GlmEngine:
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, kv-dtype, prompt precision): "
+                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -250,7 +256,11 @@ class GlmEngine:
             self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
-                        fp8=fp8, mtp_rows=MTP_ROWS)
+                        fp8=fp8, mtp_rows=MTP_ROWS, split=self.split)
+        if self.e.pbuf.split is not None:
+            self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+            if rank == 0:
+                print(f"[tensorfold] {self.split.describe()}", flush=True)
         if self.drafter is not None:
             self.drafter.capture()
         self.costs = self._calibrate()
