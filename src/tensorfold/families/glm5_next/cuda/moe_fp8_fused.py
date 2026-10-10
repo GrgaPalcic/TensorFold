@@ -29,11 +29,11 @@ import importlib.util
 import numpy as np
 import torch
 
-BLOCK_P = 64
-BLOCK_N = 256
-BLOCK_K = 32                # two 16x16 k tiles per iteration; the B decode is per element, no staging
+BLOCK_P = 128
+BLOCK_N = 128                # event-timed best on GB10 (cc 12.1); 256 costs ~2x despite fewer A reloads
+BLOCK_K = 64                # four 16x16 k tiles per iteration; the B decode is per element, no staging
 NUM_WARPS = 8
-NUM_STAGES = 2
+NUM_STAGES = 1              # double-buffering the stage measured slower in the config sweep
 
 FP8_MAX = 448.0
 
@@ -47,7 +47,7 @@ def _jit():
     @triton.jit
     def _fused_fp8_gemm(a_ptr, sa_ptr, sb_ptr, tp_ptr, k2_ptr, tab_ptr, offs_ptr, pad_ptr, out_ptr,
                         E, K, N, s_a, rtiles, inv,
-                        BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                        BLOCK_P: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, WW: tl.constexpr,
                         CB: tl.constexpr, FP8_DOT: tl.constexpr):
         b0 = tl.program_id(0) * BLOCK_P
         col0 = tl.program_id(1) * BLOCK_N
@@ -65,9 +65,9 @@ def _jit():
         rows = start + (b0 - seg0) + rp
         cols = col0 + rn
         rmask = rows < end
-        # this expert's trellis: the int64 byte base as uint32 words (a tile is 4 * k2 of them)
+        # this expert's trellis: the int64 byte base as uint32 words (a tile is 4 * k2 of them, 4-byte aligned)
         k2 = tl.load(k2_ptr + e)
-        tp = tl.load(tp_ptr + e).to(tl.pointer_type(tl.uint32))
+        tw = tl.load(tp_ptr + e).to(tl.pointer_type(tl.uint32))
         # the value's stream index p from the position in the 16x16 tile, then the packed window table:
         # i0 | off << 6 | i1 << 11, row k2 - 2 of [15, 256] (K2 half-bits 2..16)
         r16 = (rk % 16)[:, None]
@@ -76,17 +76,30 @@ def _jit():
         pk = tl.load(tab_ptr + (k2 - 2) * 256 + pv)
         i0 = pk & 63
         off = (pk >> 6) & 31
-        i1 = (pk >> 11) & 63
+        # a value is the 16-bit window ending (16 - off) bits into word i0, four-bit aligned, so it always
+        # sits inside the sliding u64 (word i0, word i0 + 1 mod 4 * k2): stage each k iteration's tiles with
+        # two coalesced u32 loads (the second shifted by a word, wrapped) and gather one sliding u64 per
+        # element -- one shared-memory gather instead of two scattered global loads per element
+        NKT: tl.constexpr = BLOCK_K // 16
+        NNT: tl.constexpr = BLOCK_N // 16
+        NT: tl.constexpr = NKT * NNT
+        tilef = tl.reshape((rk // 16)[:, None] * NNT + (rn // 16)[None, :], (BLOCK_K * BLOCK_N,))
         acc = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
         for k0 in range(0, K, BLOCK_K):
             ks = k0 + rk
             a = tl.load(a_ptr + rows[:, None] * s_a + ks[None, :], mask=rmask[:, None])
-            # the tile's uint32 base: k tile index * row stride + n tile index, in 4 * k2 u32 words a tile
-            tb = ((k0 // 16 + (rk // 16)[:, None]) * rtiles + col0 // 16 + (rn // 16)[None, :]) * (4 * k2)
-            w0 = tl.load(tp + tb + i0)
-            w1 = tl.load(tp + tb + i1, mask=off > 16, other=0)
-            st = tl.where(off <= 16, (w0 >> (16 - off)) & 0xFFFF,
-                          ((w1 >> tl.minimum(48 - off, 31)) | (w0 << tl.maximum(off - 16, 0))) & 0xFFFF)
+            e1 = tl.arange(0, NT * WW)                       # the stage: NT tiles x WW sliding-u64 slots
+            tt = e1 // WW
+            pp = e1 % WW
+            wbase = ((k0 // 16 + tt // NNT) * rtiles + col0 // 16 + (tt % NNT)) * (4 * k2) + pp
+            wa = tl.load(tw + wbase, mask=pp < 4 * k2, other=0)
+            wb = tl.load(tw + wbase + 1 - (pp == 4 * k2 - 1).to(tl.int32) * 4 * k2, mask=pp < 4 * k2, other=0)
+            flat = wa.to(tl.uint64) | (wb.to(tl.uint64) << 32)
+            wg = tl.reshape(tl.gather(flat, (tilef * WW + tl.reshape(i0, (BLOCK_K * BLOCK_N,))).to(tl.int32), 0),
+                            (BLOCK_K, BLOCK_N))
+            st = tl.where(off <= 16, (wg >> (16 - off)) & 0xFFFF,
+                          (((wg & 0xFFFF) << tl.maximum(off - 16, 0)) | (wg >> tl.minimum(80 - off, 63)))
+                          & 0xFFFF).to(tl.uint32)
             if CB == 2:                                 # mul1: the dp4a byte sum, the hfma constants
                 x = st * 0x83DCD12D
                 sm = ((x & 0xFF).to(tl.int8).to(tl.int32) + ((x >> 8) & 0xFF).to(tl.int8).to(tl.int32)
@@ -106,10 +119,11 @@ def _jit():
                 hi = (x >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
                 v = (lo.to(tl.float32) + hi.to(tl.float32)).to(tl.float16)
             b = (v.to(tl.float32) * inv).to(tl.float8e4nv)
+            af = a.to(tl.float8e4nv, bitcast=True)      # A arrives as fp8 or raw uint8 bytes; never a value cast
             if FP8_DOT:
-                acc = tl.dot(a.to(tl.float8e4nv, bitcast=True), b, acc)
+                acc = tl.dot(af, b, acc)
             else:
-                acc = tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16), acc)
+                acc = tl.dot(af.to(tl.bfloat16), b.to(tl.bfloat16), acc)
         scale = tl.load(sa_ptr) * tl.load(sb_ptr)
         tl.store(out_ptr + rows[:, None] * N + cols[None, :], (acc * scale).to(tl.bfloat16),
                  mask=rmask[:, None] & (cols < N)[None, :])
@@ -169,8 +183,10 @@ def grouped(a8: torch.Tensor, sa: torch.Tensor, ptrs: torch.Tensor, k2s: torch.T
     out = torch.empty((P, N), dtype=torch.bfloat16, device=a8.device)
     kern = _jit()
     grid = (triton.cdiv(P + E * BLOCK_P, BLOCK_P), triton.cdiv(N, BLOCK_N))
+    assert N % BLOCK_N == 0 and K % BLOCK_K == 0, (N, K)
     kern[grid](a8, sa, sb, ptrs, k2s, tables(a8.device), offs, padded, out,
-               E, K, N, a8.stride(0), rtiles, inv, BLOCK_P, BLOCK_N, BLOCK_K, cb, _FP8_DOT,
+               E, K, N, a8.stride(0), rtiles, inv, BLOCK_P, BLOCK_N, BLOCK_K,
+               32 if int(k2s.max()) <= 8 else 64, cb, _FP8_DOT,
                num_warps=NUM_WARPS, num_stages=NUM_STAGES)
     return out
 
@@ -256,7 +272,7 @@ def _probe_fp8_dot(device) -> None:
     kern = _jit()
     kern[(1, 1)](a, torch.ones(1, dtype=torch.float32, device=device),
                  torch.ones(1, dtype=torch.float32, device=device), ptrs, k2s, tables(device), offs, offs,
-                 out, E, K, N, a.stride(0), N >> 4, 1.0, BLOCK_P, BLOCK_N, BLOCK_K, 0, True,
+                 out, E, K, N, a.stride(0), N >> 4, 1.0, BLOCK_P, BLOCK_N, BLOCK_K, 32, 0, True,
                  num_warps=NUM_WARPS, num_stages=NUM_STAGES)
     torch.cuda.synchronize()
 
