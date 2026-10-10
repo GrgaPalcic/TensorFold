@@ -28,6 +28,15 @@ def test_settings_parse_and_code():
     assert (s.split, s.overlap, s.pieces, s.min_rows, s.exchange) == (True, True, 3, 128, "gather")
     assert s.piece_count() == 1                      # overlap pieces are p2p only
     assert s.code() == [1, 1, 1, 128, 1]
+    two = hcsplit.SplitSettings.from_env({"TF_GLM_HC_SPLIT": "1", "TF_GLM_PREFILL_OVERLAP": "2"})
+    assert two.fronts and two.code() == [1, 2, 2, 64, 0]      # the default 2 pieces, p2p
+    with pytest.raises(ValueError):
+        hcsplit.SplitSettings.from_env({"TF_GLM_PREFILL_OVERLAP": "2"})          # still needs the split
+    with pytest.raises(ValueError):
+        hcsplit.SplitSettings.from_env({"TF_GLM_PREFILL_OVERLAP": "3"})
+    with pytest.raises(ValueError):
+        hcsplit.SplitSettings(split=True, fronts=True)                           # fronts need the overlap
+
     off = hcsplit.SplitSettings.from_env({})
     assert off.code() == [0, 0, 0, 0, 0]
     with pytest.raises(ValueError):

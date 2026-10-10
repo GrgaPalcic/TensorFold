@@ -22,9 +22,6 @@ instead (whole halves, one piece: the partial halves out of place into the unuse
 place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric.
 """
 
-from . import glue
-
-
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -59,19 +56,28 @@ class SplitSettings:
     pieces: int = 2               # TF_GLM_OVERLAP_PIECES: row pieces a site's swaps run in (overlap, p2p only)
     min_rows: int = 64            # TF_GLM_HC_SPLIT_MIN_ROWS: shorter chunks (a prompt's tail) run unsplit
     exchange: str = "p2p"         # TF_GLM_HC_EXCHANGE: p2p (ncclSend/ncclRecv) or gather (the all-gather)
+    fronts: bool = False          # TF_GLM_PREFILL_OVERLAP=2: the next block's front on own rows during the swaps
+
+    def __post_init__(self) -> None:
+        if self.fronts and not self.overlap:
+            raise ValueError("the blocks' fronts run during the overlapped swaps: they need the overlap")
 
     @classmethod
     def from_env(cls, env=None) -> "SplitSettings":
         env = os.environ if env is None else env
         split = _flag(env, "TF_GLM_HC_SPLIT")
-        overlap = _flag(env, "TF_GLM_PREFILL_OVERLAP")
+        level = str(env.get("TF_GLM_PREFILL_OVERLAP", "") or "0").strip()
+        if level not in ("0", "1", "2"):
+            raise ValueError(f"TF_GLM_PREFILL_OVERLAP: 0, 1 or 2, not {level!r}")
+        overlap = level != "0"
         if overlap and not split:
-            raise ValueError("TF_GLM_PREFILL_OVERLAP=1 overlaps the row-split exchanges: it needs TF_GLM_HC_SPLIT=1")
+            raise ValueError(f"TF_GLM_PREFILL_OVERLAP={level} overlaps the row-split exchanges: it needs "
+                             "TF_GLM_HC_SPLIT=1")
         exchange = str(env.get("TF_GLM_HC_EXCHANGE", "") or "p2p").strip()
         if exchange not in EXCHANGES:
             raise ValueError(f"TF_GLM_HC_EXCHANGE: {' or '.join(EXCHANGES)}, not {exchange!r}")
         return cls(split, overlap, _int(env, "TF_GLM_OVERLAP_PIECES", 2, 1, 8),
-                   _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange)
+                   _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange, fronts=level == "2")
 
     def piece_count(self) -> int:
         return self.pieces if self.overlap and self.exchange == "p2p" else 1
@@ -79,7 +85,8 @@ class SplitSettings:
     def code(self) -> list[int]:
         if not self.split:
             return [0, 0, 0, 0, 0]
-        return [1, int(self.overlap), self.piece_count(), self.min_rows, EXCHANGES.index(self.exchange)]
+        return [1, int(self.overlap) + int(self.fronts), self.piece_count(), self.min_rows,
+                EXCHANGES.index(self.exchange)]
 
     def describe(self) -> str:
         what = "rows split between the ranks"
@@ -87,6 +94,8 @@ class SplitSettings:
         if self.overlap:
             n = self.piece_count()
             what += f" on a second stream{f' in {n} pieces' if n > 1 else ''}"
+            if self.fronts:
+                what += ", the next block's front on own rows meanwhile"
         return f"prompt chunks' hyper-connections: {what} (chunks of {self.min_rows}+ rows)"
 
 
@@ -212,9 +221,18 @@ class HcSplit:
                 self.ev_part[j].record(self.stream)
         self._fill(fill, mine, mine + self.H)
 
-    def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False) -> None:
+    def own(self) -> tuple[int, int]:
+        """This rank's rows of the chunk, [lo, hi) (the pad row left out)."""
+
+        return self.mine(), min(self.mine() + self.H, self.R)
+
+    def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+             front: Callable[[int, int], None] | None = None) -> None:
         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
-        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's."""
+        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's. ``front(lo, hi)``
+        (TF_GLM_PREFILL_OVERLAP=2): the next block's row-independent start on this rank's rows of each piece, on the
+        main stream right after the piece's glue, while its swap (and the later pieces' partials) are on the wire;
+        the caller runs it on the peer's rows (``own`` is what was done) after this returns."""
 
         b, c = self.b, self.w.cfg
         mine = self.mine()
@@ -237,11 +255,15 @@ class HcSplit:
                             b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters)
             if self.stream is None:
                 self._swap_rows(j, outs)
+                if front is not None:
+                    self._fill(front, lo, hi)
                 continue
             self.ev_glue[j].record(main)
             with torch.cuda.stream(self.stream):
                 self.stream.wait_event(self.ev_glue[j])
                 self._swap_rows(j, outs)
+            if front is not None:
+                self._fill(front, lo, hi)
         if self.stream is not None:
             self.ev_done.record(self.stream)
             main.wait_event(self.ev_done)
