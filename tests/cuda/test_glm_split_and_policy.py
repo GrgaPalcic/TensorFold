@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tensorfold.families.glm5_next.cuda import split
+from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so dflash2 imports)
 from tensorfold.families.glm5_next.cuda.engine import _f64_ints, _ints_f64, decode_policy, encode_policy
 
 L = "model.language_model."
@@ -195,6 +196,54 @@ def test_policies_and_the_request_header():
         parts = [seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62]
         assert all(0 <= p < 2**31 for p in parts)
         assert (parts[2] << 62) | (parts[1] << 31) | parts[0] == seed
+
+
+def test_the_noisy_dflash2_policies(allocations):
+    from tensorfold.families.glm5_next.cuda import dflash2
+    assert encode_policy("fnc5:0.3") == [17, 5, 300000, 2000000]
+
+    assert encode_policy("fnc5:0.3:1.5") == [17, 5, 300000, 1500000]
+    assert encode_policy("fcost4:noisy") == [18, 4, 2000000, 0]
+    for bad in ("fnc5", "fnc6:0.3", "fnc5:1.2", "fcost5", "fcost5:loud", "fcost6:noisy"):
+        with pytest.raises(ValueError):
+            encode_policy(bad)
+    p = decode_policy(encode_policy("fnc5:0.3"))
+    assert p.fixed and p.most == 5 and p.confidence == 0.3 and p.beta == dflash2.NOISY_BETA
+    assert p.chain_rule == {"beta": p.beta, "round_ms": None}
+    with pytest.raises(ValueError):
+        decode_policy(encode_policy("fcost4:noisy"))
+    costs = {"verify": [1.0, 2.0, 3.0, 4.0, 5.0], "block": 0.5, "taps_row": 0.01}
+    cost = decode_policy(encode_policy("fcost4:noisy"), costs)
+    assert cost.fixed and cost.most == 4 and cost.beta == 2.0
+    assert cost.round_ms == tuple(v + 0.5 + 0.01 for v in costs["verify"])
+    assert cost.chain_rule == {"beta": 2.0, "round_ms": cost.round_ms}
+
+
+def test_the_noise_aware_chain_changes_only_where_it_stops(allocations):
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter, best_depth, noisy_confidence
+
+    score = np.array([1.0, 0.5, -0.5])
+    noise = np.array([0.2, -0.4, 0.9])
+    e = np.exp(score / 2.0)
+    assert noisy_confidence(score, None, 0, 2.0) == pytest.approx(float(e[0] / e.sum()))
+    e = np.exp((score + noise) / 2.0 - (score + noise).max())
+    assert noisy_confidence(score, noise, 2, 2.0) == pytest.approx(float(e[2] / e.sum()))
+    assert best_depth([0.9, 0.5, 0.1], [10.0, 11.0, 12.0, 13.0]) == 2     # 2.35 / 12 beats 1.9 / 11 and 2.395 / 13
+    assert best_depth([0.9, 0.9, 0.9], [10.0, 11.0, 12.0, 13.0]) == 3
+    rng = np.random.default_rng(0)
+    depth, k = 5, 4
+    tokens, values = rng.integers(0, 6, (depth, k)), rng.normal(size=(depth, k))
+    proj = np.abs(rng.normal(size=depth))
+    d = Drafter.__new__(Drafter)
+    d.succ, d.pred = rng.normal(size=(6, 3)), rng.normal(size=(6, 3))
+    s = Sampling(9, 1.0, 0, 1.0, 0.0)
+    whole = Drafter.chain(d, tokens, values, proj, 0, 1, s, 0.0)
+    assert Drafter.chain(d, tokens, values, proj, 0, 1, s, 0.0, beta=2.0) == whole
+    for cut in (0.7, 0.3):
+        plain = Drafter.chain(d, tokens, values, proj, 0, 1, s, cut)
+        noisy = Drafter.chain(d, tokens, values, proj, 0, 1, s, cut, beta=2.0)
+        assert whole[:len(plain)] == plain and whole[:len(noisy)] == noisy
 
 
 def test_family_has_a_mac_engine_and_cuda_needs_two_ranks(tmp_path):

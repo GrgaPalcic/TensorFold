@@ -22,12 +22,17 @@ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 
 def encode_policy(spec: str) -> list[int]:
-    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
+    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2.
+
+    DFlash2 only: ``fncN:P[:B]`` (kind 17: the fN:P product of noise-aware confidences, B their temperature,
+    default ``dflash2.NOISY_BETA``) and ``fcostN:noisy[:B]`` (kind 18: the depth k <= N maximizing E[tokens] / round
+    ms by the startup cost table, E from the same confidences; N up to the captured verify windows' drafts)."""
 
     spec = str(spec).strip()
     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, "
                      f"t<FANOUT>d<DEPTH>, or one of these after f (N from 1 to {MAX_ROWS - 1}, FANOUT from 1 to 4, "
-                     f"FANOUT * DEPTH at most {MAX_ROWS - 1})")
+                     f"FANOUT * DEPTH at most {MAX_ROWS - 1}, fncN:P[:B] or fcostN:noisy[:B] with N up to "
+                     f"{len(GRAPH_ROWS) - 1})")
     try:
         if spec == "auto" or spec.startswith("auto:"):
             parts = spec.split(":")
@@ -37,6 +42,8 @@ def encode_policy(spec: str) -> list[int]:
             if explore < 1 or every < 0 or not 0 <= margin < 1:
                 raise bad
             return [4 if len(parts) == 1 else 5, explore, every, int(round(margin * 1e6))]
+        if spec.startswith(("fnc", "fcost")):
+            return _encode_noisy(spec[1:], bad)
         if spec.startswith("f"):
             code = encode_policy(spec[1:])
             return [code[0] + 10] + code[1:] if code[0] else code
@@ -66,8 +73,30 @@ def encode_policy(spec: str) -> list[int]:
     return [1 if most > 0 else 0, most, 0, 0]
 
 
-def decode_policy(code: list[int]):
-    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
+def _encode_noisy(spec: str, bad: ValueError) -> list[int]:
+    """``ncN:P[:B]`` -> [17, N, P, B] and ``costN:noisy[:B]`` -> [18, N, B, 0], P and B in millionths (DFlash2 only)."""
+
+    from .dflash2 import NOISY_BETA
+
+    cost = spec.startswith("cost")
+    parts = spec[4 if cost else 2:].split(":")
+    if len(parts) not in (2, 3) or (cost and parts[1] != "noisy"):
+        raise bad
+    most = int(parts[0])
+    beta = float(parts[2]) if len(parts) == 3 else NOISY_BETA
+    if not 0 < most <= len(GRAPH_ROWS) - 1 or not 0 < beta <= 1000 or round(beta * 1e6) < 1:
+        raise bad
+    if cost:
+        return [18, most, int(round(beta * 1e6)), 0]
+    conf = float(parts[1])
+    if not 0 <= conf <= 1:
+        raise bad
+    return [17, most, int(round(conf * 1e6)), int(round(beta * 1e6))]
+
+
+def decode_policy(code: list[int], costs: dict | None = None):
+    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings; ``costs``: the
+    startup cost table (``GlmEngine._calibrate``) the fcost rule weighs a round's depths by."""
 
     from .decode import DepthPolicy, TreePolicy
 
@@ -81,7 +110,20 @@ def decode_policy(code: list[int]):
         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
     if kind == 3:
         return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6)
+    if kind == 7:
+        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
+    if kind == 8:
+        if costs is None:
+            raise ValueError("the fcost policy needs the engine's cost table")
+        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+
+
+def round_costs(costs: dict) -> tuple[float, ...]:
+    """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
+    kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
+
+    return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
 
 
 def _f64_ints(x: float) -> list[int]:
@@ -467,7 +509,7 @@ class GlmEngine:
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
-        policy = decode_policy(code)
+        policy = decode_policy(code, self.costs)
         if policy is None:
             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
         elif auto:
