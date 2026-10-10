@@ -480,9 +480,11 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
     fp8 = scales is not None and cache.dtype != torch.uint8
-    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if fp8 else cache, pos, s.po[:n * LW], s.pm[:n],
-                                                s.pl[:n], R, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
-                                                FP8=fp8, Q4=scales is not None, num_warps=8, num_stages=1)
+    q4 = scales is not None and cache.dtype == torch.uint8
+    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if scales is not None else cache, pos,
+                                                s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW, CH=CHUNK,
+                                                SCALE=scale, HBT=hb, KTT=KT, FP8=fp8, Q4=q4,
+                                                num_warps=8, num_stages=1)
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
@@ -498,11 +500,12 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
-    hb = head_block(R)
     fp8 = scales is not None and cache.dtype != torch.uint8
-    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if fp8 else cache, tokens, counts, po, pm, pl, R,
-                                                 W=W, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
-                                                 FP8=fp8, Q4=scales is not None, num_warps=8, num_stages=1)
+    q4 = scales is not None and cache.dtype == torch.uint8
+    hb = head_block(R)
+    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, scales if scales is not None else cache, tokens,
+                                                 counts, po, pm, pl, R, W=W, H=H, LW=LW, CH=CHUNK, SCALE=scale,
+                                                 HBT=hb, KTT=KT, FP8=fp8, Q4=q4, num_warps=8, num_stages=1)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 

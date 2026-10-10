@@ -103,7 +103,7 @@ def test_q4_latent_kernels_track_the_bf16_cache():
     rel = (sq4.float() - sp.float()).norm() / sp.float().norm()
     assert rel < 0.25
     # the written rows dequantize back onto the bf16 rows within the bound
-    b = q4_cache[P:P + R]
+    b = q4_cache[P:P + R].int()
     nibbles = torch.stack([(b & 0xF), (b >> 4)], dim=-1).view(R, 512)
     roundtrip = (((nibbles ^ 8) - 8).float() * q4_scales[P:P + R, None])
     rel = (roundtrip - lat.float()).norm() / lat.float().norm()
