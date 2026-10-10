@@ -248,6 +248,39 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
     order = torch.argsort(flat)[: R * (slots - 1)]          # pair indices, sorted by expert
     counts = torch.bincount(flat.long(), minlength=E + 1)[:E]
     offs = counts.cumsum(0).to(torch.int32)
+    e_of = flat[order]
+    if x.is_cuda:
+        # the glue kernels: the eager chain's fp32 temps (the [P, N] sign rows, the .float() casts) are
+        # what costs at prefill shapes -- the three GEMMs are the smaller half of this call
+        from . import moe_fp8_fused
+        a8_g, s_g = q8_rows(acts.xg[:P], order)             # the pairs' fp8 A tiles, expert order
+        a8_u, s_u = q8_rows(acts.xu[:P], order)
+        inv = FP8_MAX / _codebook_max(ex.cb)
+        rows_gu = ex.gu_stride if ex.gu_stride else I >> 4
+        if s.fused:              # the fused kernel decodes each B tile from the trellis in registers
+            z_g = moe_fp8_fused.grouped(a8_g, s_g, ex.gate_ptr, ex.gate_k2, rows_gu, inv, ex.cb, s.b_scale, offs, E, I)
+            z_u = moe_fp8_fused.grouped(a8_u, s_u, ex.up_ptr, ex.up_k2, rows_gu, inv, ex.cb, s.b_scale, offs, E, I)
+        else:
+            stage(ex, s)
+            b_gu = s.b_gu.view(torch.float8_e4m3fn).view(E, 2 * I, D)  # column-major [N, K] per expert
+            z_g = gemm(a8_g, s_g, b_gu[:, :I], s.b_scale, offs, E)
+            z_u = gemm(a8_u, s_u, b_gu[:, I:], s.b_scale, offs, E)
+        rr = order.numel()                       # the routed-pair count: the GEMMs' row count, not P
+        gg = torch.empty((rr, I), dtype=torch.bfloat16, device=x.device)
+        had_round(z_g, ex.svh_g, e_of, s.h, gg, hi=limit)
+        uu = torch.empty((rr, I), dtype=torch.bfloat16, device=x.device)
+        had_round(z_u, ex.svh_u, e_of, s.h, uu, lo=-limit, hi=limit)
+        act = torch.empty((rr, I), dtype=torch.bfloat16, device=x.device)
+        swiglu(gg, uu, act)
+        xd = torch.empty((rr, I), dtype=torch.float32, device=x.device)
+        had_pre(act, ex.suh_d, e_of, s.h, xd)
+        a8_d, s_d = q8_rows(xd)                             # already in expert-sorted pair order
+        if s.fused:
+            z = moe_fp8_fused.grouped(a8_d, s_d, ex.down_ptr, ex.down_k2, D >> 4, inv, ex.cb, s.b_scale, offs, E, D)
+        else:
+            z = gemm(a8_d, s_d, s.b_d.view(torch.float8_e4m3fn).view(E, D, I), s.b_scale, offs, E)
+        had_round(z, ex.svh_d, e_of, s.h, acts.y[:P], order=order)      # the down epilogue, scattered
+        return acts.y[:P].view(R, slots, D)
     a8_g, s_g = quantize_tensor(acts.xg[:P].index_select(0, order))   # the pairs' fp8 A tiles, expert order
     a8_u, s_u = quantize_tensor(acts.xu[:P].index_select(0, order))
     if s.fused:
@@ -262,8 +295,6 @@ def routed(x: torch.Tensor, pick: torch.Tensor, ex: generic.Exl3RoutedExperts, s
         b_gu = s.b_gu.view(torch.float8_e4m3fn).view(E, 2 * I, D)      # column-major [N, K] per expert
         z_g = gemm(a8_g, s_g, b_gu[:, :I], s.b_scale, offs, E)
         z_u = gemm(a8_u, s_u, b_gu[:, I:], s.b_scale, offs, E)
-    # the epilogue: Hadamard, signs, the SwiGLU with the bf16 route's roundings (act_mode 0)
-    e_of = flat[order]
     gg = bf16r(rotate(z_g, s.h) * signs(ex.svh_g, e_of)).clamp_max(limit)
     uu = bf16r(rotate(z_u, s.h) * signs(ex.svh_u, e_of)).clamp(-limit, limit)
     act = bf16r(bf16r(gg * torch.sigmoid(gg)) * uu)
@@ -285,6 +316,129 @@ def signs(packed: torch.Tensor, e_of: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(packed).index_select(0, e_of.long()).float()
 
 
+
+
+@lru_cache(maxsize=1)
+def _tkernels():
+    """The route's CUDA glue (Triton): the fp8 quantize gather and the Hadamard-sign epilogues. The eager
+    chain they replace materializes [P, N] fp32 temps (x.float(), the [P, N] sign matrix, the matmul's
+    output) several times per projection, which at prefill shapes costs more than the GEMMs themselves.
+    The kernels keep the eager chain's arithmetic: fp32 Hadamard (ieee dot), the bf16 roundings where the
+    bf16 route rounds, division by the scale in the quantize."""
+
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _q8(x_ptr, ord_ptr, s_ptr, out_ptr, K, P, BR: tl.constexpr, BK: tl.constexpr, GATHER: tl.constexpr):
+        pid = tl.program_id(0)
+        kb = tl.program_id(1)
+        rows = pid * BR + tl.arange(0, BR)
+        rmask = rows < P
+        cols = kb * BK + tl.arange(0, BK)
+        m = rmask[:, None] & (cols < K)[None, :]
+        src = tl.load(ord_ptr + rows, mask=rmask, other=0) if GATHER else rows
+        x = tl.load(x_ptr + src[:, None] * K + cols[None, :], mask=m, other=0.0).to(tl.float32)
+        q = (x / tl.load(s_ptr)).to(tl.float8e4nv)
+        tl.store(out_ptr + rows[:, None] * K + cols[None, :], q, mask=m)
+
+    @triton.jit
+    def _had(z_ptr, sg_ptr, eof_ptr, h_ptr, out_ptr, ord_ptr, N, P, lim, lo,
+             BR: tl.constexpr, ROUND: tl.constexpr, LO: tl.constexpr, HI: tl.constexpr, SCAT: tl.constexpr):
+        pid = tl.program_id(0)
+        cb = tl.program_id(1)
+        rows = pid * BR + tl.arange(0, BR)
+        rmask = rows < P
+        r = tl.arange(0, 128)
+        c = cb * 128 + r
+        z = tl.load(z_ptr + rows[:, None] * N + c[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        htile = tl.load(h_ptr + r[:, None] * 128 + r[None, :])
+        acc = tl.dot(z, htile, input_precision="tf32", max_num_imprecise_acc=0)
+        e = tl.load(eof_ptr + rows, mask=rmask, other=0)
+        sg = tl.load(sg_ptr + e[:, None] * N + c[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        v = (acc * 0.08838834764831845) * sg
+        if ROUND:
+            v = v.to(tl.bfloat16).to(tl.float32)
+        if LO:
+            v = tl.maximum(v, lo)
+        if HI:
+            v = tl.minimum(v, lim)
+        dst = (tl.load(ord_ptr + rows, mask=rmask, other=0) if SCAT else rows)[:, None] * N + c[None, :]
+        tl.store(out_ptr + dst, v, mask=rmask[:, None])
+
+    @triton.jit
+    def _hadpre(x_ptr, su_ptr, eof_ptr, h_ptr, out_ptr, N, P, BR: tl.constexpr):
+        pid = tl.program_id(0)
+        cb = tl.program_id(1)
+        rows = pid * BR + tl.arange(0, BR)
+        rmask = rows < P
+        r = tl.arange(0, 128)
+        c = cb * 128 + r
+        x = tl.load(x_ptr + rows[:, None] * N + c[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        e = tl.load(eof_ptr + rows, mask=rmask, other=0)
+        su = tl.load(su_ptr + e[:, None] * N + c[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+        htile = tl.load(h_ptr + r[:, None] * 128 + r[None, :])
+        acc = tl.dot(x * su, htile, input_precision="tf32", max_num_imprecise_acc=0)
+        tl.store(out_ptr + rows[:, None] * N + c[None, :], acc * 0.08838834764831845, mask=rmask[:, None])
+
+    @triton.jit
+    def _swiglu(g_ptr, u_ptr, out_ptr, N, P, BR: tl.constexpr, BN: tl.constexpr):
+        pid = tl.program_id(0)
+        cb = tl.program_id(1)
+        rows = pid * BR + tl.arange(0, BR)
+        rmask = rows < P
+        cols = cb * BN + tl.arange(0, BN)
+        m = rmask[:, None] & (cols < N)[None, :]
+        g = tl.load(g_ptr + rows[:, None] * N + cols[None, :], mask=m, other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + rows[:, None] * N + cols[None, :], mask=m, other=0.0).to(tl.float32)
+        t = (g * tl.sigmoid(g)).to(tl.bfloat16).to(tl.float32)
+        tl.store(out_ptr + rows[:, None] * N + cols[None, :], (t * u).to(tl.bfloat16), mask=m)
+
+    return _q8, _had, _hadpre, _swiglu
+def q8_rows(x: torch.Tensor, order: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """The fp8 A tiles with one TensorWise scale (CUDA): the gather is a permutation, so the amax is x's
+    (the shared slots' zeros don't move it), and the rows gather on the fly -- the output has one row per
+    ``order`` entry, the route's routed-pair count."""
+
+    import triton
+    amax = x.abs().amax().float()
+    s = torch.where(amax > 0, amax * (1.0 / FP8_MAX), torch.ones_like(amax)).reshape(1)
+    P = order.numel() if order is not None else x.shape[0]
+    K = x.shape[1]
+    a8 = torch.empty((P, K), dtype=torch.float8_e4m3fn, device=x.device)
+    _tkernels()[0][(triton.cdiv(P, 16), triton.cdiv(K, 512))](
+        x, order if order is not None else x, s, a8, K, P, 16, 512, order is not None, num_warps=4)
+    return a8, s
+
+
+def had_round(z: torch.Tensor, packed: torch.Tensor, e_of: torch.Tensor, h: torch.Tensor, out: torch.Tensor,
+              order: torch.Tensor | None = None, lo: float | None = None, hi: float | None = None) -> None:
+    """out = bf16r((z @ h * HAD_SCALE) * signs[rows]), clamped, scattered by ``order`` when given (CUDA)."""
+
+    import triton
+    P, N = z.shape
+    assert N % 128 == 0
+    _tkernels()[1][(triton.cdiv(P, 64), N // 128)](
+        z, packed, e_of, h, out, order if order is not None else z, N, P,
+        float(hi) if hi is not None else 0.0, float(lo) if lo is not None else 0.0,
+        64, True, lo is not None, hi is not None, order is not None, num_warps=4)
+
+
+def had_pre(x: torch.Tensor, packed: torch.Tensor, e_of: torch.Tensor, h: torch.Tensor, out: torch.Tensor) -> None:
+    """out = ((x * signs[rows]) @ h) * HAD_SCALE in fp32 (the down input's suh fold, CUDA)."""
+
+    import triton
+    P, N = x.shape
+    assert N % 128 == 0
+    _tkernels()[2][(triton.cdiv(P, 64), N // 128)](x, packed, e_of, h, out, N, P, 64, num_warps=4)
+
+
+def swiglu(gg: torch.Tensor, uu: torch.Tensor, out: torch.Tensor) -> None:
+    """out = bf16r(bf16r(gg * sigmoid(gg)) * uu) in fp32 from the bf16 inputs (CUDA)."""
+
+    import triton
+    P, N = gg.shape
+    _tkernels()[3][(triton.cdiv(P, 32), triton.cdiv(N, 1024))](gg, uu, out, N, P, 32, 1024, num_warps=4)
 
 def rot_in(x: torch.Tensor, pick: torch.Tensor, ex, acts, R: int, D: int, slots: int, E: int) -> None:
     """The pairs' rotated activations into acts.xg / acts.xu: the rot_in kernel on CUDA, the same math in

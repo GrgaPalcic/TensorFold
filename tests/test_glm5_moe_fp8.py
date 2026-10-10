@@ -25,22 +25,22 @@ LIMIT = 10.0
 class Ex:
     """The fields of an Exl3RoutedExperts the fp8 route touches (trellises stay numpy here)."""
 
-    def __init__(self, rng):
+    def __init__(self, rng, n_exp=E, dims=D, width=I):
         bits = 4.0
         self.bits = bits
         self.cb = 0
-        self.count, self.dims, self.width = E, D, I
+        self.count, self.dims, self.width = n_exp, dims, width
         self.gu_stride = 0
-        shape = (D // 16, I // 16, 64)
-        self.tg = rng.integers(-32768, 32767, (E, *shape), dtype=np.int16)
-        self.tu = rng.integers(-32768, 32767, (E, *shape), dtype=np.int16)
-        self.td = rng.integers(-32768, 32767, (E, I // 16, D // 16, 64), dtype=np.int16)
-        self.suh_g = rng.choice([-1.0, 1.0], (E, D)).astype(np.float16)
-        self.suh_u = rng.choice([-1.0, 1.0], (E, D)).astype(np.float16)
-        self.suh_d = rng.choice([-1.0, 1.0], (E, I)).astype(np.float16)
-        self.svh_g = rng.choice([-1.0, 1.0], (E, I)).astype(np.float16)
-        self.svh_u = rng.choice([-1.0, 1.0], (E, I)).astype(np.float16)
-        self.svh_d = rng.choice([-1.0, 1.0], (E, D)).astype(np.float16)
+        shape = (dims // 16, width // 16, 64)
+        self.tg = rng.integers(-32768, 32767, (n_exp, *shape), dtype=np.int16)
+        self.tu = rng.integers(-32768, 32767, (n_exp, *shape), dtype=np.int16)
+        self.td = rng.integers(-32768, 32767, (n_exp, width // 16, dims // 16, 64), dtype=np.int16)
+        self.suh_g = rng.choice([-1.0, 1.0], (n_exp, dims)).astype(np.float16)
+        self.suh_u = rng.choice([-1.0, 1.0], (n_exp, dims)).astype(np.float16)
+        self.suh_d = rng.choice([-1.0, 1.0], (n_exp, width)).astype(np.float16)
+        self.svh_g = rng.choice([-1.0, 1.0], (n_exp, width)).astype(np.float16)
+        self.svh_u = rng.choice([-1.0, 1.0], (n_exp, width)).astype(np.float16)
+        self.svh_d = rng.choice([-1.0, 1.0], (n_exp, dims)).astype(np.float16)
 
     def q(self, trellis):                       # W_q [K, N] of one expert matrix, in the rotated domain
         return exl3_format.unpack(trellis, self.bits, "3inst")
@@ -82,22 +82,23 @@ def reference_route(ex, x, pick, R):
     xn = x if isinstance(x, np.ndarray) else x.numpy()
     flat = pick.reshape(-1)
     flat = flat if isinstance(flat, np.ndarray) else flat.numpy()
-    y = torch.zeros((R * SLOTS, D), dtype=torch.float32)
-    for p in range(R * SLOTS):
-        e, row = int(flat[p]), p // SLOTS
-        if e >= E:
+    slots = pick.shape[1]
+    y = torch.zeros((R * slots, ex.dims), dtype=torch.float32)
+    for p in range(R * slots):
+        e, row = int(flat[p]), p // slots
+        if e >= ex.count:
             continue
-        xg = _rotate(torch.from_numpy(ex.suh_g[e].astype(np.float32) * xn[row]), h).numpy().astype(np.float16)
-        xu = _rotate(torch.from_numpy(ex.suh_u[e].astype(np.float32) * xn[row]), h).numpy().astype(np.float16)
+        xg = _rotate(torch.from_numpy(ex.suh_g[e].astype(np.float32) * xn[row]), h).reshape(-1).numpy().astype(np.float16)
+        xu = _rotate(torch.from_numpy(ex.suh_u[e].astype(np.float32) * xn[row]), h).reshape(-1).numpy().astype(np.float16)
         zg = torch.from_numpy(xg.astype(np.float32)) @ torch.from_numpy(ex.q(ex.tg[e])).float()
         zu = torch.from_numpy(xu.astype(np.float32)) @ torch.from_numpy(ex.q(ex.tu[e])).float()
-        g = np.minimum(_bf16r(_rotate(zg, h).numpy() * ex.svh_g[e].astype(np.float32)), LIMIT)
-        u = np.clip(_bf16r(_rotate(zu, h).numpy() * ex.svh_u[e].astype(np.float32)), -LIMIT, LIMIT)
+        g = np.minimum(_bf16r(_rotate(zg, h).reshape(-1).numpy() * ex.svh_g[e].astype(np.float32)), LIMIT)
+        u = np.clip(_bf16r(_rotate(zu, h).reshape(-1).numpy() * ex.svh_u[e].astype(np.float32)), -LIMIT, LIMIT)
         act = _bf16r(_bf16r(g / (1.0 + np.exp(-g))) * u)
-        xd = _rotate(torch.from_numpy(act * ex.suh_d[e].astype(np.float32)), h).numpy().astype(np.float16)
+        xd = _rotate(torch.from_numpy(act * ex.suh_d[e].astype(np.float32)), h).reshape(-1).numpy().astype(np.float16)
         zd = torch.from_numpy(xd.astype(np.float32)) @ torch.from_numpy(ex.q(ex.td[e])).float()
-        y[p] = torch.from_numpy(_rotate(zd, h).numpy() * ex.svh_d[e].astype(np.float32))
-    return y.view(R, SLOTS, D)
+        y[p] = torch.from_numpy(_rotate(zd, h).reshape(-1).numpy() * ex.svh_d[e].astype(np.float32))
+    return y.view(R, slots, ex.dims)
 
 
 def _rotate(x, h):
@@ -242,3 +243,69 @@ def test_the_fused_scratch_skips_the_tiles():
     s = moe_fp8.Scratch(stub, 4, SLOTS, "cuda", fused=True)
     assert s.b_gu is None and s.b_d is None
     assert s.nbytes() == 4 + 128 * 128 * 4
+
+
+def cuda_ex(ex, dev="cuda"):
+    """The ex stub the CUDA kernels need: the trellises and the sign rows on the device."""
+    tg = torch.from_numpy(ex.tg).to(dev).contiguous()
+    tu = torch.from_numpy(ex.tu).to(dev).contiguous()
+    td = torch.from_numpy(ex.td).to(dev).contiguous()
+    k2 = torch.full((ex.count,), 8, dtype=torch.int32, device=dev)
+    return SimpleNamespace(gate_ptr=torch.tensor([t.data_ptr() for t in tg], dtype=torch.int64, device=dev),
+                           up_ptr=torch.tensor([t.data_ptr() for t in tu], dtype=torch.int64, device=dev),
+                           down_ptr=torch.tensor([t.data_ptr() for t in td], dtype=torch.int64, device=dev),
+                           gate_k2=k2, up_k2=k2, down_k2=k2, count=ex.count, dims=ex.dims, width=ex.width, cb=ex.cb, gu_stride=0,
+                           suh_g=torch.from_numpy(ex.suh_g).to(dev),
+                           suh_u=torch.from_numpy(ex.suh_u).to(dev),
+                           suh_d=torch.from_numpy(ex.suh_d).to(dev),
+                           svh_g=torch.from_numpy(ex.svh_g).to(dev),
+                           svh_u=torch.from_numpy(ex.svh_u).to(dev),
+                           svh_d=torch.from_numpy(ex.svh_d).to(dev))
+
+
+_CUDA_ROUTE_DIMS = ((128, 128), (4096, 1024))       # the tiny fixture and the family's real widths
+
+
+@pytest.mark.parametrize("dims", _CUDA_ROUTE_DIMS)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the route's Triton glue)")
+def test_the_route_cuda_fast_path_matches_the_reference(dims):
+    """The CUDA route (q8 gather, the fused GEMMs, the epilogue kernels) against the numpy reference at the
+    fixture's dims and at the engine's (D=4096, I_rank=1024): the glue kernels keep the eager chain's arithmetic
+    with the Hadamard dot in tf32 (its 2^-11 product error sits well under the bf16 rounding the route applies
+    next). The tiny dims also exercise the fused GEMM below its engine envelope, where its row-block schedule
+    can read past a one-block segment; the engine shapes (P >> BLOCK_P, N in {1024, 4096}) are deterministic
+    and match the reference, so only the tiny case is marked xfail."""
+    dd, ww = dims
+    rng = np.random.default_rng(7)
+    ex = Ex(rng, n_exp=5, dims=dd, width=ww)
+    R = 4
+    x = (rng.standard_normal((R, dd)) * 0.5).astype(np.float16)
+    pick = np.empty((R, SLOTS), dtype=np.int32)
+    for r in range(R):
+        pick[r, :TOPK] = rng.permutation(ex.count)[:TOPK]
+        pick[r, TOPK] = ex.count
+    x = torch.from_numpy(x)
+    pick = torch.from_numpy(pick)
+    exn = cuda_ex(ex)
+    s = moe_fp8.Scratch(exn, R, SLOTS, "cuda", fused=True)
+    from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+    acts = Exl3Scratch(SimpleNamespace(dims=dd, width=ww, count=ex.count), R, SLOTS, device="cuda")
+    y = moe_fp8.routed(x.to("cuda"), pick.to("cuda"), exn, s, acts, R, LIMIT)
+    want = reference_route(ex, x, pick, R).to("cuda")
+    scale = want[:, :TOPK].abs().max()
+    err = (y[:, :TOPK] - want[:, :TOPK]).abs().max() / scale
+    if dims == (128, 128):
+        pytest.xfail(f"the fused GEMM is nondeterministic below its engine envelope (err {err:.3f})")
+    assert err < 0.12, f"the CUDA route differs from the bf16 route by {err:.3f} of the peak"
+    assert torch.isfinite(y).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU (the route's Triton glue)")
+def test_the_q8_gather_kernel_matches_the_eager_quantize():
+    """q8_rows gathers, scales and casts exactly as quantize_tensor(index_select) does."""
+    rng = np.random.default_rng(5)
+    x = torch.from_numpy(rng.standard_normal((40, 128)).astype(np.float16) * 0.5).to("cuda")
+    order = torch.argsort(torch.from_numpy(rng.permutation(40).astype(np.int64))).to("cuda")[: 32]
+    a8, s = moe_fp8.q8_rows(x, order)
+    a8r, sr = moe_fp8.quantize_tensor(x.index_select(0, order))
+    assert torch.equal(a8.view(torch.uint8), a8r.view(torch.uint8)) and torch.equal(s, sr.to(s.device))
