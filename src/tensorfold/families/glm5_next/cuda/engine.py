@@ -219,7 +219,8 @@ class GlmEngine:
         self.split = SplitSettings.from_env() if split is None else split
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, int(self.mtp_on), int(DRAFT_RING), ("bf16", "fp8", "q4").index(kv_dtype),
-                KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16")] + self.split.code()
+                KVB_KINDS.index(kvb_kind() if cfg.quant == "exl3" else "bf16"),
+                int(prompt_precision.fp8())] + self.split.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
