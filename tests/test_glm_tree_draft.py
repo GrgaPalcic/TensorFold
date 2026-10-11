@@ -194,6 +194,19 @@ def test_round_keeps_the_chain_prefix_when_it_is_the_best_path(rounds):  # noqa:
     assert e.st.pos == 103 and drafter.taps == [("taps", 3)]
 
 
+def test_rounds_stream_one_round_late_not_at_the_end(rounds):  # noqa: F811
+    """A round's tokens reach on_tokens once the next round's window is queued, the last round's before the
+    loop returns: a streamed reply arrives round by round, not in one burst when decoding ends."""
+    dec, _ = rounds
+    e = FakeEngine([{101: 41, 102: 42, 103: 7, 104: 8}, {104: 43, 105: 44}])
+    drafter = FakeDrafter([([41, 42, 91], [-1, 0, 1]), ([43], [-1])])
+    got: list[tuple[list[int], int]] = []
+    res = dec.tree_decode(e, drafter, PENDING, 6, None, policy=dec.TreePolicy(2, 3),
+                          on_tokens=lambda new: got.append((list(new), len(e.windows))))
+    assert res.tokens == [PENDING, 41, 42, 7, 43, 44]
+    assert got == [([41, 42, 7], 2), ([43, 44], 2)]
+
+
 def test_auto_tree_round_feeds_both_backlogs_from_the_kept_tokens(rounds):  # noqa: F811
     """The auto loop's tree branch: the kept tokens join the MTP backlog and DFlash2's taps, the round is
     recorded on the f arm."""
