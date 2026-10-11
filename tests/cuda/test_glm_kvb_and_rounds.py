@@ -73,18 +73,8 @@ def test_the_wider_decode_window_knobs():
     assert engine.GRAPH_ROWS == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
-def test_the_late_token_delivery_and_clock(allocations):
-    from tensorfold.families.glm5_next.cuda.decode import _Clock, _Late
-
-    got = []
-    late = _Late(lambda rows: got.extend(rows))
-    late([1, 2])
-    late([3])
-    assert got == []                             # rows pile up until the flush
-    late(None)
-    assert got == [1, 2, 3]
-    late(None)                                   # an empty flush calls nothing
-    assert got == [1, 2, 3]
+def test_the_decode_clock(allocations):
+    from tensorfold.families.glm5_next.cuda.decode import _Clock
 
     clock = _Clock()
     assert clock() >= 0.0

@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from .decode import DecodeResult, DepthPolicy, Engine, TreePolicy, _sync, absorb, draft, tree_round
+from .decode import DecodeResult, DepthPolicy, Engine, TreePolicy, _Late, _sync, absorb, draft, tree_round
 from .forward import commit
 
 
@@ -87,6 +87,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     keeps: list[int] = []
     arms: list[str] = []
     last = {"m": (0, 0), "f": (0, 0)}
+    late = _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
@@ -101,7 +102,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
                 n_f = 0
             kept, R, n_drafts = tree_round(e, drafter, out[-1], sampling, fanout=f_policy.fanout,
                                            depth=min(f_policy.depth, room), confidence=f_policy.confidence,
-                                           stop_eos=stop_eos, stages=stages)
+                                           stop_eos=stop_eos, stages=stages, late=late)
             keep = len(kept)
             if len(m_next) + keep > cap:
                 absorb(e, m_rows[:len(m_next)], m_next)
@@ -120,8 +121,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             arms.append("f")
             e.follow(kept)
             out.extend(kept)
-            if on_tokens is not None:
-                on_tokens(kept[:max(0, count - (len(out) - keep))])
+            late(kept[:max(0, count - (len(out) - keep))])
             continue
 
         if arm == "m":
@@ -143,6 +143,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         drafts = tokens[1:]
         R = len(tokens)
         logits = e.forward(tokens)
+        late.flush()                        # the last round's tokens, while this window runs
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
@@ -178,12 +179,12 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         arms.append(arm)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
+    late.flush()
     _sync(w)
     seconds = time.perf_counter() - start
     if drafter is not None and n_f:
