@@ -73,6 +73,13 @@ def test_the_wider_decode_window_knobs():
     assert engine.GRAPH_ROWS == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
+def test_the_kept_prompt_point_sits_on_a_kda_sub_chunk_boundary():
+    from tensorfold.families.glm5_next.cuda.engine import kept_point
+
+    # the last multiple of 32 before the prompt's final token; none for prompts of 32 tokens or fewer
+    assert [kept_point(n) for n in (1, 32, 33, 64, 65, 221, 3011)] == [None, None, 32, 32, 64, 192, 3008]
+
+
 def test_the_decode_clock(allocations):
     from tensorfold.families.glm5_next.cuda.decode import _Clock
 

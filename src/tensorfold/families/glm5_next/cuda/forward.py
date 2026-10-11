@@ -409,13 +409,15 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
                             k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
                             st.rec[1 - cur, li], pos=st.pos if pre else None)
-    else:
+    else:                                # both segments in the prompt chunk's KDA form (chunked: aligned cuts only)
         n = cut.point
         first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li],
+                              pos=st.pos).clone()
         _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
         rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li],
+                             pos=st.pos + n)
         out = torch.cat((first, rest))
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         st.cur[li] = 1 - cur

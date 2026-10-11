@@ -98,3 +98,25 @@ def test_kernel_bits_do_not_depend_on_the_chunk_start():
         states.append(state_out)
     assert torch.equal(outs[0], outs[1])
     assert torch.equal(states[0], states[1])
+
+
+@cuda
+def test_kernel_split_at_an_aligned_cut_keeps_the_bits():
+    """A prompt chunk run as two kernels split at a sub-chunk boundary (a kept-prefix cut, or a resume from it) gives
+    the unsplit chunk's rows and final state bit for bit: drafted replies equal "draft": false ones."""
+
+    rows, n = 70, kda_chunked.CHUNK
+    p, a, g, conv_state, conv_w, a_log, dt_bias, norm_w, state = _inputs(rows, 13, "cuda")
+    args = (a_log, dt_bias, norm_w, EPS, LOWER)
+    whole = torch.empty((rows, H * kda_chunked.DV), dtype=torch.bfloat16, device="cuda")
+    s_whole = torch.empty_like(state)
+    kda_chunked.chain(p, B_OFF, a, g, conv_state, conv_w, state, *args, rows, whole, s_whole, 0)
+    first = torch.empty_like(whole)
+    s_mid = torch.empty_like(state)
+    kda_chunked.chain(p[:n], B_OFF, a[:n], g[:n], conv_state, conv_w, state, *args, n, first, s_mid, 0)
+    rest = torch.empty_like(whole)
+    s_end = torch.empty_like(state)
+    conv_mid = p[n - 3:n, :C].contiguous()          # the convolution window after the first n rows
+    kda_chunked.chain(p[n:], B_OFF, a[n:], g[n:], conv_mid, conv_w, s_mid, *args, rows - n, rest, s_end, n)
+    assert torch.equal(torch.cat((first[:n], rest[:rows - n])), whole)
+    assert torch.equal(s_end, s_whole)

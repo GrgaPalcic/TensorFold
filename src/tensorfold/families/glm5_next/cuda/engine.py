@@ -22,6 +22,17 @@ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays de
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
 
 
+def kept_point(prompt_len: int) -> int | None:
+    """Where a drafted request snapshots its prompt for later requests to resume from: the last multiple of KDA's
+    sub-chunk before the prompt's final token (None: the prompt has none). Chunked KDA (TF_GLM_KDA_CHUNKED=1) gives a
+    row the same bits in any prompt chunk only when chunks start on a sub-chunk boundary, so resuming from an aligned
+    point reproduces a fresh prefill, and so the "draft": false reply, exactly."""
+
+    from .kda_chunked import CHUNK
+
+    return (prompt_len - 1) // CHUNK * CHUNK or None
+
+
 def encode_policy(spec: str) -> list[int]:
     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2.
 
@@ -524,7 +535,7 @@ class GlmEngine:
             hit.rows, hit.nbytes = None, 0            # live again
         self.live = list(prompt)
         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
+                        keep_at=kept_point(len(prompt)) if draft else None, keep=self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
