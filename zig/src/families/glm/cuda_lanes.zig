@@ -199,6 +199,13 @@ pub const Lanes = struct {
         return l;
     }
 
+    /// Whether a stream besides `s` is past its prompt pass: a paired prompt step would hold up its rounds.
+    pub fn othersDecode(self: *const Lanes, s: *const lanes.Stream) bool {
+        var it = self.lanes.iterator();
+        while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.fill == null) return true;
+        return false;
+    }
+
     fn cancelled(ptr: ?*anyopaque) bool {
         return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
     }
@@ -261,12 +268,13 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        if (try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s))) |first| {
+        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+        if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
             return true;
         }
-        l.fill = at + engine.prompt_rows;
+        l.fill = at + step.rows;
         if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
         return false;
     }
@@ -277,7 +285,7 @@ pub const Lanes = struct {
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
         try self.x.bind(l.slot);
-        _ = self.x.chunk(s.prompt(), at, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
             if (err == error.Cancelled) return;
             return err;
         };
