@@ -50,6 +50,7 @@ test {
     _ = @import("cuda_ranks_test.zig");
     _ = @import("cuda_p2p.zig");
     _ = @import("cuda_ce.zig");
+    _ = @import("cuda_lanes_test.zig");
     _ = experts;
     _ = exl3;
     _ = vision;
