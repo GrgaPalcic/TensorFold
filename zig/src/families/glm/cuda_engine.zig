@@ -422,7 +422,7 @@ pub const Engine = struct {
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
         if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
         const rows = @min(len - start, fw.prefill_rows);
-        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks);
+        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);
