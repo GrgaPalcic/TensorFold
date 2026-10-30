@@ -361,6 +361,139 @@ test "GLM FP8 pages: a stream cut off at its opening gives back its pages and la
     }
 }
 
+/// Rank 0's steps as its link sends them (a put_words launch: the header's 16 words, then its ids), and a fault in
+/// the next sequence reset (State.reset's first memset, the begin's own work after its step went out).
+const Wire = struct {
+    var n: usize = 0;
+    var heads: [8]glm.follow.Header = undefined;
+    var ids: [8][64]u32 = undefined;
+    var lens: [8]usize = undefined;
+    var fail_reset = false;
+    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        const p = params.?;
+        const count: *const u32 = @ptrCast(@alignCast(p[1].?));
+        const w: *const glm.follow.Words = @ptrCast(@alignCast(p[2].?));
+        if (n == heads.len) return 1;
+        @memcpy(std.mem.asBytes(&heads[n]), std.mem.sliceAsBytes(w.w[0..16]));
+        lens[n] = count.* - 16;
+        @memcpy(ids[n][0..lens[n]], w.w[16..][0..lens[n]]);
+        n += 1;
+        return 0;
+    }
+    fn bcast(_: u64, _: u64, _: usize, _: cuda.nccl.DataType, _: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+        return 0;
+    }
+    fn reset(_: u64, _: u8, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return if (fail_reset) cuda.abi.error_not_ready else 0;
+    }
+    fn kind(i: usize) glm.follow.Kind {
+        return @fromBackingInt(heads[i].kind);
+    }
+    /// Steps `from..n` on a follower's engine through its own step handler, as its loop runs them.
+    fn replay(e: *glm.engine.Engine, from: usize) !void {
+        var link: glm.follow.Link = undefined; // begin and release read no link
+        var s: glm.follow.Scratch = .{};
+        for (from..n) |i| try t.expect(try glm.follow.apply(e, &link, heads[i], ids[i][0..lens[i]], &s));
+    }
+};
+
+/// A rank's engine as `begin` reaches it: no drafter, no states dropped, a reset that may fail (Wire.reset).
+fn beginReady(f: *Fixture) void {
+    f.d.api.cuMemsetD8Async = Wire.reset;
+    f.e.drafter = null;
+    f.e.dropped = .empty;
+}
+
+test "GLM FP8 pages: a begin that fails on rank 0 after its step went out frees the slot on every rank, so its next begin maps on the follower" {
+    var f: Fixture = undefined; // rank 0
+    try f.init(2, false, 8);
+    defer f.deinit();
+    beginReady(&f);
+    var lib: cuda.nccl.Library = undefined;
+    lib.api.ncclBroadcast = Wire.bcast;
+    f.d.api.cuLaunchKernel = Wire.launch;
+    f.e.m.glue.put_words = .{ .d = &f.d, .handle = null };
+    var words: [64]u32 = undefined;
+    var link: glm.follow.Link = .{ .d = &f.d, .lib = &lib, .comm = null, .stream = f.e.stream, .buf = .{ .d = &f.d, .ptr = 1 << 20, .len = 64 + words.len * 4 }, .ids = &words, .gpa = t.allocator, .wait = false };
+    var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
+    defer back.deinit();
+    var stream = try lanes.Stream.init(t.allocator, .{ .id = "fp8-begin-test", .prompt = &.{ 100, 101, 102 }, .max_new = 600 });
+    defer stream.deinit(t.allocator);
+    const b = back.backend();
+    Wire.n = 0;
+    Wire.fail_reset = true; // the begin step goes out, then rank 0's own reset fails
+    try t.expectError(error.NotReady, b.vtable.prefill_step.?(b.ptr, &stream));
+    Wire.fail_reset = false;
+    // rank 0 gave its pages and lane back; the other ranks heard the begin, then a release of the same slot
+    try t.expectEqual(@as(usize, 0), back.lanes.count());
+    try t.expect(f.p.pool.idle() and f.census().free == 8);
+    try t.expectEqual(@as(usize, 2), Wire.n);
+    try t.expectEqual(glm.follow.Kind.begin, Wire.kind(0));
+    try t.expectEqualSlices(u32, &.{ 0, 1 }, Wire.ids[0][0..Wire.lens[0]]);
+    try t.expectEqual(glm.follow.Kind.release, Wire.kind(1));
+    try t.expectEqual(Wire.heads[0].slot, Wire.heads[1].slot);
+    const slot = Wire.heads[0].slot;
+
+    var g: Fixture = undefined; // rank 1, its pool rank 0's
+    const live = F.live; // the driver's count is one for both ranks: prepare starts it again
+    try g.prepare(false, 4096);
+    F.live += live;
+    const l = try glm.pages.layout(t.allocator, &g.e, 0);
+    g.p = try glm.pages.Pages.follow(t.allocator, &g.e, 2, 8, l.pageBytes());
+    g.e.pages = g.p;
+    defer g.deinit();
+    beginReady(&g);
+    const saved = Wire.n;
+    Wire.n = 1; // the begin alone: the slot stays this rank's, and the next begin on it is BadStep (the reported fault)
+    try Wire.replay(&g.e, 0);
+    try t.expect(g.p.used[slot]);
+    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }));
+    Wire.n = saved;
+    try Wire.replay(&g.e, 1); // the release rank 0 sent after it
+    try t.expect(!g.p.used[slot] and g.st(slot).capacity == 0);
+    // the retry: its begin maps on the follower, and its end frees the slot on both ranks
+    const ids = try back.seat(&stream, 3, 600);
+    try back.x.beginOn(null, ids);
+    try t.expectEqual(glm.follow.Kind.begin, Wire.kind(2));
+    try Wire.replay(&g.e, 2);
+    try t.expect(g.p.used[slot]);
+    try t.expectEqualSlices(u32, ids, g.st(slot).pages);
+    b.vtable.release(b.ptr, &stream);
+    try t.expectEqual(glm.follow.Kind.release, Wire.kind(3));
+    try Wire.replay(&g.e, 3);
+    try t.expect(!g.p.used[slot] and f.p.pool.idle() and f.census().free == 8);
+}
+
+test "GLM FP8 pages: a request exactly at --context opens (8,000 + 184 at 8,184), one token past it is PromptTooLong" {
+    var f: Fixture = undefined;
+    try f.prepare(false, glm.native.capacity(8184)); // 8,184 + a verify window: 8,192 rows, already a multiple of 64
+    try t.expectEqual(@as(usize, 8192), f.e.capacity);
+    const l = try glm.pages.layout(t.allocator, &f.e, 0);
+    f.p = try glm.pages.Pages.init(t.allocator, &f.e, l, 2, 16, true);
+    f.p.poison = false;
+    f.e.pages = f.p;
+    defer f.deinit();
+    try f.e.bind(0);
+    f.e.dropped = .empty;
+    var link: glm.follow.Link = undefined;
+    link.ids = &.{}; // its begin step cannot carry page ids: an opening past the context check stops there
+    link.asleep = false;
+    var back: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = &link } };
+    defer back.deinit();
+    const prompt = try t.allocator.alloc(u32, 8000);
+    defer t.allocator.free(prompt);
+    @memset(prompt, 7);
+    const b = back.backend();
+    for ([_]u32{ 184, 185 }) |max_new| {
+        var stream = try lanes.Stream.init(t.allocator, .{ .id = "fp8-context-test", .prompt = prompt, .max_new = max_new });
+        defer stream.deinit(t.allocator);
+        // 8,000 + 184 + 8 == 8,192: its 16 pages taken, then the begin step; 8,000 + 185 is refused before any page
+        try t.expectError(if (max_new == 184) error.TooManyIds else error.PromptTooLong, b.vtable.prefill_step.?(b.ptr, &stream));
+        try t.expect(f.p.pool.idle() and f.census().free == 16 and back.lanes.count() == 0);
+    }
+    try t.expectEqual(@as(usize, 16), glm.pages.need(l, 8000, 184)); // the table's every entry: the pool's whole
+}
+
 test "GLM FP8 pages: a refused table upload cancels the lease, and a retry takes and returns every page" {
     var f: Fixture = undefined;
     try f.init(2, false, 8);

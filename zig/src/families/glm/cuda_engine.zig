@@ -48,6 +48,30 @@ const Snap = types.Snap;
 pub const Resume = types.Resume;
 pub const Marks = types.Marks;
 
+/// The heads a load brings and whether the engine speculates. Beside DFlash2 only the draft head it borrows loads (the
+/// target MTP layer, its caches and buffers stay out); without a drafter the MTP layer's chains draft, and a checkpoint
+/// with no MTP layer (`mtp_layers` 0) then has nothing to draft with, so it loads no head and decodes plain.
+pub fn heads(drafts: bool, drafter: bool, mtp_layers: u32) struct { heads: weights.Heads, drafts: bool } {
+    if (!drafts) return .{ .heads = .none, .drafts = false };
+    if (drafter) return .{ .heads = .draft, .drafts = true };
+    return if (mtp_layers > 0) .{ .heads = .mtp, .drafts = true } else .{ .heads = .none, .drafts = false };
+}
+
+test "GLM heads: no MTP layer and no drafter loads no head and decodes plain; DFlash2 still borrows the draft head" {
+    const H = weights.Heads;
+    try std.testing.expectEqual(H.mtp, heads(true, false, 1).heads);
+    try std.testing.expect(heads(true, false, 1).drafts);
+    try std.testing.expectEqual(H.none, heads(true, false, 0).heads); // was .mtp: nothing loaded, then NoDraftHead
+    try std.testing.expect(!heads(true, false, 0).drafts);
+    try std.testing.expectEqual(H.draft, heads(true, true, 0).heads); // the draft head is the rank's lm_head rows
+    try std.testing.expect(heads(true, true, 0).drafts);
+    try std.testing.expectEqual(H.draft, heads(true, true, 1).heads);
+    for ([_]u32{ 0, 1 }) |n| for ([_]bool{ false, true }) |dr| {
+        try std.testing.expectEqual(H.none, heads(false, dr, n).heads);
+        try std.testing.expect(!heads(false, dr, n).drafts);
+    };
+}
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -152,7 +176,9 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
+        const sel = heads(o.drafts, o.drafter, c.mtp); // every rank alike: the same config and options (cuda_ranks)
+        if (o.drafts and !sel.drafts and rank == 0) std.log.warn("glm: the checkpoint has no MTP layer (num_nextn_predict_layers 0) and no --drafter is given: decoding without drafts", .{});
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = sel.drafts, .mtp = false };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -169,9 +195,7 @@ pub const Engine = struct {
             }
         };
         const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
-        // beside DFlash2 only the draft head it borrows loads: the target MTP layer, its caches and buffers stay out
-        const heads: weights.Heads = if (!o.drafts) .none else if (o.drafter) .draft else .mtp;
-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, heads), tiler, Tile.apply);
+        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, sel.heads), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
@@ -181,7 +205,11 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
-        if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+        if (e.settings.pages and !pages_mod.pageable(e)) { // the same layers and heads on every rank: they all keep windows
+            e.settings.pages = false;
+            if (rank == 0) std.log.info("kv pages: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): each stream keeps its own window", .{});
+        }
+        if (e.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
@@ -193,7 +221,7 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         if (e.mtp) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer if (e.bm) |*b| b.deinit();
-        if (o.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (e.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
         errdefer e.pairs.free();
@@ -367,9 +395,14 @@ pub const Engine = struct {
         }
     }
 
+    /// A prompt of `len` ids and the verify window after it inside a sequence of `capacity` rows (equal fits).
+    pub fn promptFits(len: usize, capacity: usize) bool {
+        return len > 0 and len + fw.window_rows <= capacity;
+    }
+
     /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
     fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
-        if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
+        if (!promptFits(len, e.cur.st.capacity)) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
         try e.restoreState(r.id); // DFlash2's context too: its kept rows, or from r.at when it kept none

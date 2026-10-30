@@ -194,6 +194,8 @@ pub const Leader = struct {
     }
 
     /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
+    /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
+    /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
     pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
         try x.flush();
         const c = sampler.check(s);
@@ -207,7 +209,10 @@ pub const Leader = struct {
             h.top_k = v.top_k;
         }
         try x.send(h, pages);
-        try x.e.begin(c);
+        x.e.begin(c) catch |err| {
+            x.send(.{ .kind = @backingInt(Kind.release) }, &.{}) catch |why| std.log.err("slot {d}: the other ranks' release after rank 0's begin failed ({s}): {s}", .{ x.e.slot, @errorName(err), @errorName(why) });
+            return err;
+        };
     }
 
     /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
@@ -351,105 +356,116 @@ fn structuredStep(h: Header) bool {
 
 /// A rank other than 0 runs rank 0's steps until it ends; a cancelled prefill is error.Cancelled and the loop goes on.
 pub fn follow(e: *Engine, link: *Link) !void {
-    var drafts: [engine.max_drafts]u32 = undefined;
-    var chances: [engine.max_drafts]f64 = undefined;
-    var sampled: [16]u32 = undefined;
+    var scratch: Scratch = .{};
     cuda.tp_watch.sleep(e.io); // rank 0 starts with no stream: its first step wakes this rank
     while (true) {
         const step = try link.receive();
-        var h = step.h;
-        const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
-            try e.bind(h.slot);
-            try e.keep((h.flags >> 16) & 0xff);
-            h.flags &= 0xffff;
-        }
-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
-        e.prompt_logprobs = if (promptRows(h)) .{} else null;
-        e.structured = structuredStep(h); // rank 0 alone masks them
-        switch (kind) {
-            .begin => {
-                if (step.ids.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, step.ids);
-                try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
-            },
-            .pool => {
-                if (e.pages != null) return error.BadStep;
-                e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
-            },
-            .prefill => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
-                    else => return err,
-                };
-            },
-            .chunk => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                e.index_split = indexSplit(h);
-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
-                    else => return err,
-                };
-            },
-            .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
-                e.discard_draws = true;
-                defer e.discard_draws = false;
-                try e.verify(step.ids, sampled[0..step.ids.len], 0);
-            },
-            .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
-            .shared => {
-                const k = h.depth;
-                if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
-                var parts: [engine.max_shared]engine.Part = undefined;
-                var outs: [engine.shared_rows]u32 = undefined;
-                var at: usize = 2 * k;
-                var row: usize = 0;
-                for (parts[0..k], 0..) |*p, i| {
-                    const n = step.ids[2 * i + 1];
-                    if (at + n > step.ids.len or row + n > outs.len) return error.BadStep;
-                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n], .out = outs[row..][0..n] };
-                    at += n;
-                    row += n;
-                }
-                e.discard_draws = true;
-                defer e.discard_draws = false;
-                try e.verifyShared(parts[0..k]);
-            },
-            .many => {
-                var parts: [engine.max_together]engine.Prompt = undefined;
-                const decoded = try prompt_wire.decode(step.ids, h.depth, e.capacity, &parts);
-                var firsts: [engine.max_together]u32 = undefined;
-                try e.prefillMany(decoded, &firsts);
-            },
-            .keep => try e.keep(@intCast(h.a)),
-            .draft => {
-                const ids = try e.gpa.dupe(u32, step.ids);
-                defer e.gpa.free(ids);
-                try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts, if (h.flags & 2 != 0) &chances else null);
-            },
-            .block => {
-                const k = h.depth;
-                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
-                var reqs: [dflash.MAX_S]dflash.Req = undefined;
-                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
-                if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
-            },
-            .image => {
-                const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
-                try v.take(h.slot, step.ids);
-                try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
-            },
-            .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
-            .drop => for (step.ids) |id| e.dropState(id),
-            .release => e.release(h.slot),
-            .idle => cuda.tp_watch.sleep(e.io),
-            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
-        }
+        if (!try apply(e, link, step.h, step.ids, &scratch)) return cuda.tp_watch.ended(); // rank 0 ended on purpose
     }
+}
+
+/// A follower's rows of rank 0's draws, which only rank 0 reads.
+pub const Scratch = struct {
+    drafts: [engine.max_drafts]u32 = undefined,
+    chances: [engine.max_drafts]f64 = undefined,
+    sampled: [16]u32 = undefined,
+};
+
+/// One of rank 0's steps on this rank (`ids` its ids); false at the end step.
+pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scratch) !bool {
+    var h = h_in;
+    const kind: Kind = @fromBackingInt(@intCast(h.kind));
+    if (h.flags & keep_flag != 0) { // rank 0's last keep, on this step's slot, before the step (as its keep step was)
+        try e.bind(h.slot);
+        try e.keep((h.flags >> 16) & 0xff);
+        h.flags &= 0xffff;
+    }
+    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
+    e.prompt_logprobs = if (promptRows(h)) .{} else null;
+    e.structured = structuredStep(h); // rank 0 alone masks them
+    switch (kind) {
+        .begin => {
+            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, ids_in);
+            try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
+        },
+        .pool => {
+            if (e.pages != null) return error.BadStep;
+            e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
+        },
+        .prefill => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+            _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
+                error.Cancelled => {},
+                else => return err,
+            };
+        },
+        .chunk => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
+            e.index_split = indexSplit(h);
+            _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                error.Cancelled => {},
+                else => return err,
+            };
+        },
+        .verify => { // rank 0 alone reads the draws: this rank joins their gathers and leaves the tokens on the device
+            e.discard_draws = true;
+            defer e.discard_draws = false;
+            try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
+        },
+        .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
+        .shared => {
+            const k = h.depth;
+            if (k == 0 or k > engine.max_shared or ids_in.len < 2 * k) return error.BadStep;
+            var parts: [engine.max_shared]engine.Part = undefined;
+            var outs: [engine.shared_rows]u32 = undefined;
+            var at: usize = 2 * k;
+            var row: usize = 0;
+            for (parts[0..k], 0..) |*p, i| {
+                const n = ids_in[2 * i + 1];
+                if (at + n > ids_in.len or row + n > outs.len) return error.BadStep;
+                p.* = .{ .slot = ids_in[2 * i], .ids = ids_in[at..][0..n], .out = outs[row..][0..n] };
+                at += n;
+                row += n;
+            }
+            e.discard_draws = true;
+            defer e.discard_draws = false;
+            try e.verifyShared(parts[0..k]);
+        },
+        .many => {
+            var parts: [engine.max_together]engine.Prompt = undefined;
+            const decoded = try prompt_wire.decode(ids_in, h.depth, e.capacity, &parts);
+            var firsts: [engine.max_together]u32 = undefined;
+            try e.prefillMany(decoded, &firsts);
+        },
+        .keep => try e.keep(@intCast(h.a)),
+        .draft => {
+            const ids = try e.gpa.dupe(u32, ids_in);
+            defer e.gpa.free(ids);
+            try e.draft(h.flags & 1 != 0, ids, h.depth, &s.drafts, if (h.flags & 2 != 0) &s.chances else null);
+        },
+        .block => {
+            const k = h.depth;
+            if (k == 0 or k > dflash.MAX_S or ids_in.len != 3 * k) return error.BadStep;
+            var reqs: [dflash.MAX_S]dflash.Req = undefined;
+            for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = ids_in[3 * i], .pos = 0, .n = ids_in[3 * i + 1], .anchor = ids_in[3 * i + 2] };
+            if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
+        },
+        .image => {
+            const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
+            try v.take(h.slot, ids_in);
+            try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+        },
+        .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+        .drop => for (ids_in) |id| e.dropState(id),
+        .release => e.release(h.slot),
+        .idle => cuda.tp_watch.sleep(e.io),
+        .end => return false, // rank 0 ends on purpose: its line closing from here is expected
+    }
+    return true;
 }
 
 test "a step's header is 64 bytes and keeps its fields" {

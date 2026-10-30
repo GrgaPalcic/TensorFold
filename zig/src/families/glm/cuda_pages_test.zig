@@ -315,3 +315,41 @@ test "a request needing more pages than the whole pool is admitted at once and r
     p.close(1);
     try expect(p.fits(600, 100));
 }
+
+test "TF_KV_PAGES on a model of KDA layers alone without the MTP head: nothing to page, so its layout is refused by name" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    for (&f.layers) |*l| l.mixer = .{ .kda = undefined }; // TF_GLM_LAYERS=1: no DSA layer is loaded
+    for ([_]bool{ false, true }) |kv8| {
+        f.e.settings.kv8 = kv8;
+        f.e.mtp = false; // --no-drafts or DFlash2
+        try expectEqual(@as(u64, 0), pages_mod.pageBytes(&f.e)); // a zero-byte page: the pool's plan would divide by it
+        try expect(!pages_mod.pageable(&f.e)); // Engine.init keeps every stream's window instead
+        try std.testing.expectError(error.NoPagedCaches, pages_mod.layout(std.testing.allocator, &f.e, 0));
+        f.e.mtp = true; // the target MTP head's cache alone still pages
+        try expect(pages_mod.pageable(&f.e));
+        try expect((try pages_mod.layout(std.testing.allocator, &f.e, 0)).token_bytes > 0);
+    }
+    f.e.mtp = false;
+    f.layers[1].mixer = .{ .mla = undefined }; // one DSA layer pages without the head
+    try expect(pages_mod.pageable(&f.e));
+    try expect(@import("cuda_native.zig").explain(null, error.NoPagedCaches) != null);
+    try expectEqual(@as(usize, 0), f.e.seqs.items.len); // nothing was made for it
+}
+
+test "capacity keeps a request exactly at --context: prompt + max_tokens == context passes the opening and prompt checks" {
+    const native = @import("cuda_native.zig");
+    for ([_]usize{ 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
+        const cap = native.capacity(context);
+        for ([_]usize{ 1, 184, context / 2 }) |max_new| {
+            const prompt = context - max_new;
+            try expect(Lanes.fitsContext(prompt, max_new, cap));
+            const rows = pages_mod.tableLen(prompt + max_new + 8) * @import("cuda_state.zig").page_rows; // its pages' rows
+            try expect(Engine.promptFits(prompt, @min(rows, cap))); // a paged stream's capacity (Pages.mapped)
+            try expect(Engine.promptFits(prompt + max_new, cap)); // a prompt-only turn at the context too
+        }
+        try expect(!Lanes.fitsContext(cap - 8, 1, cap)); // a window past the capacity
+        try expect(!Engine.promptFits(cap - 7, cap));
+        try expect(!Engine.promptFits(0, cap));
+    }
+}

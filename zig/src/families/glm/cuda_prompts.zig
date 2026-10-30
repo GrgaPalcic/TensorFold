@@ -10,7 +10,7 @@ pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
     if (parts.len == 0 or parts.len > engine.max_together) return false;
     var rows: usize = 0;
     for (parts, 0..) |p, i| {
-        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows >= capacity) return false;
+        if (p.ids.len == 0 or p.ids.len > fw.prefill_rows or p.ids.len + fw.window_rows > capacity) return false;
         for (parts[0..i]) |q| if (q.slot == p.slot) return false;
         rows += p.ids.len;
     }

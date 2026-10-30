@@ -14,7 +14,9 @@ pub fn tableLen(capacity: usize) usize {
 
 /// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
 /// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
+/// A layout of no token bytes (no DSA layer, no target MTP head) is error.NoPagedCaches: the pool divides by its page.
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
+    if (!pageable(e)) return error.NoPagedCaches;
     const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
     const page = pageBytes(e);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
@@ -23,6 +25,12 @@ pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
 /// A page's bytes for engine `e`: its cache format's parts, the target MTP head's only when it is loaded.
 pub fn pageBytes(e: *const Engine) u64 {
     return state.pageBytesOf(&e.w, e.settings.kv8, e.mtp);
+}
+
+/// Whether engine `e` has caches to page: a thin model of KDA layers alone (TF_GLM_LAYERS) without the target MTP head
+/// has none, so its sequences keep their windows (of no KV rows) whatever TF_KV_PAGES says.
+pub fn pageable(e: *const Engine) bool {
+    return pageBytes(e) > 0;
 }
 
 /// A paged sequence of engine `e`'s format on the pages at `at`.

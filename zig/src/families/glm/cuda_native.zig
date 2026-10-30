@@ -440,6 +440,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
+        error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
         error.TooManyRanks => std.fmt.comptimePrint(
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },

@@ -291,7 +291,7 @@ pub const Lanes = struct {
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
-        if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+        if (!fitsContext(ids.len, s.max_new, self.x.e.capacity)) return error.PromptTooLong;
         const pages = try self.seat(s, ids.len, s.max_new);
         errdefer {
             self.x.e.release(self.lanes.get(s).?.slot);
@@ -302,6 +302,12 @@ pub const Lanes = struct {
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+    }
+
+    /// A prompt, its reply and the last verify window inside the capacity: equal still fits (the window's last row is
+    /// row capacity - 1 at most), so a request of exactly --context opens (capacity = context + a window, rounded up).
+    pub fn fitsContext(prompt: usize, max_new: usize, capacity: usize) bool {
+        return prompt + max_new + max_rows <= capacity;
     }
 
     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
