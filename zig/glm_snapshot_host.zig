@@ -448,7 +448,8 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
     e.capacity = seq.st.capacity;
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;
-    try t.expectEqual(@as(u64, 203423744), minimum);
+    // 203,423,744 at 8-row windows; W16's 16-row windows double the KDA layers' window saves a state carries (+18 MiB)
+    try t.expectEqual(@as(u64, if (glm.forward.window_rows == 16) 222298112 else 203423744), minimum);
     try t.expect(minimum <= budget);
     try t.expect(glm.native.snap_bytes(&e, 34816) > budget);
 }

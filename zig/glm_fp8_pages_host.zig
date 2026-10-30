@@ -464,9 +464,11 @@ test "GLM FP8 pages: a begin that fails on rank 0 after its step went out frees 
     try t.expect(!g.p.used[slot] and f.p.pool.idle() and f.census().free == 8);
 }
 
-test "GLM FP8 pages: a request exactly at --context opens (8,000 + 184 at 8,184), one token past it is PromptTooLong" {
+test "GLM FP8 pages: a request exactly at --context opens (8,000 + the rest of 8,192 less a window), one token past it is PromptTooLong" {
+    const window: u32 = glm.native.window_rows; // a verify window's rows (8; 16 with W16's windows)
+    const context = 8192 - window; // + a verify window: 8,192 rows, already a multiple of 64
     var f: Fixture = undefined;
-    try f.prepare(false, glm.native.capacity(8184)); // 8,184 + a verify window: 8,192 rows, already a multiple of 64
+    try f.prepare(false, glm.native.capacity(context));
     try t.expectEqual(@as(usize, 8192), f.e.capacity);
     const l = try glm.pages.layout(t.allocator, &f.e, 0);
     f.p = try glm.pages.Pages.init(t.allocator, &f.e, l, 2, 16, true);
@@ -484,14 +486,15 @@ test "GLM FP8 pages: a request exactly at --context opens (8,000 + 184 at 8,184)
     defer t.allocator.free(prompt);
     @memset(prompt, 7);
     const b = back.backend();
-    for ([_]u32{ 184, 185 }) |max_new| {
+    const fits = context - 8000;
+    for ([_]u32{ fits, fits + 1 }) |max_new| {
         var stream = try lanes.Stream.init(t.allocator, .{ .id = "fp8-context-test", .prompt = prompt, .max_new = max_new });
         defer stream.deinit(t.allocator);
-        // 8,000 + 184 + 8 == 8,192: its 16 pages taken, then the begin step; 8,000 + 185 is refused before any page
-        try t.expectError(if (max_new == 184) error.TooManyIds else error.PromptTooLong, b.vtable.prefill_step.?(b.ptr, &stream));
+        // 8,000 + fits + a window == 8,192: its 16 pages taken, then the begin step; one more is refused before any page
+        try t.expectError(if (max_new == fits) error.TooManyIds else error.PromptTooLong, b.vtable.prefill_step.?(b.ptr, &stream));
         try t.expect(f.p.pool.idle() and f.census().free == 16 and back.lanes.count() == 0);
     }
-    try t.expectEqual(@as(usize, 16), glm.pages.need(l, 8000, 184)); // the table's every entry: the pool's whole
+    try t.expectEqual(@as(usize, 16), glm.pages.need(l, 8000, fits)); // the table's every entry: the pool's whole
 }
 
 test "GLM FP8 pages: a refused table upload cancels the lease, and a retry takes and returns every page" {

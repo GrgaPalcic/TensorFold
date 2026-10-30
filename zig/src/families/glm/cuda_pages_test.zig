@@ -339,17 +339,18 @@ test "TF_KV_PAGES on a model of KDA layers alone without the MTP head: nothing t
 
 test "capacity keeps a request exactly at --context: prompt + max_tokens == context passes the opening and prompt checks" {
     const native = @import("cuda_native.zig");
-    for ([_]usize{ 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
+    const window: usize = @import("cuda_state.zig").window_rows; // a verify window's rows past the reply (8, or 16 with W16)
+    for ([_]usize{ 8192 - window, 8184, 8192, 8191, 245_760, 864_256, 1_048_576 }) |context| {
         const cap = native.capacity(context);
         for ([_]usize{ 1, 184, context / 2 }) |max_new| {
             const prompt = context - max_new;
             try expect(Lanes.fitsContext(prompt, max_new, cap));
-            const rows = pages_mod.tableLen(prompt + max_new + 8) * @import("cuda_state.zig").page_rows; // its pages' rows
+            const rows = pages_mod.tableLen(prompt + max_new + window) * @import("cuda_state.zig").page_rows; // its pages' rows
             try expect(Engine.promptFits(prompt, @min(rows, cap))); // a paged stream's capacity (Pages.mapped)
             try expect(Engine.promptFits(prompt + max_new, cap)); // a prompt-only turn at the context too
         }
-        try expect(!Lanes.fitsContext(cap - 8, 1, cap)); // a window past the capacity
-        try expect(!Engine.promptFits(cap - 7, cap));
+        try expect(!Lanes.fitsContext(cap - window, 1, cap)); // a window past the capacity
+        try expect(!Engine.promptFits(cap - window + 1, cap));
         try expect(!Engine.promptFits(0, cap));
     }
 }
