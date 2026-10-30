@@ -8,6 +8,8 @@ const kernels: mm.Kernels = .{
     .reduce = .{ .id = 1024 },
     .tile = .{},
     .tile_packed = @splat(.{}),
+    .pair = @splat(.{}), // decode windows' two-problem launches (not this test's)
+    .packed_prompt = @splat(.{}), // the two-stage packed prompt kernels (not this test's)
     .pdl = false,
 };
 test "verify and draft windows keep shape-selected split K at every width" {
