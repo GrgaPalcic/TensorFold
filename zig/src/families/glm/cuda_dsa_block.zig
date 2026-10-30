@@ -134,7 +134,8 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
     if (c.ps % (l.lw * 2) != 0) return error.LatentShape; // pages whole latent rows apart (the token lists' unit)
-    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2) };
+    // an E4M3 cache's sparse lists stay positions (its chunks take each key through the table); BF16's are page rows
+    const t: latent.Table = .{ .pt = c.pt, .ps = c.ps, .page_rows = c.ps / (l.lw * 2), .logical = c.ls != 0 };
     var stamp = prof.span(k.prof, stream, .cache_write);
     try latent.latentWriteFormat(set, stream, v.lat, l.lw, c.lc, c.ls, t, pos, rows, l.lw);
     stamp.end();
