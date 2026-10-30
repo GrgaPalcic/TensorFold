@@ -264,8 +264,15 @@ pub const Drafter = struct {
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
     pub const promptSegment = ingestPrompt;
 
-    /// A prompt chunk whose tap rows are at `taps` (a paired step's second chunk).
-    pub const promptFrom = ingestPromptFrom;
+    /// A paired step's second chunk whose tap rows are already in the context input from row `row0` (pairTaps).
+    pub const promptIn = ingestPromptIn;
+
+    /// Where a paired step's second chunk taps when the first's last `first_rows` rows go in too (cuda_prompt_pair):
+    /// the context input past them, idle through the pass. The first's ingest copies its rows in before them, then the
+    /// second's reads its own in place (promptIn), so a pair needs no tap rows of its own.
+    pub fn pairTaps(dr: *const Drafter, first_rows: usize) taps_mod.Taps {
+        return .{ .f = dr.k.tap, .out = dr.cin + first_rows * TAP_ROW };
+    }
 
     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
@@ -275,7 +282,7 @@ pub const Drafter = struct {
         if (N > MAX_CTX) return error.DrafterContextTooWide;
         var row: usize = 0;
         for (runs) |r| {
-            try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
+            if (r.taps != dr.cin + row * TAP_ROW) try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW); // in place: promptIn
             for (0..r.n) |j| {
                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
                 dr.h_crings[row + j] = r.ring;
@@ -368,18 +375,32 @@ pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, ro
 }
 
 pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
-    const s = try dr.slot(i);
-    const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
-    try dr.ingest(e, &.{run});
-    // the run the ring holds: it goes on from `end`, or starts again past a gap (rows a kept state may carry)
-    if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
-    s.end = run.pos0 + @as(i64, @intCast(run.n));
+    return ingestFrom(dr, e, i, start, rows, len, dr.taps_prefill, row0);
 }
 
-/// ingestPrompt of a chunk whose tap rows are at `taps` (a paired step's second chunk, cuda_prompt_pair) instead of
-/// taps_prefill: the same run and ingest.
-pub fn ingestPromptFrom(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, taps: u64) !void {
+/// ingestPrompt of a chunk whose tap rows already sit in the context input from row `row0` on (a paired step's second
+/// chunk, tapped at pairTaps while the first's rows go in before them): the ingest reads them where they are, as the
+/// copy would have left them at row 0. Every one of its rows is in the last window.
+pub fn ingestPromptIn(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
+    if (start < len -| @as(usize, @intCast(WIN)) or row0 > MAX_CTX or rows > MAX_CTX - row0) return error.BadPromptContext;
+    const cin = dr.cin;
+    defer dr.cin = cin;
+    dr.cin = cin + row0 * TAP_ROW;
+    return ingestFrom(dr, e, i, start, rows, len, dr.cin, 0);
+}
+
+/// A prompt chunk's rows in the last window from tap rows at `taps` (row `row0` on) into slot `i`'s ring, and the run
+/// the ring then holds (keptFrom's), whichever buffer they were tapped into.
+fn ingestFrom(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, taps: u64, row0: usize) !void {
     const s = try dr.slot(i);
-    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, 0)) orelse return;
+    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, row0)) orelse return;
     try dr.ingest(e, &.{run});
+    noteRun(s, run);
+}
+
+/// The run slot `s`'s ring holds once `run` is in: it goes on from `end`, or starts again past a gap (rows a kept
+/// state may carry).
+pub fn noteRun(s: anytype, run: Run) void {
+    if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
+    s.end = run.pos0 + @as(i64, @intCast(run.n));
 }

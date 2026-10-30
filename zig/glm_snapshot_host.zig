@@ -835,6 +835,58 @@ test "GLM snapshots: beside DFlash2 a state carries the drafter's context rows t
     f.e.drafter = null;
 }
 
+test "GLM snapshots: a paired step's second chunk leaves DFlash2's context run where a chunk at a time leaves it" {
+    const df = glm.dflash;
+    const C = 2048;
+    const Slot = struct { ring: ?struct { ptr: u64 } = .{ .ptr = 0x7000_0000 }, first: i64 = df.no_rows, end: i64 = 0 };
+    const Mock = struct { // the ingests' runs and where the context input began for each (cuda_prompt_pair's calls)
+        cin: u64 = 0x1000_0000,
+        taps_prefill: u64 = 0x4000_0000,
+        s: Slot = .{},
+        taps: [4]u64 = undefined,
+        cins: [4]u64 = undefined,
+        runs: [4]df.Run = undefined,
+        n: usize = 0,
+        pub fn slot(m: *@This(), _: u32) !*Slot {
+            return &m.s;
+        }
+        pub fn ingest(m: *@This(), _: void, runs: []const df.Run) !void {
+            m.runs[m.n] = runs[0];
+            m.cins[m.n] = m.cin;
+            m.n += 1;
+        }
+    };
+    const len = 3 * C + 1000; // the last window starts 1,048 rows before chunk 3: chunks 2 and 3 reach it
+    const keep_from = len - @as(usize, @intCast(df.WIN));
+    var one: Mock = .{};
+    for ([_]usize{ 0, C, 2 * C, 3 * C }) |start| try df.ingestPrompt(&one, {}, 0, start, @min(C, len - start), len, 0);
+    var two: Mock = .{};
+    try df.ingestPrompt(&two, {}, 0, 0, C, len, 0);
+    try df.ingestPrompt(&two, {}, 0, C, C, len, 0);
+    const kept = 3 * C - keep_from; // the pair (2, 3): chunk 2's rows in the window go in first, chunk 3's after them
+    try df.ingestPrompt(&two, {}, 0, 2 * C, C, len, 0);
+    try df.ingestPromptIn(&two, {}, 0, 3 * C, len - 3 * C, len, kept);
+    try t.expectEqual(one.s.first, two.s.first);
+    try t.expectEqual(one.s.end, two.s.end);
+    try t.expectEqual(@as(i64, @intCast(keep_from)), two.s.first);
+    try t.expectEqual(@as(i64, len), two.s.end); // so a keep at the prompt's end carries the ring (keptFrom)
+    try t.expectEqual(@as(usize, 2), two.n);
+    for (one.runs[0..2], two.runs[0..2]) |a, b| { // the same rows and positions into the same ring
+        try t.expectEqual(a.n, b.n);
+        try t.expectEqual(a.pos0, b.pos0);
+        try t.expectEqual(a.ring, b.ring);
+    }
+    try t.expectEqual(two.taps_prefill + (keep_from - 2 * C) * df.TAP_ROW, two.runs[0].taps);
+    const cin_b = two.cin + kept * df.TAP_ROW; // chunk 3's rows are read where they were tapped, so ingest copies none
+    try t.expectEqual(cin_b, two.runs[1].taps);
+    try t.expectEqual(cin_b, two.cins[1]);
+    try t.expectEqual(@as(u64, 0x1000_0000), two.cin); // the context input is the drafter's own again
+    try t.expect(kept + (len - 3 * C) <= df.MAX_CTX);
+    // a chunk that starts before the window has rows a copy would skip: it never reads its rows in place
+    try t.expectError(error.BadPromptContext, df.ingestPromptIn(&two, {}, 0, 2 * C, C, len, 0));
+    try t.expectError(error.BadPromptContext, df.ingestPromptIn(&two, {}, 0, 3 * C, len - 3 * C, len, df.MAX_CTX - 999));
+}
+
 /// Every field an E4M3 prefix at `at` reads, in `a` and in `b` (codes, scales, rings, pooled keys), from either layout.
 fn expectSamePrefix8(c: glm.config.Config, a: *const glm.forward.State, b: *const glm.forward.State, at: usize, head: ?usize) !void {
     try same(a.pos_dev, b.pos_dev, 4);

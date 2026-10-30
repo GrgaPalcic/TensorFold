@@ -187,23 +187,28 @@ pub const Buffers = struct {
     }
 
     /// A paired step's second chunk: its own rows across sites and streams, and `of`'s scratch for one site's work.
-    pub fn initTwin(d: *const cuda.Driver, w: *const weights.Weights, of: *const Buffers, capacity: usize) !Buffers {
-        return make(d, w, of.rows, of.prefill, capacity, of.rows, of);
+    /// Without `own_room` it exchanges into `of`'s gathered rooms too (split exchanges touch them on the side stream only).
+    pub fn initTwin(d: *const cuda.Driver, w: *const weights.Weights, of: *const Buffers, capacity: usize, own_room: bool) !Buffers {
+        return make(d, w, of.rows, of.prefill, capacity, of.rows, .{ .of = of, .own_room = own_room });
     }
+
+    /// The buffers a twin is made beside, and whether it takes rooms of its own.
+    const Twin = struct { of: *const Buffers, own_room: bool };
 
     /// The fields a twin holds apart, by their index in make's sizes (make reads the fields from these indexes too).
     const twin_at = .{ .ids = 0, .x = 1, .normed = 2, .xs = 3, .post = 4, .comb = 5, .hcpart = 6, .gathered = 7, .hidden = 62, .fnormed = 63, .fxs = 64, .logits = 65, .part = 70 };
     /// make's size count when twin_at's indexes were last checked: adding or removing a size fails the build.
     const twin_checked = 76;
 
-    /// Whether make's size `i` is one a twin holds apart.
-    fn twinHolds(i: usize) bool {
+    /// Whether make's size `i` is one a twin holds apart (its gathered rooms only with `own_room`).
+    fn twinHolds(i: usize, own_room: bool) bool {
+        if (i == twin_at.gathered and !own_room) return false;
         inline for (@typeInfo(@TypeOf(twin_at)).@"struct".field_names) |f| if (@field(twin_at, f) == i) return true;
         return false;
     }
 
     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?*const Buffers) !Buffers {
+    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?Twin) !Buffers {
         const c = &w.config;
         const s = &w.share;
         const D: usize = c.hidden;
@@ -272,8 +277,8 @@ pub const Buffers = struct {
             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
         };
         var held = sizes;
-        if (twin != null) for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
-            if (!twinHolds(i)) bytes.* = 0;
+        if (twin) |tw| for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
+            if (!twinHolds(i, tw.own_room)) bytes.* = 0;
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &held, &p);
@@ -329,10 +334,11 @@ pub const Buffers = struct {
         };
         out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
         out.kda.tmp = p[75];
-        if (twin) |of| {
-            var t = of.*;
+        if (twin) |tw| {
+            var t = tw.of.*;
             t.arena = out.arena;
             inline for (@typeInfo(@TypeOf(twin_at)).@"struct".field_names) |f| @field(t, f) = @field(out, f);
+            if (!tw.own_room) t.gathered = tw.of.gathered;
             return t;
         }
         return out;

@@ -10,23 +10,27 @@ const room = fw.Forward.room;
 const share = fw.Forward.share;
 
 /// Two consecutive prompt chunks of one sequence (`b` a view of `a`'s at its end), each on `pieced`'s kernels and bits.
-/// A chunk with DFlash2 taps (its own tap rows) is tapped on the side stream as each ffn piece's glue posts its rows,
+/// Both chunks' exchanges and glue post on one side stream in step order, so they may share one exchange room.
+/// A chunk with DFlash2 taps is tapped on the side stream as each ffn piece's glue posts its rows,
 /// and its taps are shared (#1623's shareTaps) once both chunks' last sites are in: the rows `pieced` would tap.
 pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !void {
     const two = [_]*const Forward{ a, b };
     const rows = [_]usize{ ra, rb };
     var cuts: [2][fw.max_pieces][2]usize = undefined;
     var n: [2]usize = undefined;
+    const one_room = a.ranks[0].b.gathered == b.ranks[0].b.gathered; // a twin without rooms of its own (Pair.own_room)
     for (two, rows, 0..) |f, R, i| {
         if (f.pieces == null or f.prof != null) return error.BadPair;
         const c = &f.ranks[0].w.config;
+        n[i] = fw.ranges(R, f.pieces.?.count, &cuts[i]);
+        if (n[i] == 1 and !f.splits(R)) return error.BadPair; // run would take this chunk whole
+        // in one room every piece splits: a whole piece's fill writes its room on the main stream (prompt_pair.piecesSplit)
+        if (one_room) for (cuts[i][0..n[i]]) |p| if (!f.splits(p[1] - p[0])) return error.BadPair;
         for (f.ranks) |r| {
             if (r.segs.len > 0 or !r.b.prefill or R == 0 or R > r.b.rows) return error.BadPair;
             try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
         }
         if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
-        n[i] = fw.ranges(R, f.pieces.?.count, &cuts[i]);
-        if (n[i] == 1 and !f.splits(R)) return error.BadPair; // run would take this chunk whole
         for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
     }
     const layers = a.ranks[0].w.layers;

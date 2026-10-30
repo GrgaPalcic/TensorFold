@@ -6,7 +6,6 @@ const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
 const engine = @import("cuda_engine.zig");
 const dflash = @import("dflash.zig");
-const taps_mod = @import("cuda_taps.zig");
 const Engine = engine.Engine;
 
 /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
@@ -24,26 +23,25 @@ pub fn minLen() usize {
 }
 
 /// A paired step's second chunk: twins of the prompt buffers, pieces on their side stream, and its first position.
+/// Beside DFlash2 it taps into the drafter's own buffers (dflash pairTaps), so it holds no tap rows.
 pub const Pair = struct {
     bp: fw.Buffers,
     pieces: fw.Pieces,
     pos: cuda.DeviceBuffer, // an i32: where the second chunk's view of the sequence starts
-    taps: ?cuda.DeviceBuffer = null, // with a drafter: the second chunk's DFlash2 tap rows (the first's are its taps_prefill)
+    own_room: bool, // its own exchange room; else the first chunk's (split exchanges: only the side stream touches it)
     steps: u64 = 0, // paired steps so far (glm-pair-check counts them)
 
-    /// `drafter`: DFlash2 will be loaded, so the second chunk needs tap rows of its own (a chunk's worth).
-    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, bp: *const fw.Buffers, pieces: *const fw.Pieces, capacity: usize, drafter: bool) !Pair {
-        var b = try fw.Buffers.initTwin(d, w, bp, capacity);
+    /// `own_room`: the second chunk exchanges into rooms of its own (TF_GLM_PREFILL_REDUCE=gather fills a room on the
+    /// main stream); split exchanges share the first's (64 MiB a rank at TP=2).
+    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, bp: *const fw.Buffers, pieces: *const fw.Pieces, capacity: usize, own_room: bool) !Pair {
+        var b = try fw.Buffers.initTwin(d, w, bp, capacity, own_room);
         errdefer b.deinit();
         var p = try fw.Pieces.initTwin(d, pieces);
         errdefer p.deinit();
-        var t: ?cuda.DeviceBuffer = if (drafter) try cuda.DeviceBuffer.alloc(d, fw.prefill_rows * dflash.TAP_ROW) else null;
-        errdefer if (t) |*x| x.free();
-        return .{ .bp = b, .pieces = p, .pos = try cuda.DeviceBuffer.alloc(d, 4), .taps = t };
+        return .{ .bp = b, .pieces = p, .pos = try cuda.DeviceBuffer.alloc(d, 4), .own_room = own_room };
     }
 
     pub fn deinit(p: *Pair) void {
-        if (p.taps) |*t| t.free();
         p.pos.free();
         p.pieces.deinit();
         p.bp.deinit();
@@ -63,38 +61,46 @@ pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool
     return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
 }
 
+/// Whether chunks of `ra` and `rb` rows can share one exchange room (Pair.own_room false): every piece of each splits
+/// (at least a row a rank), so only the side stream, which posts both chunks' exchanges in one order, touches it.
+pub fn piecesSplit(ra: usize, rb: usize, count: usize, world: usize) bool {
+    var cut: [fw.max_pieces][2]usize = undefined;
+    for ([_]usize{ ra, rb }) |rows| {
+        const n = fw.ranges(rows, count, &cut);
+        for (cut[0..n]) |p| if (p[1] - p[0] < world) return false;
+    }
+    return true;
+}
+
 /// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do: at a, or not.
 pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
     const ra = fw.prefill_rows;
     return start + ra > base + ring or start + ra + rb <= base + ring;
 }
 
-/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with prompt rows or prof, nor with a
-/// drafter unless the twin holds its tap rows.
+/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with prompt rows or prof.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.pair == null or !e.settings.pair or !drafterFits(e) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+    if (e.pair == null or !e.settings.pair or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (len < minLen()) return false; // too short to gain from a pair
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
+    const rb = @min(len - start - fw.prefill_rows, fw.prefill_rows);
+    if (!e.pair.?.own_room and !piecesSplit(fw.prefill_rows, rb, e.pieces.count, e.share.world)) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
-    return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
-}
-
-/// A drafter pairs only with the twin's own tap rows (Pair.init's `drafter`).
-fn drafterFits(e: *const Engine) bool {
-    return e.drafter == null or e.pair.?.taps != null;
+    return ringsAgree(base, e.cur.st.ring_rows, start, rb);
 }
 
 /// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
-/// With DFlash2 each chunk's taps are the rows prefillChunk would tap (its last window's), and the drafter ingests a's,
-/// then b's, as two chunks one at a time do.
+/// With DFlash2 each chunk taps where prefillChunk would (a chunk reaching the last window), and the drafter ingests
+/// a's rows, then b's, as two chunks one at a time do.
 pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks, split: bool) !?u32 {
     const ra: usize = fw.prefill_rows;
     if (len <= start + ra) return error.BadChunk;
     const rb: usize = @min(len - start - ra, fw.prefill_rows);
     const pair = if (e.pair) |*p| p else return error.BadChunk;
-    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or !drafterFits(e) or e.prompt_logprobs != null) return error.BadChunk;
+    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.prompt_logprobs != null) return error.BadChunk;
+    if (!pair.own_room and !piecesSplit(ra, rb, e.pieces.count, e.share.world)) return error.BadChunk; // pairedAt's rule
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
@@ -109,10 +115,12 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     fb.prof = null;
     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
     fb.index_split = split;
-    // DFlash2 taps (prefillChunk's rule): only a chunk that reaches into the last window; b's rows into the twin's
+    // DFlash2 taps (prefillChunk's rule): only a chunk that reaches into the last window. a's go to taps_prefill; b's
+    // there too when a has none, else into the drafter's context input past a's kept rows (dflash pairTaps)
     const keep_from = len -| @as(usize, @intCast(dflash.WIN));
-    if (start + ra <= keep_from) fa.taps = null;
-    fb.taps = if (e.drafter) |dr| (if (start + ra + rb <= keep_from) null else taps_mod.Taps{ .f = dr.k.tap, .out = pair.taps.?.ptr }) else null;
+    const a_kept = start + ra -| keep_from; // a's rows in the last window (keep_from > start: b follows a)
+    if (a_kept == 0) fa.taps = null;
+    fb.taps = if (e.drafter) |dr| (if (start + ra + rb <= keep_from) null else if (a_kept > 0) dr.pairTaps(a_kept) else dr.taps(true)) else null;
     const st = &e.cur.st;
     try st.ready(e.stream, ra + rb); // one rebase for both chunks, at a as a chunk at a time, before b's view copies it
     var sb = st.*;
@@ -127,9 +135,9 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     try fw.Forward.pairBody(&fa, &fb, ra, rb);
     pair.steps += 1;
     e.index_splits += @intFromBool(split);
-    if (e.drafter) |dr| { // a's rows from its taps_prefill, then b's from the twin's, each as its own chunk would
+    if (e.drafter) |dr| { // a's rows from taps_prefill, then b's where they were tapped, each as its own chunk's would
         try dr.prompt(e, e.slot, start, ra, len);
-        try dr.promptFrom(e, e.slot, start + ra, rb, len, pair.taps.?.ptr);
+        if (a_kept > 0) try dr.promptIn(e, e.slot, start + ra, rb, len, a_kept) else try dr.prompt(e, e.slot, start + ra, rb, len);
         if (start + ra + rb == len) try dr.ringDigest(e, e.slot, len);
     }
     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
@@ -174,6 +182,17 @@ test "a pair rebases the index rings where a chunk at a time would, so a ring ba
     try std.testing.expect(!ringsAgree(0, 2 * C, C, 1));
     try std.testing.expect(ringsAgree(0, 2 * C, 2 * C, C)); // both at a's start
     try std.testing.expect(ringsAgree(C, 2 * C, C, C));
+}
+
+test "chunks share one exchange room only where every piece splits: a row a rank in each" {
+    const C = fw.prefill_rows;
+    try std.testing.expect(piecesSplit(C, C, 3, 2));
+    try std.testing.expect(piecesSplit(C, min_rows, 3, 2));
+    try std.testing.expect(!piecesSplit(C, 769, 3, 2)); // pieces of 384, 384 and 1 row: the last goes whole
+    try std.testing.expect(piecesSplit(C, 770, 3, 2));
+    try std.testing.expect(!piecesSplit(C, 770, 3, 3));
+    try std.testing.expect(piecesSplit(C, 769, 1, 2)); // one piece of every row
+    for (1..fw.max_pieces + 1) |count| try std.testing.expect(piecesSplit(C, C, count, 16)); // a's pieces always split
 }
 
 test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
