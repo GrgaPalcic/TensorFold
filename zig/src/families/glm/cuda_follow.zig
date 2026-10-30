@@ -144,6 +144,7 @@ pub const Leader = struct {
             cuda.tp_watch.wake();
             x.link.asleep = false;
         }
+        if (ids.len > x.link.ids.len) return error.TooManyIds; // refused whole: a pending keep stays for the next step
         if (x.link.keep_pending) |kp| {
             x.link.keep_pending = null;
             const kind: Kind = @fromBackingInt(@intCast(hh.kind));
