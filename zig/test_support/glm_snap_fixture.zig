@@ -20,7 +20,7 @@ pub const Fixture = struct {
         layers[0].mixer = .{ .mla = undefined };
         layers[1].mixer = .{ .kda = undefined };
         w.layers = &layers;
-        f.seq = .{ .st = try glm.forward.State.initFormat(t.allocator, d, &w, 16448, kv8) };
+        f.seq = .{ .st = try glm.forward.State.initHead(t.allocator, d, &w, 16448, kv8, mtp) }; // as Engine.bind makes one
         f.e = undefined;
         f.e.cur = &f.seq;
         f.e.gpa = t.allocator;

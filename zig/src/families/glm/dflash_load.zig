@@ -117,7 +117,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     if (bits != 0 and bits != 4) return error.BadDrafterBits;
     try checkConfig(gpa, io, dir);
     const d = e.d;
-    const head = (e.w.mtp orelse return error.DrafterNeedsDraftHead).draft;
+    const head = e.w.draft_head orelse return error.DrafterNeedsDraftHead; // borrowed: the weights own it
     const path = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
     defer gpa.free(path);
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});

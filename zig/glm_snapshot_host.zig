@@ -596,3 +596,43 @@ test "GLM snapshots: with the engine's own sequence on pages too, a prefix's siz
         for (ats, sizes) |at, s| try t.expectEqual(s, f.e.stateBytes(at));
     }
 }
+
+test "GLM snapshots: without the target MTP head a window's sequence drops exactly the head's cache, and its prefix too" {
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Sizing.alloc;
+    d.api.cuMemFree_v2 = Sizing.free;
+    d.api.cuMemsetD8_v2 = Sizing.zero;
+    var w: glm.weights.Weights = undefined;
+    w.config = .{};
+    w.share = try glm.shard.Share.of(&w.config, 0, 2);
+    var layers: [glm.config.max_layers]glm.weights.Layer = undefined;
+    w.layers = layers[0..w.config.layers];
+    for (w.layers, 0..) |*layer, i| {
+        layer.* = undefined;
+        layer.mixer = switch (w.config.kind(@intCast(i))) {
+            .mla => .{ .mla = undefined },
+            .kda => .{ .kda = undefined },
+        };
+    }
+    const cap = glm.native.capacity(446464);
+    for ([_]bool{ false, true }) |kv8| {
+        var with = try glm.forward.State.initHead(t.allocator, &d, &w, cap, kv8, true);
+        defer with.deinit();
+        var without = try glm.forward.State.initHead(t.allocator, &d, &w, cap, kv8, false);
+        defer without.deinit();
+        var whole = try glm.forward.State.initFormat(t.allocator, &d, &w, cap, kv8);
+        defer whole.deinit();
+        try t.expectEqual(whole.arena.buf.len, with.arena.buf.len); // initFormat keeps the head's cache, as before
+        const c = &w.config;
+        const ring = std.mem.alignForward(usize, @min(cap, 2 * glm.engine.prompt_rows) * c.i_dim * 2, 256);
+        const latent = std.mem.alignForward(usize, try glm.latent.cacheBytes(cap, c.kv_lora, kv8), 256);
+        const pooled = std.mem.alignForward(usize, (cap / glm.sparse.pool + 2) * c.i_dim * 2, 256);
+        try t.expectEqual(with.arena.buf.len - without.arena.buf.len, latent + 2 * ring + pooled);
+        std.debug.print("GLM no-head sequence kv8={} cap={d}: {d} -> {d} bytes (-{d})\n", .{ kv8, cap, with.arena.buf.len, without.arena.buf.len, with.arena.buf.len - without.arena.buf.len });
+        // its prefix plans no head rows and still ends with the head's position and the first-draft row
+        const plan = try glm.snapshots.layout.Plan.init(&without, c, 131072, null);
+        const headed = try glm.snapshots.layout.Plan.init(&with, c, 131072, null);
+        try t.expectEqual(headed.len, plan.len);
+        try t.expect(plan.len < without.arena.buf.len);
+    }
+}

@@ -71,15 +71,16 @@ pub const Engine = struct {
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
     bd: fw.Buffers, // verify windows
-    bm: fw.Buffers, // the MTP head's rows
-    bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
+    bm: ?fw.Buffers = null, // the target MTP head's rows (only with its layer loaded)
+    bs: ?fw.Buffers = null, // shared verify windows (with drafts, as the lane core shares only then)
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
     slot: u32 = 0,
     capacity: usize,
-    mtp: bool,
+    drafts: bool, // speculation on: shared windows and the lane core's draft facts (the MTP layer's or DFlash2's)
+    mtp: bool, // the target MTP layer loaded and run: its prompt absorb, chains, caches and kept rows (w.mtp != null)
     heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
     shared_buf: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
@@ -124,7 +125,7 @@ pub const Engine = struct {
             rank,
             o.settings,
             o.capacity,
-            o.mtp,
+            o.drafts,
             config_hash,
             program_hash,
             checkpoint_digest,
@@ -146,7 +147,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -163,12 +164,15 @@ pub const Engine = struct {
             }
         };
         const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
+        // beside DFlash2 only the draft head it borrows loads: the target MTP layer, its caches and buffers stay out
+        const heads: weights.Heads = if (!o.drafts) .none else if (o.drafter) .draft else .mtp;
+        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, heads), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);
             gpa.free(e.packs.bits);
         }
+        e.mtp = e.w.mtp != null; // before the first sequence: its caches hold the head's rows only with the head
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
@@ -181,9 +185,9 @@ pub const Engine = struct {
         errdefer e.bp.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
-        errdefer e.bm.deinit();
-        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (e.mtp) e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        errdefer if (e.bm) |*b| b.deinit();
+        if (o.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();
@@ -226,7 +230,7 @@ pub const Engine = struct {
         e.smp.deinit();
         e.pairs.free();
         if (e.bs) |*b| b.deinit();
-        e.bm.deinit();
+        if (e.bm) |*b| b.deinit();
         e.bd.deinit();
         e.bp.deinit();
         if (e.pages) |p| p.deinit();
@@ -287,7 +291,7 @@ pub const Engine = struct {
         if (made) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8) };
+            q.* = .{ .st = try fw.State.initHead(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, e.mtp) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
@@ -557,8 +561,9 @@ pub const Engine = struct {
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32, chances: ?[]f64) !void {
         if (!e.mtp) return error.NoDraftHead;
         if (depth > max_drafts) return error.TooDeep;
+        const bm = if (e.bm) |*b| b else return error.NoDraftHead;
         var one: [1]fw.Rank = undefined;
-        const f = e.view(&e.bm, &one);
+        const f = e.view(bm, &one);
         const D = e.c.hidden;
         const hidden = if (from_prompt) @import("cuda_prompt_hold.zig").input(e) else e.cur.rows_at;
         try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
@@ -572,15 +577,15 @@ pub const Engine = struct {
         }
         for (0..depth) |j| {
             if (chances != null and !e.structured and e.cur.sampling == null) {
-                const p = try e.greedyChance(e.bm.logits);
+                const p = try e.greedyChance(bm.logits);
                 out[j] = p.token;
                 chances.?[j] = p.chance;
             } else {
-                try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
+                try e.draw(bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
                 if (chances) |c| c[j] = 1; // a sampled or structured draft keeps chance 1: its window runs whole
             }
             if (j + 1 < depth) {
-                try f.mtp(@ptrCast(out[j..][0..1]), &.{e.bm.fnormed});
+                try f.mtp(@ptrCast(out[j..][0..1]), &.{bm.fnormed});
                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
                 e.cur.in_head += 1;
             }

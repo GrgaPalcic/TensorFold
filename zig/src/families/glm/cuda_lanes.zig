@@ -102,7 +102,7 @@ pub const Lanes = struct {
 
     /// Round loop facts: copies up to max_rows, head chains to mtp_rows, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
-        const drafting = self.x.e.mtp;
+        const drafting = self.x.e.drafts; // speculation on (the target MTP layer loads only without DFlash2)
         const block = self.x.e.drafter != null;
         const sharing = drafting and !self.alone;
         return .{

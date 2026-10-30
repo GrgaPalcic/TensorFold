@@ -158,7 +158,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, df.EPS, M, D);
-    const head = e.w.mtp.?.draft;
+    const head = e.w.draft_head.?; // the weights own it (dflash_load checked it is there)
     var r0: usize = 0;
     while (r0 < M) : (r0 += 16) {
         const rows = @min(16, M - r0);
