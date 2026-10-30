@@ -193,6 +193,7 @@ pub const Forward = struct {
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
+    side: ?moe.Side = null, // a decode window's MoE shared expert on a second stream (TF_GLM_SHARED_SIDE, default on)
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
@@ -301,7 +302,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side };
     }
 
     pub const Site = enum { mixer, ffn };

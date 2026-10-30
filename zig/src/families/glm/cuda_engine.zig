@@ -67,6 +67,7 @@ pub const Engine = struct {
     m: fw.Modules,
     stream: cuda.Stream,
     pieces: fw.Pieces,
+    side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
     bd: fw.Buffers, // verify windows
@@ -140,10 +141,12 @@ pub const Engine = struct {
         errdefer m.deinit();
         var pieces = try fw.Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
+        var side = try sideStream(d);
+        errdefer if (side) |*x| freeSide(x);
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -229,6 +232,7 @@ pub const Engine = struct {
         e.seqs.deinit(e.gpa);
         e.w.deinit();
         e.pieces.deinit();
+        if (e.side) |*x| freeSide(x);
         e.m.deinit();
         e.stream.deinit();
         e.gpa.free(e.spans);
@@ -245,7 +249,24 @@ pub const Engine = struct {
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side };
+    }
+
+    /// The decode windows' side stream for the MoE shared expert, unless TF_GLM_SHARED_SIDE=0.
+    fn sideStream(d: *const cuda.Driver) !?@import("cuda_moe.zig").Side {
+        if (std.c.getenv("TF_GLM_SHARED_SIDE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
+        var s = try cuda.Stream.init(d, false);
+        errdefer s.deinit();
+        var fork = try cuda.Event.init(d, false);
+        errdefer fork.deinit();
+        return .{ .s = s, .fork = fork, .join = try cuda.Event.init(d, false) };
+    }
+
+    fn freeSide(x: *@import("cuda_moe.zig").Side) void {
+        x.s.synchronize() catch {};
+        x.join.deinit();
+        x.fork.deinit();
+        x.s.deinit();
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -500,7 +521,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         for (parts, segs[0..parts.len]) |p, g| {
