@@ -65,7 +65,8 @@ pub fn splitAt(start: usize, from: usize, world: usize) bool {
     return from > 0 and world > 1 and start >= from;
 }
 
-/// sparse.select_tokens: rows' tokens (i32 [rows][width], ascending, -1 padded; on pages their rows); count 0 if dense.
+/// sparse.select_tokens: rows' tokens (i32 [rows][width], ascending, -1 padded; on pages their rows unless `t.logical`);
+/// count 0 if dense. The pooled keys are read through `t.pt` either way.
 pub fn selectTokens(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, t: latent.Table, pos: u64, host_pos: usize, rows: usize, heads: usize, d: usize, np_max_cap: usize, s: Scratch, tokens: u64, counts: u64) !void {
     return selectTokensProfile(set, ops, stream, qi, wts, w_stride, pk, t, pos, host_pos, rows, heads, d, np_max_cap, s, tokens, counts, null, null);
 }
@@ -126,7 +127,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
     args.add(@as(c_int, topk_pools));
     args.add(tokens);
     args.add(counts);
-    args.add(t.pt);
+    args.add(if (t.logical) @as(u64, 0) else t.pt); // an E4M3 cache's lists stay positions; its chunks take the table
     args.add(@as(i64, @intCast(t.page_rows)));
     try cuda.launch.launch(assemble, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
 }
