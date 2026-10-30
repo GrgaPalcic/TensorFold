@@ -131,7 +131,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 13, // this struct's version
+    layout: u32 = 14, // this struct's version (13 was num3's numerics or prefill3's pair alone)
     world: u32,
     rank: u32,
     kv8: u32 = 0,

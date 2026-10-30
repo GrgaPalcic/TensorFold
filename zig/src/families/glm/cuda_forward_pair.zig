@@ -75,14 +75,14 @@ fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: 
         for (f.ranks) |r| try f.fillRows(r, r.w.layers[j], site, lo, piece[1], if (split) r.b.part + lo * D * 4 else room(r, lo) + r.w.share.rank * n * D * 4);
         try p.filled[q].record(f.stream);
         try p.side.wait(p.filled[q]);
-        try pieces.partials(f, p, lo, n, split);
+        try pieces.partials(f, p, q, lo, n, split);
         if (split) {
             for (f.ranks) |r| {
                 const mine = share(n, world, r.w.share.rank);
                 try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
             }
             if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n); // the rows this glue posted
-            try pieces.shareGlued(f, p, lo, n, last);
+            try pieces.shareGlued(f, p, q, lo, n, last);
         } else {
             for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
             if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n);

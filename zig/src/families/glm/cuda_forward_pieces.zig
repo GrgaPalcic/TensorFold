@@ -26,7 +26,7 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
         try p.side.wait(p.filled[q]);
         stamp.end();
         stamp = prof.span(f.prof, p.side, .partials);
-        try partials(f, p, lo, n, split);
+        try partials(f, p, q, lo, n, split);
         stamp.end();
         try p.gathered[q].record(p.side);
     }
@@ -58,7 +58,7 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
         try p.side.wait(p.glues[q]);
         stamp.end();
         stamp = prof.span(f.prof, p.side, .glued);
-        try shareGlued(f, p, lo, n, last);
+        try shareGlued(f, p, q, lo, n, last);
         stamp.end();
         try p.shared[q].record(p.side);
         sent |= @as(usize, 1) << @intCast(q);
@@ -110,8 +110,9 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
     }
 }
 
-/// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner).
-pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split: bool) !void {
+/// A piece's partials on the side stream: gathered whole, or split (each rank's rows of every partial to their owner;
+/// with `f.ce`, TF_GLM_CE_EXCHANGE=1, by copy-engine pushes into the peer's room and piece `q`'s flag slot).
+pub fn partials(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usize, split: bool) !void {
     const D = f.ranks[0].w.config.hidden;
     const world = f.ranks[0].w.share.world;
     const bytes = n * D * 4;
@@ -137,14 +138,15 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
             const mine = share(n, world, me);
             const own = mine[1] - mine[0];
             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-            if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+            if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
             try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
         },
     }
 }
 
-/// A split piece's glued rows (normed, or hidden after the last layer) to every rank on the side stream.
-pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last: bool) !void {
+/// A split piece's glued rows (normed, or hidden after the last layer) to every rank on the side stream (with `f.ce`
+/// by copy engines, piece `q`'s flag slot).
+pub fn shareGlued(f: *const Forward, p: *const Pieces, q: usize, lo: usize, n: usize, last: bool) !void {
     const D: usize = f.ranks[0].w.config.hidden;
     const world = f.ranks[0].w.share.world;
     switch (f.exchange) {
@@ -161,7 +163,7 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last
             const me = r.w.share.rank;
             const rows_of = if (last) r.b.hidden else r.b.normed;
             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-            if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+            if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
         },
     }
 }

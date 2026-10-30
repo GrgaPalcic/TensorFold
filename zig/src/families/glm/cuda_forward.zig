@@ -143,7 +143,9 @@ pub const Pieces = struct {
 
     /// A paired step's second chunk on `of`'s side stream: every rank posts both chunks' exchanges in one order.
     pub fn initTwin(d: *const cuda.Driver, of: *const Pieces) !Pieces {
-        return make(d, of.count, of.side, false);
+        var p = try make(d, of.count, of.side, false);
+        p.ce_slot0 = of.ce_slot0 + 2 * max_pieces; // copy-engine flag slots of its own (cuda_ce.slot), were it to push
+        return p;
     }
 
     fn make(d: *const cuda.Driver, count: usize, side: cuda.Stream, owns_side: bool) !Pieces {
