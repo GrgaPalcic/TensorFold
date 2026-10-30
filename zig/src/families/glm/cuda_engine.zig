@@ -27,6 +27,8 @@ pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) boo
 pub const max_drafts = 3;
 /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
 const pair_bytes = 16;
+/// The rows one gather of greedy picks holds (cuda_engine_pick.greedyRows): a shared window's.
+pub const pick_rows = 32;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
@@ -67,6 +69,8 @@ pub const Engine = struct {
     m: fw.Modules,
     stream: cuda.Stream,
     pieces: fw.Pieces,
+    discard_draws: bool = false, // a follower's verify step: its draws join the gathers, rank 0 alone reads the tokens
+    moe_fuse: bool = true, // TF_GLM_MOE_FUSE=0: a decode window's EXL3 MoE glue unfused (the same bits either way)
     side: ?@import("cuda_moe.zig").Side = null, // decode windows' shared expert stream and events (TF_GLM_SHARED_SIDE=0: none)
     w: weights.Weights,
     bp: fw.Buffers, // prompt chunks
@@ -147,7 +151,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .side = side, .moe_fuse = envOn("TF_GLM_MOE_FUSE"), .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .drafts = o.drafts, .mtp = false };
         const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
         if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
         const Tile = struct {
@@ -189,9 +193,9 @@ pub const Engine = struct {
         errdefer if (e.bm) |*b| b.deinit();
         if (o.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
-        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
+        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
         errdefer e.pairs.free();
-        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
+        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
@@ -255,7 +259,13 @@ pub const Engine = struct {
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse };
+    }
+
+    /// An on-by-default switch: off only when `name` is "0".
+    fn envOn(name: [*:0]const u8) bool {
+        const v = std.c.getenv(name) orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
     /// The decode windows' side stream for the MoE shared expert, unless TF_GLM_SHARED_SIDE=0.
@@ -531,7 +541,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         for (parts, segs[0..parts.len]) |p, g| {
@@ -597,10 +607,14 @@ pub const Engine = struct {
     pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
         if (e.structured) return e.drawWhole(logits, rows, first, bits, out);
         if (e.cur.sampling) |s| {
+            if (e.discard_draws) { // a follower's verify rows: their columns to every rank, the draw itself rank 0's
+                @memset(out[0..rows], 0);
+                return e.smp.gather(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, e.smp.full.ptr);
+            }
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             return e.checkGathers(); // the draw read rows the forward's gathers made
         }
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+        try @import("cuda_engine_pick.zig").greedyRows(e, logits, rows, out);
     }
 
     pub const promptHead = @import("cuda_structured.zig").promptHead;
