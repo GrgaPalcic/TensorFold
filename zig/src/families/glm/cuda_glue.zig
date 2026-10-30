@@ -26,6 +26,7 @@ pub const Kernels = struct {
     top1: cuda.Function,
     top1_sums: cuda.Function,
     put_words: cuda.Function,
+    p2p_gather: cuda.Function, // the TP group's peer-store all-gather (cuda/p2p_gather.zig)
     embed_b16: cuda.Function,
     conv_shift: cuda.Function,
     swiglu_512: cuda.Function,

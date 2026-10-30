@@ -267,6 +267,11 @@ fn finishRank(a: OpenArgs) !Loaded {
     }
     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
     errdefer if (own.group.fast) |f| f.deinit();
+    try @import("cuda_p2p.zig").open(gpa, ctx.d, &own.group, own.e.stream, own.e.m.glue.p2p_gather); // both ranks, or neither
+    errdefer if (own.group.p2p) |x| {
+        x.deinit();
+        own.group.p2p = null;
+    };
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
