@@ -1,5 +1,6 @@
 //! The existing pieced prompt exchanges, isolated so their diagnostic spans stay beside each stream operation.
 const relay = @import("cuda_relay.zig");
+const ce_x = @import("cuda_ce.zig");
 const taps = @import("cuda_taps.zig");
 const fw = @import("cuda_forward.zig");
 const prof = @import("cuda_prof.zig");
@@ -48,7 +49,7 @@ pub fn exchangePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site,
                 const mine = share(n, world, me);
                 const own = mine[1] - mine[0];
                 const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-                if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
+                if (f.ce) |ce| try ce_x.partials(f, ce, p, q, lo, n) else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
                 try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
             },
         }
@@ -99,7 +100,7 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
                 const me = r.w.share.rank;
                 const rows_of = if (last) r.b.hidden else r.b.normed;
                 const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-                if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+                if (f.ce) |ce| try ce_x.glued(f, ce, p, q, rows_of, lo, n) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
             },
         }
         stamp.end();

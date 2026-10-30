@@ -58,6 +58,7 @@ pub const Engine = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+    ce: ?*cuda.ce_push.Push = null, // TF_GLM_CE_EXCHANGE=1: a prompt chunk's split exchanges by copy engines (cuda_ce.zig)
     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
@@ -259,7 +260,7 @@ pub const Engine = struct {
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b == &e.bp) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null };
     }
 
     /// An on-by-default switch: off only when `name` is "0".

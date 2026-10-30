@@ -127,6 +127,7 @@ pub fn ranges(rows: usize, pieces: usize, out: *[max_pieces][2]usize) usize {
 /// A prompt chunk's pieced exchanges (overlap.Overlap): second stream and events; `count`: TF_GLM_OVERLAP_PIECES (3).
 pub const Pieces = struct {
     count: usize = 4,
+    ce_slot0: usize = 0, // the first of its 2 x max_pieces copy-engine flag slots (a paired chunk's twin takes the next)
     side: cuda.Stream,
     filled: [max_pieces]cuda.Event,
     gathered: [max_pieces]cuda.Event,
@@ -192,6 +193,7 @@ pub const Forward = struct {
     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
+    ce: ?*cuda.ce_push.Push = null, // split exchanges by copy-engine pushes into the peer's registered rows (cuda_ce.zig)
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     side: ?moe.Side = null, // a decode window's MoE shared expert on a second stream (TF_GLM_SHARED_SIDE, default on)
     moe_fuse: bool = false, // a decode window's EXL3 MoE glue fused (TF_GLM_MOE_FUSE, default on in the engine)

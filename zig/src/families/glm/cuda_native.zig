@@ -272,6 +272,11 @@ fn finishRank(a: OpenArgs) !Loaded {
         x.deinit();
         own.group.p2p = null;
     };
+    own.e.ce = try @import("cuda_ce.zig").open(gpa, ctx.d, &own.group, own.e.stream, &own.e.bp, own.e.c.hidden, set.split and !set.ring);
+    errdefer if (own.e.ce) |x| {
+        x.deinit();
+        own.e.ce = null;
+    };
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
@@ -417,6 +422,7 @@ fn close(ptr: *anyopaque) void {
 /// What a rank owns, freed by rank 0's close and by a follower before it leaves.
 fn release(own: *Owned) void {
     own.link.deinit();
+    if (own.e.ce) |x| x.deinit(); // before the buffers it maps go with the engine
     if (own.e.images) |v| v.deinit();
     own.e.deinit();
     own.group.close();

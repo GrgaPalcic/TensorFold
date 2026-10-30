@@ -39,6 +39,8 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
     try e.gate(null);
     var one: [1]Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
     var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(true) else null };
+    // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)
+    if (comptime @hasField(Forward, "ce") and @hasField(@TypeOf(e.*), "ce")) f.ce = e.ce;
     try f.run(@ptrCast(ids[0..rows]));
     if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
         try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
