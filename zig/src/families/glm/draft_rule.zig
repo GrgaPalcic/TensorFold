@@ -175,14 +175,14 @@ pub const Knobs = struct {
     coupled: bool = false, // TF_GLM_DFLASH2_COUPLED=1: a sampled stream's drafts race under its target rows' keyed noise
     copy_skip: bool = false, // TF_GLM_DFLASH2_COPY_SKIP=1: no block pass for a stream whose next window a copy takes
     force: ?[]const u8 = null, // TF_GLM_DFLASH2_FORCE: a window's rows in turn (diagnostic), e.g. "8,1,8,2,..."
-    verify_a: f64 = 8.6, // TF_GLM_VERIFY_MS=a,b: the cost seed (sm_120 x8 400 W, 0005-0013)
-    verify_b: f64 = 1.6,
-    draft_ms: f64 = 1.2,
+    verify_a: f64 = 9.4, // TF_GLM_VERIFY_MS=a,b,d: the cost seed (measured: sm_120 x8 400 W, 0005-0013, forced widths 1-8)
+    verify_b: f64 = 1.31,
+    draft_ms: f64 = 1.37,
     lambda: f64 = 0.15, // TF_GLM_DRAFT_LAMBDA: a new stream's tokens a ms before its first rounds
     step: f64 = 0.05, // TF_GLM_DRAFT_LEAN: a stream's logit step a draft
     decay: f64 = 0.998,
     prior: [buckets]f64 = default_prior,
-    prior_sampled: [buckets]f64 = default_prior,
+    prior_sampled: [buckets]f64 = default_prior_sampled,
 
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8) Knobs {
         var k: Knobs = .{};
@@ -230,8 +230,10 @@ pub const Knobs = struct {
     }
 };
 
-/// Landing by bucket before any stream drafted: the selector's chance itself, shaded (replaced by measured priors).
-pub const default_prior = [buckets]f64{ 0.05, 0.15, 0.25, 0.32, 0.4, 0.48, 0.55, 0.62, 0.72, 0.82, 0.9, 0.96 };
+/// Landing by bucket before any stream drafted (greedy): measured on 1,554 windows with forced widths (draft2 slot 1).
+pub const default_prior = [buckets]f64{ 0.2, 0.237, 0.2, 0.261, 0.462, 0.566, 0.444, 0.608, 0.619, 0.673, 0.864, 0.984 };
+/// The same for sampled streams (temperature 1.0, top_p 0.95), from the same measurement.
+pub const default_prior_sampled = [buckets]f64{ 0.111, 0.189, 0.263, 0.347, 0.366, 0.453, 0.512, 0.465, 0.583, 0.659, 0.798, 0.986 };
 
 test "offer: a draft pays while its chain chance beats lambda times a row" {
     const t = std.testing;
