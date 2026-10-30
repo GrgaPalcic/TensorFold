@@ -152,9 +152,11 @@ pub const Pages = struct {
     /// One line when admission starts holding a request back, saying for what, and one when it fits again.
     fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
         if (@import("builtin").is_test) return;
-        if (ok) {
-            if (p.waiting) |w| std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ w, p.pool.available(), p.pool.total() });
-            p.waiting = null;
+        if (ok) { // the held-back request's own admission ends its wait (another request fitting beside it does not)
+            if (p.waiting == n) {
+                std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ n, p.pool.available(), p.pool.total() });
+                p.waiting = null;
+            }
             return;
         }
         if (p.waiting == n) return;

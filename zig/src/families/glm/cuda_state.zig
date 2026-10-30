@@ -75,7 +75,7 @@ pub fn pageBytes(w: *const weights.Weights) u64 {
 }
 
 /// A page's bytes for this cache format: every DSA layer's part, then the target MTP head's if it is loaded
-/// (bf16 13,056 a row, E4M3 6,960; 12,036 and 6,380 without the head, as beside DFlash2).
+/// (bf16 13,056 a row, E4M3 6,960; 11,968 and 6,380 without the head, as beside DFlash2).
 pub fn pageBytesOf(w: *const weights.Weights, kv8: bool, head: bool) u64 {
     return (mlaLayers(w) + @intFromBool(head)) * pageCacheBytes(&w.config, kv8);
 }
