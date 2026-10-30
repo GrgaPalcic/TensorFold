@@ -427,6 +427,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
+        error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
+        error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
         error.TooManyRanks => std.fmt.comptimePrint(
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },
@@ -449,7 +451,7 @@ test "a checkpoint refused for its format, at the entry or by the loader, is exp
     for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.UnreadableExl3 }) |e| try std.testing.expect(explain(null, e) != null);
 }
 
-test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
+test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and 1 page like on, others are refused" {
     try std.testing.expect(!try paging(null, 1, false));
     try std.testing.expect(!try paging("auto", 1, false));
     for ([_]usize{ 2, 3, 16 }) |w| {
@@ -462,18 +464,21 @@ test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and ot
         try std.testing.expect(!try paging("off", w, false));
         try std.testing.expect(!try paging("0", w, false));
         try std.testing.expect(try paging("all", w, false));
+        try std.testing.expectError(error.BadKvPages, paging("yes", w, false));
     }
+    try std.testing.expect(explain(null, error.BadKvPages) != null);
 }
 
-test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all are refused by name" {
+test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all page" {
     for ([_]usize{ 1, 2, 3, 16 }) |w| {
         try std.testing.expect(!try paging(null, w, true));
         try std.testing.expect(!try paging("auto", w, true));
         try std.testing.expect(!try paging("off", w, true));
         try std.testing.expect(!try paging("0", w, true));
-        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expectError(error.Fp8OnPages, paging(v, w, true));
+        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expect(try paging(v, w, true));
     }
     try std.testing.expect(explain(null, error.Fp8OnPages) != null);
+    try std.testing.expect(explain(null, error.PoolTooSmall) != null);
 }
 
 test "capacity keeps a verify window past the context and a multiple of 64" {

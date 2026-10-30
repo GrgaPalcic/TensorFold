@@ -12,11 +12,22 @@ pub fn tableLen(capacity: usize) usize {
     return (capacity + state.page_rows - 1) / state.page_rows;
 }
 
-/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
+/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), and a token's bytes
+/// on the pages: 13,056 in bf16 with the target MTP head, 6,380 in E4M3 beside DFlash2 (no head part).
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
-    const fixed = try state.State.pagedBytes(gpa, &e.w, e.capacity, tableLen(e.capacity));
-    const page = state.pageBytes(&e.w);
+    const fixed = try state.State.pagedBytesOf(gpa, &e.w, e.capacity, tableLen(e.capacity), e.mtp);
+    const page = pageBytes(e);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
+}
+
+/// A page's bytes for engine `e`: its cache format's parts, the target MTP head's only when it is loaded.
+pub fn pageBytes(e: *const Engine) u64 {
+    return state.pageBytesOf(&e.w, e.settings.kv8, e.mtp);
+}
+
+/// A paged sequence of engine `e`'s format on the pages at `at`.
+fn pagedState(e: *const Engine, at: state.Paged) !fw.State {
+    return fw.State.initPagedFormat(e.gpa, e.d, &e.w, e.capacity, at, e.settings.kv8, e.mtp);
 }
 
 /// A request's need: its prompt, its reply and one last verify window.
@@ -30,7 +41,7 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
+    q.* = .{ .st = try pagedState(e, on(e, 0, pageBytes(e))) };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
@@ -83,7 +94,7 @@ pub const Pages = struct {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream
             const s = try e.gpa.create(types.Seq);
             errdefer e.gpa.destroy(s);
-            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at) };
+            s.* = .{ .st = try pagedState(e, at) };
             q.* = s;
             made += 1;
         }
@@ -125,9 +136,11 @@ pub const Pages = struct {
         return slot < p.used.len;
     }
 
-    /// Whether a request's pages fit now and a paged sequence is free for it.
+    /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
+    /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
     pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
-        for (p.used) |u| if (!u) return p.pool.fits(need(p.layout, prompt, max_tokens));
+        const n = need(p.layout, prompt, max_tokens);
+        for (p.used) |u| if (!u) return n > p.pool.total() or p.pool.fits(n);
         return false;
     }
 
@@ -136,6 +149,7 @@ pub const Pages = struct {
         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
         const n = need(p.layout, prompt, max_tokens);
         if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
+        if (n > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
         const l = &p.leases[slot];
         try p.pool.promise(l, n);
         errdefer p.pool.finish(l);

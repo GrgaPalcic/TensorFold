@@ -21,6 +21,7 @@ pub const mlp = @import("cuda_mlp.zig");
 pub const shard = @import("cuda_shard.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const forward = @import("cuda_forward.zig");
+pub const state = @import("cuda_state.zig");
 pub const relay = @import("cuda_relay.zig");
 pub const config = @import("config.zig");
 pub const quant = @import("cuda_quant.zig");

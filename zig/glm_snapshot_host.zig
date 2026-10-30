@@ -833,3 +833,84 @@ test "GLM snapshots: beside DFlash2 a state carries the drafter's context rows t
     try t.expectEqual(@as(?i64, 8192 - df.WIN), dr.keptFrom(0, 8192));
     f.e.drafter = null;
 }
+
+/// Every field an E4M3 prefix at `at` reads, in `a` and in `b` (codes, scales, rings, pooled keys), from either layout.
+fn expectSamePrefix8(c: glm.config.Config, a: *const glm.forward.State, b: *const glm.forward.State, at: usize, head: ?usize) !void {
+    try same(a.pos_dev, b.pos_dev, 4);
+    try same(a.conv, b.conv, a.kda_layers * 3 * a.conv_c * 2);
+    try same(a.rec, b.rec, 2 * a.kda_layers * a.rec_layer);
+    for (0..a.caches.len + 1) |j| {
+        const n = if (j < a.caches.len) at else head orelse break;
+        const x = if (j < a.caches.len) a.caches[j] else a.mtp_caches;
+        const y = if (j < b.caches.len) b.caches[j] else b.mtp_caches;
+        try t.expect(x.ls != 0 and y.ls != 0);
+        for (0..n) |r| {
+            try same(rowAt(a, x, x.lc, r, c.kv_lora, 512), rowAt(b, y, y.lc, r, c.kv_lora, 512), c.kv_lora);
+            try same(rowAt(a, x, x.ls, r, 4, 512), rowAt(b, y, y.ls, r, 4, 512), 4);
+        }
+        for (0..2) |k| try same(a.rings[2 * j + k], b.rings[2 * j + k], @min(n, a.ring_rows) * a.ring_row);
+        for (0..@min(n / 4 + 2, x.pk_rows)) |p| try same(rowAt(a, x, x.pk, p, c.i_dim * 2, 128), rowAt(b, y, y.pk, p, c.i_dim * 2, 128), c.i_dim * 2);
+    }
+    try same(a.mtp_pos_dev, b.mtp_pos_dev, 4);
+    try same(a.prompt_hidden, b.prompt_hidden, c.hidden * 2);
+}
+
+test "GLM snapshots: an E4M3 paged sequence keeps and resumes its codes, scales and pooled keys through its pages" {
+    var d = rec.init();
+    for ([_]bool{ false, true }) |mtp| {
+        var f: Fixture = undefined;
+        try f.initFormat(&d, 0, 2, mtp, true);
+        defer f.deinit();
+        const c = f.e.c;
+        var w: glm.weights.Weights = undefined;
+        w.config = c;
+        w.share = f.e.share;
+        var layers: [2]glm.weights.Layer = undefined;
+        layers[0].mixer = .{ .mla = undefined };
+        layers[1].mixer = .{ .kda = undefined };
+        w.layers = &layers;
+        // a page: the DSA layer's part (codes, scales, pooled keys), the head's after it only with the head
+        const part = 512 * (c.kv_lora + 4) + 128 * c.i_dim * 2;
+        try t.expectEqual(@as(u64, (1 + @as(usize, @intFromBool(mtp))) * part), glm.state.pageBytesOf(&w, true, mtp));
+        const page = (1 + @as(usize, @intFromBool(mtp))) * part;
+        const ids = [_]u32{ 5, 2, 9, 0, 7, 1, 3, 8, 4, 6 };
+        var kv = try cuda.DeviceBuffer.alloc(&d, ids.len * page);
+        defer kv.free();
+        var paged = f.seq;
+        paged.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, .{ .kv = kv.ptr, .pages = glm.pages.tableLen(16448), .page_bytes = page }, true, mtp);
+        defer paged.st.deinit();
+        paged.st.pages = &ids;
+        paged.st.capacity = ids.len * 512;
+        // its layout: codes, then the part's scales, then its pooled keys, and the head's part only with the head
+        const x = paged.st.caches[0];
+        try t.expectEqual(kv.ptr, x.lc);
+        try t.expectEqual(kv.ptr + 512 * c.kv_lora, x.ls);
+        try t.expectEqual(kv.ptr + 512 * (c.kv_lora + 4), x.pk);
+        try t.expectEqual(@as(u64, page), x.ps);
+        if (mtp) try t.expectEqual(kv.ptr + part, paged.st.mtp_caches.lc);
+        const window = &f.seq;
+        try f.e.prepareSnapshots(3 * f.e.stateBytes(4096));
+        for ([_]usize{ 511, 1537, 4096 }) |at| {
+            const head: ?usize = if (mtp) at + 7 else null;
+            f.e.cur = window;
+            try f.mark(at, head orelse at, @intCast(at % 251));
+            const id = try f.e.keepState();
+            @memset(rec.bytes(paged.st.arena.buf.ptr, paged.st.arena.buf.len), 0xE9);
+            @memset(rec.bytes(kv.ptr, kv.len), 0xE9);
+            f.e.cur = &paged;
+            try f.e.restoreState(id);
+            try expectSamePrefix8(c, &window.st, &paged.st, at, head);
+            try t.expectEqual(at, paged.st.pos);
+            f.e.dropState(id);
+            f.e.dropped.clearRetainingCapacity();
+            const back = try f.e.keepState(); // the pages' prefix back onto a window
+            @memset(rec.bytes(window.st.arena.buf.ptr, window.st.arena.buf.len), 0x5C);
+            f.e.cur = window;
+            try f.e.restoreState(back);
+            try expectSamePrefix8(c, &paged.st, &window.st, at, head);
+            f.e.dropState(back);
+            f.e.dropped.clearRetainingCapacity();
+        }
+        f.e.cur = window;
+    }
+}
