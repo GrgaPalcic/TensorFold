@@ -81,27 +81,44 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
   uint2 raw[FP8 ? UPT : 1];
   float rsc[FP8 ? UPT : 1];
-  // on pages: a dense chunk's page (its 512 keys are that page's rows), found once
-  const int64_t dense_page = PAGED8 && !sparse && live ? (int64_t)pt[c] * pstep : 0;
+  // on pages, a dense chunk is one page: its codes and scales are the window's at bases moved once (as keys_at above),
+  // so its keys load with the window's arithmetic; a sparse key's logical token goes through the table to its page.
+  const unsigned char* codes8 = reinterpret_cast<const unsigned char*>(lc);
+  const float* scales8 = scales;
+  if constexpr (PAGED8) {
+    if (!sparse && live) {
+      const int64_t page = (int64_t)pt[c] * pstep;
+      codes8 += page - start * LW;
+      scales8 = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) - start;
+    }
+  }
   auto fetch8 = [&](int tile) {
-    const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
     const int64_t first = start + tile * KT;
+    if constexpr (PAGED8) {
+      if (sparse) {
+        const unsigned char* scale_bytes = reinterpret_cast<const unsigned char*>(scales);
+#pragma unroll
+        for (int i = 0; i < UPT; ++i) {
+          const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
+          const int64_t ki = first + key;
+          const bool ok = ki < n;
+          const int s = ok ? tok[r * w + ki] : 0;  // a visible position: 0 <= s < 2^31
+          const int64_t page = ok ? (int64_t)pt[s >> 9] * pstep : 0;  // CH = 512 rows a page
+          const int row = s & (CH - 1);
+          raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + page + (row * LW + u * 8))) : make_uint2(0u, 0u);
+          rsc[i] = ok ? __ldg(reinterpret_cast<const float*>(scale_bytes + page + row * 4)) : 1.0f;
+        }
+        return;
+      }
+    }
 #pragma unroll
     for (int i = 0; i < UPT; ++i) {
       const int idx = t + i * CHUNK_THREADS, key = idx / (LW / 8), u = idx % (LW / 8);
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (PAGED8) {
-        const int64_t page = sparse ? (ok ? (int64_t)pt[src / CH] * pstep : 0) : dense_page;
-        const int64_t row = src % CH;
-        const float* row_scale = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) + row;
-        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + page + row * LW + u * 8)) : make_uint2(0u, 0u);
-        rsc[i] = ok ? __ldg(row_scale) : 1.0f;
-      } else {
-        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
-        rsc[i] = ok ? __ldg(scales + src) : 1.0f;
-      }
+      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes8 + src * LW + u * 8)) : make_uint2(0u, 0u);
+      rsc[i] = ok ? __ldg(scales8 + src) : 1.0f;
     }
   };
   auto store8 = [&](int tile) {
