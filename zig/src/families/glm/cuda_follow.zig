@@ -308,12 +308,21 @@ pub const Leader = struct {
 
     /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
     pub fn block(x: Leader, reqs: []dflash.Req) !void {
+        return x.blockStep(reqs, false);
+    }
+
+    /// The kept rows into DFlash2's contexts and no block pass, for streams a copy drafts next (flags 1).
+    pub fn ingest(x: Leader, reqs: []dflash.Req) !void {
+        return x.blockStep(reqs, true);
+    }
+
+    fn blockStep(x: Leader, reqs: []dflash.Req, only_ingest: bool) !void {
         if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
         try x.flush();
         var buf: [3 * dflash.MAX_S]u32 = undefined;
         for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
-        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 3 * reqs.len]);
-        try x.e.draftBlock(reqs);
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len), .flags = @intFromBool(only_ingest) }, buf[0 .. 3 * reqs.len]);
+        if (only_ingest) try x.e.ingestBlock(reqs) else try x.e.draftBlock(reqs);
     }
 
     /// The other ranks leave their loops.
@@ -427,7 +436,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
                 var reqs: [dflash.MAX_S]dflash.Req = undefined;
                 for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
-                try e.draftBlock(reqs[0..k]);
+                if (h.flags & 1 != 0) try e.ingestBlock(reqs[0..k]) else try e.draftBlock(reqs[0..k]);
             },
             .image => {
                 const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)

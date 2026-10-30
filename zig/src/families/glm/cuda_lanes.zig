@@ -516,19 +516,25 @@ pub const Lanes = struct {
     }
 
     /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
+    /// With TF_GLM_DFLASH2_COPY_SKIP=1 a stream whose next window a copy takes (the core asks one draft while its room
+    /// holds more) has its kept rows ingested with no block pass: those drafts would be thrown away.
     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
+        var asked: [dflash.MAX_S]usize = undefined; // the request each drafted stream came from
+        var skips: [dflash.MAX_S]dflash.Req = undefined;
+        var n: usize = 0;
+        var ns: usize = 0;
         const k = self.tuned();
         for (requests, 0..) |r, i| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
             if (r.lanes != null) return error.TreesNotBuilt;
-            var n: usize = 0;
+            var kept: usize = 0;
             const anchor = if (r.rows) |rows| a: {
                 for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
-                n = rows.len;
+                kept = rows.len;
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
             const keyed: ?@import("dflash_select.zig").Keyed = if (!k.coupled or !sampledOf(r.stream)) null else .{
@@ -536,15 +542,31 @@ pub const Lanes = struct {
                 .inv_t = @floatCast(1.0 / @max(r.stream.sampling.?.temperature, 1e-6)),
                 .top_p = @floatCast(r.stream.sampling.?.top_p),
             };
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed };
-            held[i] = l;
+            const q: dflash.Req = .{ .slot = l.slot, .pos = 0, .n = kept, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed };
+            if (k.copy_skip and r.depth == 1 and r.stream.draftRoom() > 2) {
+                skips[ns] = q;
+                ns += 1;
+                l.draft_ms = 0;
+                l.held[0] = anchor; // a placeholder at chance 0: should the copy not come, the window offers no draft
+                l.chances[0] = 0;
+                l.raw[0] = 0;
+                l.held_n = 1;
+                continue;
+            }
+            reqs[n] = q;
+            held[n] = l;
+            asked[n] = i;
+            n += 1;
         }
+        if (ns > 0) try self.x.ingest(skips[0..ns]);
+        if (n == 0) return;
         const t0 = self.now();
-        try self.x.block(reqs[0..requests.len]);
+        try self.x.block(reqs[0..n]);
         const ms = self.since(t0);
         const alone = self.lanes.count() == 1;
         const cut = confidence();
-        for (requests, held[0..requests.len]) |r, l| {
+        for (asked[0..n], held[0..n]) |i, l| {
+            const r = requests[i];
             l.held_n = @min(r.depth, max_held);
             l.draft_ms = ms;
             @memcpy(l.raw[0..l.held_n], l.chances[0..l.held_n]);

@@ -559,6 +559,13 @@ pub const Engine = struct {
         try dr.draft(e, reqs);
     }
 
+    /// The kept rows into the contexts of streams a copy drafts next, with no block pass (every rank).
+    pub fn ingestBlock(e: *Engine, reqs: []dflash.Req) !void {
+        const dr = e.drafter orelse return error.NoDrafter;
+        for (reqs) |*q| q.pos = @intCast((e.seqs.items[q.slot] orelse return error.UnknownSlot).st.pos);
+        try dr.ingestOnly(e, reqs);
+    }
+
     pub const holdPrompt = @import("cuda_prompt_hold.zig").save;
     pub const prefillMany = @import("cuda_prompts.zig").prefillMany;
 

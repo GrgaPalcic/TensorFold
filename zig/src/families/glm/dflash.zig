@@ -271,12 +271,15 @@ pub const Drafter = struct {
         try block.ingestPass(dr, e, N);
     }
 
-    /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
-    pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
-        if (reqs.len == 0) return;
+    /// Kept rows into each context and no block pass (a copy takes these streams' next windows): every rank.
+    pub fn ingestOnly(dr: *Drafter, e: anytype, reqs: []const Req) !void {
         if (reqs.len > MAX_S) return error.TooManyStreams;
-        var tm = try dr.mark(e, null);
         var runs: [MAX_S]Run = undefined;
+        try dr.ingest(e, runs[0..try dr.keptRuns(reqs, &runs)]);
+    }
+
+    /// Each request's kept verify rows as a context run (a context whose rows are gone restarts at its position).
+    fn keptRuns(dr: *Drafter, reqs: []const Req, runs: *[MAX_S]Run) !usize {
         var nr: usize = 0;
         for (reqs) |q| {
             const s = try dr.slot(q.slot);
@@ -289,7 +292,16 @@ pub const Drafter = struct {
             runs[nr] = .{ .ring = s.ring.?.ptr, .taps = dr.taps_step + s.v_row0 * TAP_ROW, .n = q.n, .pos0 = s.v_pos0 };
             nr += 1;
         }
-        try dr.ingest(e, runs[0..nr]);
+        return nr;
+    }
+
+    /// Kept rows into each context, then the block pass for every stream (every rank); rank 0 selects 7 drafts each.
+    pub fn draft(dr: *Drafter, e: anytype, reqs: []const Req) !void {
+        if (reqs.len == 0) return;
+        if (reqs.len > MAX_S) return error.TooManyStreams;
+        var tm = try dr.mark(e, null);
+        var runs: [MAX_S]Run = undefined;
+        try dr.ingest(e, runs[0..try dr.keptRuns(reqs, &runs)]);
         tm = try dr.mark(e, .{ tm, 0 });
         const S = reqs.len;
         for (reqs, 0..) |q, i| {
