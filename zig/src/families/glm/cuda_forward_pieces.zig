@@ -1,4 +1,5 @@
 //! The existing pieced prompt exchanges, isolated so their diagnostic spans stay beside each stream operation.
+const cuda = @import("cuda");
 const relay = @import("cuda_relay.zig");
 const ce_x = @import("cuda_ce.zig");
 const taps = @import("cuda_taps.zig");
@@ -72,24 +73,25 @@ pub fn gluePieces(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut
 
 /// DFlash2's taps after layer j: split glue posts a rank's own rows of x only, so it taps those (shareTaps sends them).
 pub fn tapPieces(f: *const Forward, t: taps.Taps, j: usize, cut: []const [2]usize) !void {
+    for (cut) |piece| try tapPiece(f, f.stream, t, j, piece[0], piece[1] - piece[0]);
+}
+
+/// One piece's taps after layer j on `s`, once its glue there has posted the rows: the rank's own rows of a split piece
+/// over NCCL (shareTaps sends them), else every row (in-process ranks copy the owners' rows in first).
+pub fn tapPiece(f: *const Forward, s: cuda.Stream, t: taps.Taps, j: usize, lo: usize, n: usize) !void {
     if (taps.slot(j) == null) return;
     const r = f.ranks[0];
     const world = r.w.share.world;
     const row = r.w.config.hc * r.w.config.hidden * 2;
-    for (cut) |piece| {
-        const lo = piece[0];
-        const n = piece[1] - lo;
-        if (f.splits(n) and f.exchange == .nccl) {
-            const mine = share(n, world, r.w.share.rank);
-            try t.at(f.stream, j, r.b.x, lo + mine[0], mine[1] - mine[0]);
-            continue;
-        }
-        if (f.splits(n)) for (f.ranks) |from| if (from.w.share.rank != r.w.share.rank) {
-            const mine = share(n, world, from.w.share.rank);
-            try f.copy(f.stream, r.b.x + (lo + mine[0]) * row, from.b.x + (lo + mine[0]) * row, (mine[1] - mine[0]) * row);
-        };
-        try t.at(f.stream, j, r.b.x, lo, n);
+    if (f.splits(n) and f.exchange == .nccl) {
+        const mine = share(n, world, r.w.share.rank);
+        return t.at(s, j, r.b.x, lo + mine[0], mine[1] - mine[0]);
     }
+    if (f.splits(n)) for (f.ranks) |from| if (from.w.share.rank != r.w.share.rank) {
+        const mine = share(n, world, from.w.share.rank);
+        try f.copy(s, r.b.x + (lo + mine[0]) * row, from.b.x + (lo + mine[0]) * row, (mine[1] - mine[0]) * row);
+    };
+    try t.at(s, j, r.b.x, lo, n);
 }
 
 /// After a pieced pass: every split piece's own tap rows (tapPieces) to every rank, so each rank's taps hold every row.

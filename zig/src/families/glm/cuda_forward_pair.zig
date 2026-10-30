@@ -10,13 +10,15 @@ const room = fw.Forward.room;
 const share = fw.Forward.share;
 
 /// Two consecutive prompt chunks of one sequence (`b` a view of `a`'s at its end), each on `pieced`'s kernels and bits.
+/// A chunk with DFlash2 taps (its own tap rows) is tapped on the side stream as each ffn piece's glue posts its rows,
+/// and its taps are shared (#1623's shareTaps) once both chunks' last sites are in: the rows `pieced` would tap.
 pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !void {
     const two = [_]*const Forward{ a, b };
     const rows = [_]usize{ ra, rb };
     var cuts: [2][fw.max_pieces][2]usize = undefined;
     var n: [2]usize = undefined;
     for (two, rows, 0..) |f, R, i| {
-        if (f.pieces == null or f.prof != null or f.taps != null) return error.BadPair;
+        if (f.pieces == null or f.prof != null) return error.BadPair;
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| {
             if (r.segs.len > 0 or !r.b.prefill or R == 0 or R > r.b.rows) return error.BadPair;
@@ -51,6 +53,8 @@ pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !voi
         try awaitShared(f, f.pieces.?, n[i]);
         try f.finish(R);
     }
+    // the side stream is drained of both chunks' work here, so the taps' exchange runs alone on the main stream
+    for (two, 0..) |f, i| if (f.taps) |t| try pieces.shareTaps(f, t, cuts[i][0..n[i]]);
 }
 
 /// A paired site: each piece filled on the main stream, then on the side stream its exchange, glue and (split) sharing.
@@ -73,8 +77,12 @@ fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: 
                 const mine = share(n, world, r.w.share.rank);
                 try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
             }
+            if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n); // the rows this glue posted
             try pieces.shareGlued(f, p, lo, n, last);
-        } else for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
+        } else {
+            for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
+            if (site == .ffn) if (f.taps) |t| try pieces.tapPiece(f, p.side, t, j, lo, n);
+        }
         try p.shared[q].record(p.side);
     }
 }

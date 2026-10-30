@@ -251,6 +251,9 @@ pub const Drafter = struct {
     /// The same ordinary context ingest, with this prompt's rows at row0 in the batched tap buffer.
     pub const promptSegment = ingestPrompt;
 
+    /// A prompt chunk whose tap rows are at `taps` (a paired step's second chunk).
+    pub const promptFrom = ingestPromptFrom;
+
     /// The runs' rows through fc, the hidden norm and each layer's k, v into their rings.
     pub fn ingest(dr: *Drafter, e: anytype, runs: []const Run) !void {
         var N: usize = 0;
@@ -358,4 +361,12 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, 
     // the run the ring holds: it goes on from `end`, or starts again past a gap (rows a kept state may carry)
     if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
     s.end = run.pos0 + @as(i64, @intCast(run.n));
+}
+
+/// ingestPrompt of a chunk whose tap rows are at `taps` (a paired step's second chunk, cuda_prompt_pair) instead of
+/// taps_prefill: the same run and ingest.
+pub fn ingestPromptFrom(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, taps: u64) !void {
+    const s = try dr.slot(i);
+    const run = (try promptRun(s.ring.?.ptr, taps, start, rows, len, 0)) orelse return;
+    try dr.ingest(e, &.{run});
 }

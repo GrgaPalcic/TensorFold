@@ -5,6 +5,8 @@ const fw = @import("cuda_forward.zig");
 const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
 const engine = @import("cuda_engine.zig");
+const dflash = @import("dflash.zig");
+const taps_mod = @import("cuda_taps.zig");
 const Engine = engine.Engine;
 
 /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
@@ -15,17 +17,22 @@ pub const Pair = struct {
     bp: fw.Buffers,
     pieces: fw.Pieces,
     pos: cuda.DeviceBuffer, // an i32: where the second chunk's view of the sequence starts
+    taps: ?cuda.DeviceBuffer = null, // with a drafter: the second chunk's DFlash2 tap rows (the first's are its taps_prefill)
     steps: u64 = 0, // paired steps so far (glm-pair-check counts them)
 
-    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, bp: *const fw.Buffers, pieces: *const fw.Pieces, capacity: usize) !Pair {
+    /// `drafter`: DFlash2 will be loaded, so the second chunk needs tap rows of its own (a chunk's worth).
+    pub fn init(d: *const cuda.Driver, w: *const weights.Weights, bp: *const fw.Buffers, pieces: *const fw.Pieces, capacity: usize, drafter: bool) !Pair {
         var b = try fw.Buffers.initTwin(d, w, bp, capacity);
         errdefer b.deinit();
         var p = try fw.Pieces.initTwin(d, pieces);
         errdefer p.deinit();
-        return .{ .bp = b, .pieces = p, .pos = try cuda.DeviceBuffer.alloc(d, 4) };
+        var t: ?cuda.DeviceBuffer = if (drafter) try cuda.DeviceBuffer.alloc(d, fw.prefill_rows * dflash.TAP_ROW) else null;
+        errdefer if (t) |*x| x.free();
+        return .{ .bp = b, .pieces = p, .pos = try cuda.DeviceBuffer.alloc(d, 4), .taps = t };
     }
 
     pub fn deinit(p: *Pair) void {
+        if (p.taps) |*t| t.free();
         p.pos.free();
         p.pieces.deinit();
         p.bp.deinit();
@@ -51,9 +58,10 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
     return start + ra > base + ring or start + ra + rb <= base + ring;
 }
 
-/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with a drafter, prompt rows or prof.
+/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with prompt rows or prof, nor with a
+/// drafter unless the twin holds its tap rows.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.pair == null or !e.settings.pair or e.drafter != null or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+    if (e.pair == null or !e.settings.pair or !drafterFits(e) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
@@ -61,13 +69,20 @@ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume
     return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
 }
 
+/// A drafter pairs only with the twin's own tap rows (Pair.init's `drafter`).
+fn drafterFits(e: *const Engine) bool {
+    return e.drafter == null or e.pair.?.taps != null;
+}
+
 /// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
+/// With DFlash2 each chunk's taps are the rows prefillChunk would tap (its last window's), and the drafter ingests a's,
+/// then b's, as two chunks one at a time do.
 pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks, split: bool) !?u32 {
     const ra: usize = fw.prefill_rows;
     if (len <= start + ra) return error.BadChunk;
     const rb: usize = @min(len - start - ra, fw.prefill_rows);
     const pair = if (e.pair) |*p| p else return error.BadChunk;
-    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.drafter != null or e.prompt_logprobs != null) return error.BadChunk;
+    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or !drafterFits(e) or e.prompt_logprobs != null) return error.BadChunk;
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
@@ -82,6 +97,10 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     fb.prof = null;
     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
     fb.index_split = split;
+    // DFlash2 taps (prefillChunk's rule): only a chunk that reaches into the last window; b's rows into the twin's
+    const keep_from = len -| @as(usize, @intCast(dflash.WIN));
+    if (start + ra <= keep_from) fa.taps = null;
+    fb.taps = if (e.drafter) |dr| (if (start + ra + rb <= keep_from) null else taps_mod.Taps{ .f = dr.k.tap, .out = pair.taps.?.ptr }) else null;
     const st = &e.cur.st;
     try st.ready(e.stream, ra + rb); // one rebase for both chunks, at a as a chunk at a time, before b's view copies it
     var sb = st.*;
@@ -96,6 +115,10 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     try fw.Forward.pairBody(&fa, &fb, ra, rb);
     pair.steps += 1;
     e.index_splits += @intFromBool(split);
+    if (e.drafter) |dr| { // a's rows from its taps_prefill, then b's from the twin's, each as its own chunk would
+        try dr.prompt(e, e.slot, start, ra, len);
+        try dr.promptFrom(e, e.slot, start + ra, rb, len, pair.taps.?.ptr);
+    }
     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
     try fa.commit(ra);
     st.pending = rb;
@@ -114,7 +137,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
 
 /// decode._absorb_rows of a chunk: the MTP head over its next ids `nxt` on its final-norm rows `hidden`.
 fn mtpRows(e: *Engine, f: *fw.Forward, nxt: []const i32, hidden: u64) !void {
-    if (!e.mtp or nxt.len == 0) return;
+    if (!e.mtp or e.drafter != null or nxt.len == 0) return; // beside a drafter the head's caches are never read
     try f.mtp(nxt, &.{hidden});
     try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
 }
