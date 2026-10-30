@@ -227,6 +227,8 @@ const usage =
     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
+    \\  exl3-prompt-k6 [DIR|none] [BASE]  EXL3 prompt kernels at 3 and 4 bits, GLM's shapes: runSlots, FP64, row bytes, time;
+    \\                            DIR adds a real layer, BASE (an earlier exl3_experts fatbin) its 4-bit bytes
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
     \\  qmm-prefill-many-contract the GB10 bit-exact multi-projection prompt launch against separate launches
@@ -393,6 +395,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else "none");
     if (std.mem.eql(u8, cmd, "exl3-tiles")) return exl3_candidate_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+    if (std.mem.eql(u8, cmd, "exl3-prompt-k6")) return @import("exl3_prompt_k6_tests.zig").run(gpu, if (rest.len > 0) rest[0] else "none", if (rest.len > 1) rest[1] else null);
     if (std.mem.eql(u8, cmd, "exl3-tp2")) return exl3_tp2_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else "none");
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "topk")) return sample_tests.topk(gpu);
