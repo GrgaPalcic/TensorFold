@@ -69,7 +69,45 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   const bool live = sparse ? start < n : start <= limit;
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
   const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
+  // E4M3 tiles: each thread's 8-code units in one 8-byte load apiece, all issued before any is converted (fetch8),
+  // then converted value for value as before (store8); the loop fetches tile + 2 before its math and stores it after.
+  constexpr int UPT = KT * (LW / 8) / 256;  // units a thread moves a tile: the launches' 256 threads (cuda_latent)
+  uint2 raw[FP8 ? UPT : 1];
+  float rsc[FP8 ? UPT : 1];
+  auto fetch8 = [&](int tile) {
+    const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
+    const int64_t first = start + tile * KT;
+#pragma unroll
+    for (int i = 0; i < UPT; ++i) {
+      const int idx = t + i * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      const int64_t ki = first + key;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
+      rsc[i] = ok ? __ldg(scales + src) : 1.0f;
+    }
+  };
+  auto store8 = [&](int tile) {
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
+#pragma unroll
+    for (int i = 0; i < UPT; ++i) {
+      const int idx = t + i * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      const uint32_t wv[2] = {raw[i].x, raw[i].y};
+#pragma unroll
+      for (int j = 0; j < 8; j += 2) {
+        const uint16_t bits = (uint16_t)((wv[j / 4] >> (8 * (j % 4))) & 0xffffu);  // codes j, j + 1 (little-endian)
+        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+        dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, rsc[i]));
+        dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, rsc[i]));
+      }
+    }
+  };
   auto load_kv = [&](int tile) {
+    if constexpr (FP8) {
+      fetch8(tile);
+      store8(tile);
+      return;
+    }
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
@@ -77,20 +115,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (FP8) {
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
-        const float row_scale = ok ? scales[src] : 1.0f;
-#pragma unroll
-        for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
-        }
-      } else {
-        cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
-      }
+      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -121,6 +146,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         wait<0>();
     }
     __syncthreads();
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) fetch8(tile + 2);  // in flight during this tile's math
+    }
     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     float sc[4];
@@ -202,7 +230,11 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
+    if constexpr (FP8) {
+      if (tile + 2 < tiles) store8(tile + 2);
+    } else if (tile + 2 < tiles) {
+      load_kv(tile + 2);
+    }
     commit();
   }
   for (int i = 0; i < MT; ++i)
