@@ -91,7 +91,9 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         for (0..2) |twin| { // twin 0 a chunk a step, twin 1 paired where it can, both with the same marks
             e.settings.pair = twin == 1;
             const held = if (set.pages) try e.pages.?.open(slots[twin], len, 64) else &.{};
-            for (held[1..], held[0 .. held.len -| 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
+            if (held.len > 1) {
+                for (held[1..], held[0 .. held.len - 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
+            }
             try x.bind(slots[twin]);
             if (set.pages) try x.beginOn(null, held) else try x.begin(null);
             const before = e.pair.?.steps;
