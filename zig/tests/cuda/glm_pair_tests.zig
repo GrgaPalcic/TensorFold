@@ -25,7 +25,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
     try check.expect(world > 1, "glm-pair-check needs other ranks: at TP=1 an engine makes no twin", .{});
     const C = glm.engine.prompt_rows;
     const capacity = @max(dc.capacity, 5 * C);
-    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
+    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .drafts = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
     defer link.deinit();
