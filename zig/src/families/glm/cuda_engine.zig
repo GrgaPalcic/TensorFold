@@ -203,12 +203,14 @@ pub const Engine = struct {
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
         errdefer @import("cuda_load_owner.zig").drain(stream, d);
+        errdefer if (e.side) |x| @import("cuda_load_owner.zig").drain(x.s, d); // before the buffers it reads go
         try e.stream.synchronize();
         return e;
     }
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.side) |x| x.s.synchronize() catch {}; // shared-expert work still in flight reads buffers and weights freed below
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();

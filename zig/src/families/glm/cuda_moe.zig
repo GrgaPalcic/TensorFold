@@ -64,7 +64,10 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const shared_id: i32 = @intCast(l.count);
-    if (forks(k, prompt)) { // the shared expert of every row on the side stream, from the block's input as it stands now
+    const forked = forks(k, prompt);
+    // a failure from the fork on leaves no side work behind it: the caller may reuse the scratch or free the buffers
+    errdefer if (forked) k.side.?.s.synchronize() catch {};
+    if (forked) { // the shared expert of every row on the side stream, from the block's input as it stands now
         const sd = k.side.?;
         try sd.fork.record(stream);
         try sd.s.wait(sd.fork);
