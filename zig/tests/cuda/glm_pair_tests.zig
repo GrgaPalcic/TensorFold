@@ -1,11 +1,13 @@
-//! GLM-5.3-Flash's paired prompt steps (TF_GLM_PROMPT_PAIR) against twins a chunk a step, on one Engine and its ranks.
+//! GLM-5.3-Flash's paired prompt steps (TF_GLM_PROMPT_PAIR) against twins a chunk a step, on one Engine and its ranks:
+//! on whole windows, or (TF_KV_PAGES=on) on KV pages taken out of order and NaN first, bf16 or (TF_GLM_CHECK_KV8=1) E4M3.
 
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
 const Gpu = check.Gpu;
 
-/// `glm-pair-check`: prompts a step at a time, paired and not; first token, next window and every state byte equal.
+/// `glm-pair-check`: prompts a step at a time, paired and not; first token, next window and every state byte equal
+/// (on pages also every page the stream holds, in row order).
 pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
@@ -17,10 +19,12 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
     const comm = try @import("glm_lanes_tests.zig").openComm(gpu, &lib, rank, world, id_path);
     defer _ = lib.api.ncclCommDestroy(comm);
     var problem: []const u8 = "";
-    const set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
+    var set = glm.ranks.Settings.read(&glm.ranks.environment, &problem) catch |err| {
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
+    set.kv8 = envIs("TF_GLM_CHECK_KV8", "1"); // as --kv-cache fp8
+    set.pages = envIs("TF_KV_PAGES", "on"); // as the server's TF_KV_PAGES=on: the engine's own sequence on pages too
     try check.expect(set.pair, "glm-pair-check needs TF_GLM_PROMPT_PAIR on (unset or 1)", .{});
     try check.expect(world > 1, "glm-pair-check needs other ranks: at TP=1 an engine makes no twin", .{});
     const C = glm.engine.prompt_rows;
@@ -36,8 +40,23 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
     }
     const x: glm.follow.Leader = .{ .e = e, .link = &link };
     defer x.end() catch {};
+    const P = glm.pages;
+    const shuffled = 2; // on pages: takes and gives back pages between prompts, so the twins' come out of order
+    var page_bytes: u64 = 0;
+    if (set.pages) {
+        const l = try P.layout(gpu.gpa, e, 0);
+        page_bytes = l.pageBytes();
+        const count = 3 * P.tableLen(capacity) + 3;
+        try x.pool(3, count, page_bytes);
+        e.pages = try P.Pages.init(gpu.gpa, e, l, 3, count, true);
+        e.pages.?.poison = true; // a row read before its write turns the reply to NaN
+    }
     const V = e.share.vocab.len();
     const min = glm.prompt_pair.min_rows;
+    // a second chunk whose last piece has fewer rows than ranks: with one exchange room (split) such a step goes alone
+    const ragged: usize = for (min..C) |rb| {
+        if (!glm.prompt_pair.piecesSplit(C, rb, e.pieces.count, e.share.world)) break rb;
+    } else C;
     const Case = struct { len: usize, marks: []const u32 = &.{} };
     const cases = [_]Case{
         .{ .len = 2 * C + 300 }, // a pair and a tail
@@ -46,13 +65,20 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         .{ .len = 2 * C }, // a pair to the end
         .{ .len = C + min - 1 }, // a tail too short to pair
         .{ .len = 4 * C, .marks = &.{C} }, // a mark at chunk 1: 0 and 1 alone (a pair at 1 rebases apart), then a pair
+        .{ .len = 3 * C + ragged }, // a pair, then (one room) two chunks alone: the second's last piece goes whole
     };
     const Kept = struct {
         fn call(_: *anyopaque, _: u32) void {} // the check keeps no state: its marks only shape the steps
     };
     var no_ctx: u8 = 0;
     var failed = false;
+    var unordered: usize = 0;
+    var pages_compared: usize = 0;
     for (cases, 0..) |case, i| {
+        if (set.pages) if (i % 2 == 0) {
+            try x.bind(shuffled);
+            _ = try e.pages.?.open(shuffled, (i + 1) * 700, 0);
+        } else x.release(shuffled) catch {};
         const len = case.len;
         const marks: ?glm.engine.Marks = if (case.marks.len == 0) null else .{ .at = case.marks, .ctx = &no_ctx, .call = Kept.call };
         const ids = try a.alloc(u32, len);
@@ -61,10 +87,13 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
         var outs: [2][4]u32 = undefined;
         var logits: [2][]u16 = undefined;
         var paired: [2]u64 = undefined;
+        const slots: [2]u32 = if (set.pages) .{ 0, 1 } else .{ @intCast(2 * i), @intCast(2 * i + 1) };
         for (0..2) |twin| { // twin 0 a chunk a step, twin 1 paired where it can, both with the same marks
             e.settings.pair = twin == 1;
-            try x.bind(@intCast(2 * i + twin));
-            try x.begin(null);
+            const held = if (set.pages) try e.pages.?.open(slots[twin], len, 64) else &.{};
+            for (held[1..], held[0 .. held.len -| 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
+            try x.bind(slots[twin]);
+            if (set.pages) try x.beginOn(null, held) else try x.begin(null);
             const before = e.pair.?.steps;
             var at: usize = 0;
             const t = while (true) {
@@ -83,13 +112,15 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[twin].ptr, e.bd.logits, win.len * V * 2), "cuMemcpyDtoH");
         }
         e.settings.pair = true;
-        const st = &e.seqs.items[2 * i].?.st;
-        const tw = &e.seqs.items[2 * i + 1].?.st;
+        const st = &e.seqs.items[slots[0]].?.st;
+        const tw = &e.seqs.items[slots[1]].?.st;
         var want: u64 = 0; // the steps glm.prompt_pair.pairedAt pairs over this prompt, the rings' base followed here
         var base: usize = 0;
         var at: usize = 0;
         while (at < len) {
-            const two = len >= glm.prompt_pair.minLen() and glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks) and glm.prompt_pair.ringsAgree(base, st.ring_rows, at, @min(len - at - C, C));
+            const two = len >= glm.prompt_pair.minLen() and glm.prompt_pair.takesTwo(at, len, e.share.world, case.marks) and
+                (e.pair.?.own_room or glm.prompt_pair.piecesSplit(C, @min(len - at - C, C), e.pieces.count, e.share.world)) and
+                glm.prompt_pair.ringsAgree(base, st.ring_rows, at, @min(len - at - C, C));
             const rows = @min(len - at, @as(usize, if (two) 2 * C else C));
             if (at + rows > base + st.ring_rows) base = at; // State.ready rebases at the step's start, a whole pool
             want += @intFromBool(two);
@@ -104,17 +135,56 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
             failed = true;
         }
         try e.stream.synchronize();
-        const n = st.arena.buf.len;
+        // on pages the arena ends with the table (page ids: the twins' differ), and the rows are the pages' in row order
+        const n = if (set.pages) st.table - st.arena.buf.ptr else st.arena.buf.len;
         const h0 = try a.alloc(u8, n);
         const h1 = try a.alloc(u8, n);
         try st.arena.buf.download(0, h0);
         try tw.arena.buf.download(0, h1);
-        const diff = std.mem.indexOfDiff(u8, h0, h1);
+        var diff = std.mem.indexOfDiff(u8, h0, h1);
+        if (set.pages and diff == null) {
+            const arena_ptr = e.pages.?.arena.?.ptr;
+            const p0 = try a.alloc(u8, page_bytes);
+            const p1 = try a.alloc(u8, page_bytes);
+            if (st.pages.len != tw.pages.len) diff = n;
+            for (st.pages, tw.pages, 0..) |id0, id1, k| {
+                try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(p0.ptr, arena_ptr + id0 * page_bytes, page_bytes), "cuMemcpyDtoH");
+                try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(p1.ptr, arena_ptr + id1 * page_bytes, page_bytes), "cuMemcpyDtoH");
+                if (std.mem.indexOfDiff(u8, p0, p1)) |at_| {
+                    std.debug.print("FAIL pair: prompt of {d}: page {d} (ids {d}/{d}) differs at byte {d} of {d}\n", .{ len, k, id0, id1, at_, page_bytes });
+                    failed = true;
+                    break;
+                }
+                pages_compared += 1;
+            }
+        }
         if (st.pos != tw.pos or st.mtp_len != tw.mtp_len or st.base != tw.base or st.mtp_base != tw.mtp_base or !std.mem.eql(u1, st.cur, tw.cur) or diff != null) {
             std.debug.print("FAIL pair: prompt of {d}: the paired state differs (pos {d}/{d}, rings' base {d}/{d}, MTP base {d}/{d}, first byte {?d} of {d})\n", .{ len, st.pos, tw.pos, st.base, tw.base, st.mtp_base, tw.mtp_base, diff, n });
             failed = true;
         }
+        if (set.pages) {
+            try x.release(slots[0]);
+            try x.release(slots[1]);
+        }
+    }
+    if (set.pages) {
+        x.release(shuffled) catch {};
+        const c = e.pages.?.pool.census();
+        if (!e.pages.?.pool.idle() or c.free != c.total) {
+            std.debug.print("FAIL pair: the pool is not idle after every stream ended (free {d} of {d}, promised {d})\n", .{ c.free, c.total, c.promised });
+            failed = true;
+        }
+        if (unordered == 0) {
+            std.debug.print("FAIL pair: every stream's pages came in order; the check did not reach a shuffled table\n", .{});
+            failed = true;
+        }
     }
     if (failed) return error.TestFailed;
-    check.pass("paired prompt steps at TP={d}: {d} prompts, one with a mark at chunk 1, equal their twins a chunk a step in the first token, the next window's logits and tokens, the rings' bases and every state byte", .{ world, cases.len });
+    const where = if (!set.pages) "whole windows" else if (set.kv8) "E4M3 KV pages" else "bf16 KV pages";
+    check.pass("paired prompt steps at TP={d} on {s} ({s} exchange room{s}): {d} prompts, one with a mark at chunk 1 and one whose {d}-row second chunk ends in a piece of fewer rows than ranks, equal their twins a chunk a step in the first token, the next window's logits and tokens, the rings' bases and every state byte; {d} pages compared in row order, {d} jumps in the tables", .{ world, where, if (e.pair.?.own_room) "its own" else "one shared", if (e.pair.?.own_room) "s" else "", cases.len, ragged, pages_compared, unordered });
+}
+
+fn envIs(name: [*:0]const u8, want: []const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), want);
 }
