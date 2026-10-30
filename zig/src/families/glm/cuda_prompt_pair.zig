@@ -12,6 +12,17 @@ const Engine = engine.Engine;
 /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
 pub const min_rows = fw.prefill_rows / 4;
 
+/// The shortest prompt (ids) whose steps pair: three chunks or more by default. A prompt of two chunks is one paired
+/// step with nothing after it to hide, and measured ~3% slower paired at 4K (2x RTX PRO 6000, DFlash2); from 16K on a
+/// pair is ahead. TF_GLM_PROMPT_PAIR_MIN overrides it in ids (0: pair wherever a step can). Rank 0's choice, so the
+/// other ranks need no setting: they take the steps it sends.
+pub const default_min_len = 2 * fw.prefill_rows + 1;
+
+pub fn minLen() usize {
+    const v = std.c.getenv("TF_GLM_PROMPT_PAIR_MIN") orelse return default_min_len;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default_min_len;
+}
+
 /// A paired step's second chunk: twins of the prompt buffers, pieces on their side stream, and its first position.
 pub const Pair = struct {
     bp: fw.Buffers,
@@ -63,6 +74,7 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
     if (e.pair == null or !e.settings.pair or !drafterFits(e) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
+    if (len < minLen()) return false; // too short to gain from a pair
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
