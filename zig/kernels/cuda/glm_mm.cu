@@ -251,6 +251,15 @@ GLM_MM_ALL(4)
 GLM_MM_ALL(6)
 GLM_MM_ALL(8)
 GLM_MM_ALL(16)
+// Packed prompts, two stages (41 KB: two blocks an SM instead of one). Each output's K groups run in the same order, so
+// the sums are glm_mm{B}_128's bit for bit; a 768-row piece's 384 blocks fit one wave of 376 slots instead of 2.04.
+#define GLM_MM_PROMPT2(B)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(256, 2) glm_mm##B##_128s2(const __nv_bfloat16* __restrict__ x,       \
+        long long ldx, const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out,          \
+        float* __restrict__ part, int f32, int M, int N, int K, int SK) { mm_kernel<B, 128, 2, 2>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+GLM_MM_PROMPT2(4)
+GLM_MM_PROMPT2(6)
+GLM_MM_PROMPT2(8)
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>
