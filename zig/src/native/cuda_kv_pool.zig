@@ -73,17 +73,63 @@ fn fits(comptime F: type, loaded: anytype, o: api.Open, room: u64, window: u64, 
     return room -| stream_bytes * (n -| loaded.free_streams) >= want;
 }
 
+/// The room's reserve (TENSORFOLD_MEMORY_RESERVE_GIB) and the least it may be set to, for a refusal's fit; `limited`:
+/// TENSORFOLD_CUDA_MEMORY_LIMIT_GB bounds the room, so a smaller reserve may not widen it.
+pub const Reserve = struct { bytes: u64, least: u64, limited: bool = false };
+
+/// What a plan reads beside the budget: the reserve its refusals price a fit by (null: none named).
+pub const Facts = struct { reserve: ?Reserve = null };
+
 /// The pool beside the engine's own sequence (in `model`: a window, or on pages its fixed part); null: see `problem`.
-pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool) !?Plan {
+pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts) !?Plan {
     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
-    return kv_pool.plan(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged }) catch |e| {
-        problem.* = switch (e) {
-            error.NoStream => if (engine_paged) try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream beside the model: one at a {d}-token window takes {d:.2} GiB of KV pages, and the budget leaves {d:.2} GiB", .{ window, toGib(l.pages(window + rows) * l.pageBytes()), toGib(room) }) else "the CUDA memory budget fits no stream beside the model",
-            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each, and the CUDA memory budget leaves {d:.2} GiB: serve fewer, or free device memory", .{ o.lanes, toGib((o.lanes - 1) * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes())), toGib(room) }),
-        };
+    const b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged };
+    return kv_pool.plan(l, b) catch |e| {
+        problem.* = try refusal(a, l, b, e, window, rows, facts.reserve);
         return null;
     };
+}
+
+/// A refused plan's words: what it needs and the room it has, then what would fit. The fit clause's format, for the
+/// recipe's start script (each value is `none` when nothing at the engine's limits fits; `--context` only on pages):
+///   ": <short> GiB short; fits: --parallel <n>, TENSORFOLD_MEMORY_RESERVE_GIB=<gib> (now <gib>), --context <tokens>"
+/// The reserve is the largest at which the asked streams fit at this --context, the --context the largest at which
+/// they fit at this reserve (the engine's own window shrinks; buffers sized by the capacity shrink too), --parallel the
+/// most this room serves as it is. Free memory moves with other programs on the card: leave a margin.
+pub fn refusal(a: Allocator, l: kv_pool.Layout, b: kv_pool.Budget, e: error{ NoStream, TooMany }, window: u64, rows: u64, reserve: ?Reserve) ![]const u8 {
+    const page = l.pageBytes();
+    const own: u64 = if (b.engine_paged) l.pages(b.window) * page else 0;
+    const each = l.fixed_bytes + (1 + l.runPages()) * page;
+    const extra: u64 = b.lanes -| 1;
+    const others = extra * each;
+    const head = switch (e) {
+        error.NoStream => if (b.engine_paged and b.lanes > 0) try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream beside the model: one at a {d}-token window takes {d:.2} GiB of KV pages, and the budget leaves {d:.2} GiB", .{ window, toGib(own), toGib(b.room) }) else return "the CUDA memory budget fits no stream beside the model",
+        error.TooMany => if (b.engine_paged) try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each beside the engine's own {d}-token window ({d:.2} GiB of KV pages), and the CUDA memory budget leaves {d:.2} GiB", .{ b.lanes, toGib(others), window, toGib(own), toGib(b.room) }) else try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each, and the CUDA memory budget leaves {d:.2} GiB", .{ b.lanes, toGib(others), toGib(b.room) }),
+    };
+    const streams: u64 = if (b.fixed) others else 0; // --parallel named a number: its other streams must fit too
+    const need = b.engine + own + streams;
+    const short = need -| b.room;
+    const left = b.room -| (b.engine + own);
+    const parallel: u64 = if (e == error.NoStream) 0 else 1 + @min(extra, left / each);
+    var r: [48]u8 = undefined;
+    const res: []const u8 = if (reserve) |v| (if (!v.limited and v.bytes >= short and v.bytes - short >= v.least) try std.fmt.bufPrint(&r, "{d:.2}", .{floorGib(v.bytes - short)}) else "none") else "none";
+    var now: [32]u8 = undefined;
+    const was: []const u8 = if (reserve) |v| try std.fmt.bufPrint(&now, "{d:.2}", .{toGib(v.bytes)}) else "unknown";
+    var c: [48]u8 = undefined;
+    const fit_pages: u64 = if (b.room > b.engine + streams) (b.room - b.engine - streams) / page else 0;
+    const ctx: []const u8 = if (fit_pages * l.page_tokens > rows) try std.fmt.bufPrint(&c, "{d}", .{fit_pages * l.page_tokens - rows}) else "none";
+    var n: [24]u8 = undefined;
+    const par: []const u8 = if (parallel > 0) try std.fmt.bufPrint(&n, "{d}", .{parallel}) else "none";
+    return if (b.engine_paged)
+        std.fmt.allocPrint(a, "{s}: {d:.2} GiB short; fits: --parallel {s}, TENSORFOLD_MEMORY_RESERVE_GIB={s} (now {s}), --context {s}", .{ head, toGib(short), par, res, was, ctx })
+    else
+        std.fmt.allocPrint(a, "{s}: {d:.2} GiB short; fits: --parallel {s}, TENSORFOLD_MEMORY_RESERVE_GIB={s} (now {s})", .{ head, toGib(short), par, res, was });
+}
+
+/// GiB rounded down to a hundredth: a reserve set to it leaves at least the bytes asked.
+fn floorGib(bytes: u64) f64 {
+    return @floor(@as(f64, @floatFromInt(bytes)) / (1 << 30) * 100) / 100;
 }
 
 /// The planned streams' sequences and pages made now; false: `problem` says why they could not be.
@@ -208,11 +254,11 @@ test "kv pages: an engine whose own rows are pages plans a window of them first,
     const l: kv_pool.Layout = .{ .fixed_bytes = 180 << 20, .token_bytes = 13_056, .page_tokens = 512, .snap_bytes = 0 };
     const o: api.Open = .{ .dir = "", .model_type = "g", .lanes = 4, .prompt_cache_gib = 4 };
     try std.testing.expect(enginePaged(.{ .layout = @as(?kv_pool.Layout, l), .engine_paged = true }) and !enginePaged(.{ .layout = @as(?kv_pool.Layout, l) }));
-    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true)).?;
+    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true, .{})).?;
     try std.testing.expectEqual(@as(u32, 4), p.lanes);
     try std.testing.expectEqual(@as(usize, 4 * 17), p.pages); // every stream at most 8,192 rows and a verify window: 17 pages
     const floor = 17 * l.pageBytes();
-    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true, .{}));
     try std.testing.expect(std.mem.indexOf(u8, problem, "8192-token window") != null);
     const shown = (try text(Owned, a, 180 << 20, l, p, true, 8192, .{ .snaps = 0, .copied = 4 << 30, .snap_bytes = 0 }, false))[0];
     try std.testing.expectEqualStrings("the engine's own and 3 more taking 68 pages of 512 rows (0.42 GiB) as they need them (enough for one at a 8192-token window), 180 MiB fixed each", shown);
@@ -272,7 +318,80 @@ test "KV admission: a refusal prices the running states beside the fixed part an
     var problem: []const u8 = "";
     const l: kv_pool.Layout = .{ .fixed_bytes = 1 << 30, .token_bytes = 1 << 28, .page_tokens = 4, .snap_bytes = 1, .run_bytes = 1 << 30 };
     const o: api.Open = .{ .dir = "", .model_type = "n", .lanes = 2, .lanes_fixed = true, .prompt_cache_gib = 0 };
-    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false, .{}));
     try std.testing.expect(std.mem.indexOf(u8, problem, "needs 3.00 GiB") != null);
     try std.testing.expect(std.mem.indexOf(u8, problem, "state runs") != null);
+}
+
+/// GLM-5.3-Flash's shape in production (TP2, fp8 pages beside DFlash2): its family's declarations the plan reads.
+const Glm = struct {
+    pub const snap_save = 1;
+    pub const window_rows = 8;
+};
+const glm_layout: kv_pool.Layout = .{ .fixed_bytes = 378 << 20, .token_bytes = 6380, .page_tokens = 512, .snap_bytes = 0 };
+
+/// The values a refusal's fit clause names (none: null), parsed as the recipe's start script would.
+fn fitOf(problem: []const u8) !struct { parallel: ?u32, reserve: ?f64, context: ?u64 } {
+    const at = std.mem.indexOf(u8, problem, "; fits: --parallel ") orelse return error.NoFit;
+    var it = std.mem.tokenizeAny(u8, problem[at + "; fits: --parallel ".len ..], ", =()");
+    const par = it.next().?;
+    try std.testing.expectEqualStrings("TENSORFOLD_MEMORY_RESERVE_GIB", it.next().?);
+    const res = it.next().?;
+    try std.testing.expectEqualStrings("now", it.next().?);
+    _ = it.next().?;
+    const ctx: ?[]const u8 = if (it.next()) |w| blk: {
+        try std.testing.expectEqualStrings("--context", w);
+        break :blk it.next().?;
+    } else null;
+    return .{
+        .parallel = if (std.mem.eql(u8, par, "none")) null else try std.fmt.parseInt(u32, par, 10),
+        .reserve = if (std.mem.eql(u8, res, "none")) null else try std.fmt.parseFloat(f64, res),
+        .context = if (ctx) |c| (if (std.mem.eql(u8, c, "none")) null else try std.fmt.parseInt(u64, c, 10)) else null,
+    };
+}
+
+test "kv merge: a refused --parallel names what would fit: the streams the room serves, a reserve, a --context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var problem: []const u8 = "";
+    const l = glm_layout;
+    const gib: u64 = 1 << 30;
+    const o: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true };
+    const reserve: Reserve = .{ .bytes = 4 * gib, .least = gib / 2 };
+    const room: u64 = 6359 << 20; // 6.21 GiB, production's at reserve 4: three streams' fixed parts are 0.05 GiB short
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = reserve }));
+    // the old words stay (start.sh greps them), the engine's own window is named, then the clause
+    try std.testing.expect(std.mem.indexOf(u8, problem, "--parallel 4 needs 1.12 GiB for its other streams' fixed parts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "beside the engine's own 864256-token window (5.14 GiB of KV pages)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "leaves 6.21 GiB: 0.04 GiB short; fits: --parallel 3, TENSORFOLD_MEMORY_RESERVE_GIB=3.95 (now 4.00), --context ") != null);
+    try std.testing.expectEqualStrings("--parallel 4 needs 1.12 GiB for its other streams' fixed parts, state runs and a page each beside the engine's own 864256-token window (5.14 GiB of KV pages), and the CUDA memory budget leaves 6.21 GiB: 0.04 GiB short; fits: --parallel 3, TENSORFOLD_MEMORY_RESERVE_GIB=3.95 (now 4.00), --context 857080", problem);
+    const fit = try fitOf(problem);
+    try std.testing.expectEqual(@as(?u32, 3), fit.parallel);
+    // each named value, set alone, serves all four streams (and not a byte past the reserve's hundredth)
+    const lower: u64 = @intFromFloat(fit.reserve.? * @as(f64, @floatFromInt(gib)));
+    try std.testing.expect((try plan(Glm, a, l, room + reserve.bytes - lower, o, 864_256, &problem, false, true, .{})) != null);
+    try std.testing.expect(lower + (gib / 100) > reserve.bytes - (l.pages(864_264) * l.pageBytes() + 3 * (l.fixed_bytes + l.pageBytes()) - room));
+    try std.testing.expect((try plan(Glm, a, l, room, o, fit.context.?, &problem, false, true, .{})) != null);
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, fit.context.? + 512, &problem, false, true, .{}));
+    const three: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = fit.parallel.?, .lanes_fixed = true };
+    try std.testing.expect((try plan(Glm, a, l, room, three, 864_256, &problem, false, true, .{})) != null);
+    // a reserve at the engine's floor that still falls short, or a memory limit, names none
+    _ = try plan(Glm, a, l, room - 4 * gib, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = gib / 2 + gib / 4, .least = gib / 2 } });
+    try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
+    _ = try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = 4 * gib, .least = gib / 2, .limited = true } });
+    try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
+    // a room under the engine's own window: no stream fits, so --parallel names none; the reserve and --context do
+    _ = try plan(Glm, a, l, 5 * gib, o, 864_256, &problem, false, true, .{ .reserve = reserve });
+    try std.testing.expect(std.mem.indexOf(u8, problem, "one at a 864256-token window takes 5.14 GiB of KV pages, and the budget leaves 5.00 GiB") != null);
+    const none = try fitOf(problem);
+    try std.testing.expectEqual(@as(?u32, null), none.parallel);
+    try std.testing.expect((try plan(Glm, a, l, 5 * gib, o, none.context.?, &problem, false, true, .{})) != null);
+    const lifted = 5 * gib + reserve.bytes - @as(u64, @intFromFloat(none.reserve.? * @as(f64, @floatFromInt(gib))));
+    try std.testing.expect((try plan(Glm, a, l, lifted, o, 864_256, &problem, false, true, .{})) != null);
+    // a family whose own window is in the model's bytes: no --context in its clause
+    const NotPaged = struct {};
+    _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve });
+    try std.testing.expect(std.mem.endsWith(u8, problem, "(now 4.00)"));
+    try std.testing.expectEqual(@as(?u32, 1), (try fitOf(problem)).parallel);
 }
