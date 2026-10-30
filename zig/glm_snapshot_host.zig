@@ -914,3 +914,63 @@ test "GLM snapshots: an E4M3 paged sequence keeps and resumes its codes, scales 
         f.e.cur = window;
     }
 }
+
+test "GLM snapshots: an E4M3 state kept on one paged stream restores into another stream on other pages, its table its own" {
+    var d = rec.init();
+    var f: Fixture = undefined;
+    try f.initFormat(&d, 1, 2, false, true); // a follower's share, beside DFlash2: no head
+    defer f.deinit();
+    const c = f.e.c;
+    var w: glm.weights.Weights = undefined;
+    w.config = c;
+    w.share = f.e.share;
+    var layers: [2]glm.weights.Layer = undefined;
+    layers[0].mixer = .{ .mla = undefined };
+    layers[1].mixer = .{ .kda = undefined };
+    w.layers = &layers;
+    const page = glm.state.pageBytesOf(&w, true, false);
+    // one pool of 20 pages, the two streams' tables disjoint and shuffled
+    const ids_a = [_]u32{ 13, 2, 19, 7, 0, 11, 5, 16, 9, 3 };
+    const ids_b = [_]u32{ 4, 17, 8, 1, 14, 10, 18, 6, 12, 15 };
+    var kv = try cuda.DeviceBuffer.alloc(&d, 20 * page);
+    defer kv.free();
+    const at: glm.state.Paged = .{ .kv = kv.ptr, .pages = glm.pages.tableLen(16448), .page_bytes = page };
+    var a = f.seq;
+    a.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, at, true, false);
+    defer a.st.deinit();
+    var b = f.seq;
+    b.st = try glm.forward.State.initPagedFormat(t.allocator, &d, &w, 16448, at, true, false);
+    defer b.st.deinit();
+    for ([_]*@TypeOf(a){ &a, &b }, [_][]const u32{ &ids_a, &ids_b }) |q, ids| {
+        q.st.pages = ids;
+        q.st.capacity = ids.len * 512;
+        @memset(rec.bytes(q.st.table, ids.len * 4), 0x77); // each table is its stream's: a restore leaves it alone
+    }
+    try f.e.prepareSnapshots(2 * f.e.stateBytes(4096));
+    for ([_]usize{ 1537, 4096 }) |at_row| {
+        // stream a's rows on its pages, as its prompt wrote them
+        @memset(rec.bytes(kv.ptr, kv.len), 0);
+        const arena = rec.bytes(a.st.arena.buf.ptr, a.st.arena.buf.len);
+        for (arena, 0..) |*x, i| x.* = @truncate(i *% 29 +% at_row);
+        @memset(rec.bytes(a.st.table, ids_a.len * 4), 0x77); // the pattern ran over a's own table (its arena's end)
+        for (ids_a) |id| for (rec.bytes(kv.ptr + id * page, page), 0..) |*x, i| {
+            x.* = @truncate(i *% 13 +% id);
+        };
+        try a.st.restoreHost(f.e.stream, at_row, 0, &.{1}, .{ 0, 0 });
+        f.e.cur = &a;
+        const id = try f.e.keepState();
+        // b's pages hold other bytes; the restore writes b's own pages through b's ids
+        for (ids_b) |pid| @memset(rec.bytes(kv.ptr + pid * page, page), 0xE9);
+        const a_pages = try t.allocator.dupe(u8, rec.bytes(kv.ptr, kv.len));
+        defer t.allocator.free(a_pages);
+        f.e.cur = &b;
+        try f.e.restoreState(id);
+        try expectSamePrefix8(c, &a.st, &b.st, at_row, null);
+        try t.expectEqual(at_row, b.st.pos);
+        for (ids_a) |pid| try t.expectEqualSlices(u8, a_pages[pid * page ..][0..page], rec.bytes(kv.ptr + pid * page, page)); // a's untouched
+        for ([_]*@TypeOf(a){ &a, &b }, [_][]const u32{ &ids_a, &ids_b }) |q, ids| for (rec.bytes(q.st.table, ids.len * 4)) |x| try t.expectEqual(@as(u8, 0x77), x);
+        f.e.dropState(id);
+        f.e.dropped.clearRetainingCapacity();
+    }
+    f.e.cur = &f.seq;
+}

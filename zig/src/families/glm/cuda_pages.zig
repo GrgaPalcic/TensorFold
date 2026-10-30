@@ -194,6 +194,9 @@ pub const Pages = struct {
 
     /// The slot's sequence reaches its pages' rows (NaN first under TF_KV_POISON).
     fn mapped(p: *Pages, slot: u32, ids: []const u32) !void {
+        // every id names a page of this pool, on every rank (the kernels read pt[pos / 512] for pos under the capacity
+        // set below, and State.ready refuses a pass past it), so no table can send a kernel past the pages' arena
+        for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
         const st = &p.e.seqs.items[slot].?.st;
         const page = p.layout.pageBytes();
         if (p.poison) for (ids) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
