@@ -62,6 +62,7 @@ pub const Pages = struct {
     used: []bool,
     leader: bool,
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
+    waiting: ?usize = null, // rank 0: the pages the request admission last held back needs (one log line a wait)
 
     /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
@@ -138,10 +139,28 @@ pub const Pages = struct {
 
     /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
     /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
-    pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
+    pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
         const n = need(p.layout, prompt, max_tokens);
-        for (p.used) |u| if (!u) return n > p.pool.total() or p.pool.fits(n);
-        return false;
+        const free_seq = for (p.used) |u| {
+            if (!u) break true;
+        } else false;
+        const ok = free_seq and (n > p.pool.total() or p.pool.fits(n));
+        p.noteWait(n, prompt, max_tokens, ok, free_seq);
+        return ok;
+    }
+
+    /// One line when admission starts holding a request back, saying for what, and one when it fits again.
+    fn noteWait(p: *Pages, n: usize, prompt: usize, max_tokens: usize, ok: bool, free_seq: bool) void {
+        if (@import("builtin").is_test) return;
+        if (ok) {
+            if (p.waiting) |w| std.log.info("kv pool: the request waiting for {d} pages fits now ({d} free of {d})", .{ w, p.pool.available(), p.pool.total() });
+            p.waiting = null;
+            return;
+        }
+        if (p.waiting == n) return;
+        p.waiting = n;
+        if (!free_seq) return std.log.info("kv pool: a request ({d} prompt + {d} reply tokens, {d} pages) waits for a stream: all {d} paged sequences are busy", .{ prompt, max_tokens, n, p.used.len });
+        std.log.info("kv pool: a request ({d} prompt + {d} reply tokens) waits for {d} pages: {d} free and {d} reclaimable of {d}, while the running streams hold the rest", .{ prompt, max_tokens, n, p.pool.available(), p.pool.reclaimable(), p.pool.total() });
     }
 
     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.

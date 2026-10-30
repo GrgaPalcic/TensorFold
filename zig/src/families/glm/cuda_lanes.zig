@@ -307,7 +307,7 @@ pub const Lanes = struct {
 
     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
     pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
-        const p = self.x.e.pages orelse return true;
+        const p = self.x.e.pages orelse return true; // its wait note is rank 0's, on the engine thread
         return p.fits(prompt, max_tokens);
     }
 

@@ -81,6 +81,7 @@ const Fake = struct {
         f.e.pages = null;
         f.e.images = null;
         f.e.settings = .{};
+        f.e.mtp = true; // the target MTP head's part on every page (DFlash2 tests turn it off)
         f.e.w = undefined;
         f.e.w.config = .{};
         f.e.w.share = try shard.Share.of(&f.e.w.config, 0, 2);
@@ -276,4 +277,41 @@ test "every host allocation failure while making the pages leaves no device buff
             try expectEqual(@as(usize, 0), F.live);
         }
     }.run, .{});
+}
+
+test "E4M3 pages beside DFlash2: a page holds each DSA layer's codes, scales and pooled keys, no MTP part" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    f.e.settings.kv8 = true;
+    f.e.mtp = false;
+    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
+    try expectEqual(@as(u64, 512 + 4 + 64), l.token_bytes); // one DSA layer: codes, its scale, pooled keys
+    const p = try f.pool(l, 3, 8, true);
+    defer f.deinit(p);
+    _ = try p.open(1, 600, 100);
+    const st = &f.e.seqs.items[1].?.st;
+    const x = st.caches[0];
+    try expect(st.kv8 and !st.head);
+    try expectEqual(x.lc + 512 * 512, x.ls); // the part's scales after its codes
+    try expectEqual(x.ls + 512 * 4, x.pk); // its pooled keys last
+    try expectEqual(l.pageBytes(), x.ps);
+    try expectEqual(@as(u64, 296_960), l.pageBytes());
+    p.close(1);
+}
+
+test "a request needing more pages than the whole pool is admitted at once and refused, never left waiting" {
+    var f: Fake = undefined;
+    try f.init(std.testing.allocator);
+    const l = try pages_mod.layout(std.testing.allocator, &f.e, 0);
+    const p = try f.pool(l, 3, 4, true); // 4 pages: 2,048 rows in all
+    defer f.deinit(p);
+    try expect(p.fits(3000, 100)); // 7 pages: past the pool, inside the window's table of 8
+    try std.testing.expectError(error.PoolTooSmall, p.open(1, 3000, 100));
+    try expectEqual(@as(usize, 0), f.e.seqs.items[1].?.st.capacity);
+    try expect(p.pool.idle() and p.pool.census().free == 4); // nothing promised or taken
+    _ = try p.open(1, 1500, 100); // 4 pages: the whole pool
+    try expect(!p.fits(600, 100)); // waits: the running stream holds every page
+    try expect(p.fits(3000, 100)); // still refused at once, not left waiting
+    p.close(1);
+    try expect(p.fits(600, 100));
 }
