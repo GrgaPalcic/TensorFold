@@ -303,6 +303,31 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     }
 }
 
+/// A decode window's routed experts after a fused select (glue.selectGroup): the call's common scratch, whose ids,
+/// count and members the select fills and whose compact picks are sc.picks. Null when the window takes the old path.
+pub fn decodeScratch(w: Experts, sc: Scratch, rows: usize, count: usize, dims: usize, width: usize, limit: f32) !?common.Scratch {
+    if (rows == 0 or rows > chunk_rows) return null;
+    const l = layer(w, count, dims, width, limit);
+    return try common.scratch(sc.picks + picksBytes(rows), l, rows, top_k);
+}
+
+/// The grouped decode path's experts (picks compact in sc.picks, grouped by the fused select): the down partials only;
+/// `combineDecode` then writes the layer's output. No copies: the slot rows of `ey` are not used.
+pub fn runGrouped(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, x: u64, x_stride: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32) !void {
+    if (dims % 256 != 0 or width % 128 != 0) return error.UnreadableExl3;
+    const l = layer(w, count, dims, width, limit);
+    const scratch = (try decodeScratch(w, sc, rows, count, dims, width, limit)) orelse return error.BadWindow;
+    try k.core(stream, l, x, x_stride, .bf16, sc.picks, rows, scratch);
+}
+
+/// The grouped decode path's output: every row's routed slots (from the down partials) and its shared expert's row
+/// `shared` (fp32 [rows][dims]) summed with `wts` (`top_k` + 1 a row) in slot order, as glue.combine sums the slot rows.
+pub fn combineDecode(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, rows: usize, count: usize, dims: usize, width: usize, limit: f32, wts: u64, shared: u64, out: u64) !void {
+    const l = layer(w, count, dims, width, limit);
+    const scratch = (try decodeScratch(w, sc, rows, count, dims, width, limit)) orelse return error.BadWindow;
+    try k.combine(stream, l, sc.picks, rows, scratch, wts, top_k + 1, shared, out);
+}
+
 test {
     _ = @import("cuda_exl3_test.zig");
 }

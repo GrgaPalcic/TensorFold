@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include "exl3_grouped.cuh"
+#include "exl3_group.cuh"
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -23,15 +24,26 @@ extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, 
     tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// mcg at 4 tiles a block: twice the blocks of tf_exl3_grouped_1 on the same k slices, each column's sum in the same warp
+// order, so the same bits (decode windows pick it where it measures faster: cuda/exl3_experts.zig ntFor).
+extern "C" __global__ void tf_exl3_grouped_1_nt4(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body<1, 4, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+// mcg decode windows of at most 8 rows on a projection of one width: 3-bit (K2 6) or 4-bit (K2 8), 4 tiles a block,
+// 8 reduction rows (cuda/exl3_experts.zig tilesFor; the same bits as tf_exl3_grouped_1).
+extern "C" __global__ void tf_exl3_grouped_1_k6r8(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_LOAD, 6, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+extern "C" __global__ void tf_exl3_grouped_1_k8r8(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
 namespace tf_exl3 {
-
-// Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
-constexpr int GROUP_THREADS = 1024;
-constexpr int GROUP_PER_THREAD = 4;
 
 struct GroupArgs {
     const int* pick; // int32 [rows * slots]
@@ -43,54 +55,10 @@ struct GroupArgs {
 
 extern "C" __global__ void __launch_bounds__(GROUP_THREADS) tf_exl3_group(const GroupArgs a) {
     extern __shared__ int sh_pick[];
-    __shared__ int warp_tot[GROUP_THREADS / 32];
     const int n = a.rows * a.slots;
     for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = a.pick[i];
     __syncthreads();
-    int cnt[GROUP_PER_THREAD];
-    int used = 0;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        int c = 0;
-        if (e < a.experts)
-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
-        cnt[q] = c;
-        used += c > 0;
-    }
-    // exclusive scan of `used` over threads
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int inc = used;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        int v = __shfl_up_sync(0xffffffffu, inc, o);
-        if (lane >= o) inc += v;
-    }
-    if (lane == 31) warp_tot[warp] = inc;
-    __syncthreads();
-    if (warp == 0) {
-        int v = warp_tot[lane];
-        int s = v;
-        for (int o = 1; o < 32; o <<= 1) {
-            int x = __shfl_up_sync(0xffffffffu, s, o);
-            if (lane >= o) s += x;
-        }
-        warp_tot[lane] = s - v; // exclusive per warp
-        if (lane == 31) a.ucount[0] = s;
-    }
-    __syncthreads();
-    int place = warp_tot[warp] + inc - used;
-#pragma unroll
-    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
-        if (cnt[q] == 0) continue;
-        const int e = threadIdx.x * GROUP_PER_THREAD + q;
-        a.uids[place] = e;
-        int j = 0;
-        for (int i = 0; i < n && j < a.maxm; ++i)
-            if (sh_pick[i] == e) a.members[place * a.maxm + j++] = (i / a.slots) * 32 + (i % a.slots);
-        for (; j < a.maxm; ++j) a.members[place * a.maxm + j] = -1;
-        ++place;
-    }
+    group_rows(sh_pick, n, a.slots, a.experts, a.maxm, a.uids, a.ucount, a.members);
 }
 
 // Program (slot, 128-block of K, matrix): Xh = fp16((x * suh) @ H) for gate and up of every routed slot (pick < E).
@@ -196,9 +164,11 @@ struct DownArgs {
     const int* pick; // int32 [P]
     const half* svh_d; // fp16 [E, D]
     float* y; // fp32 [P, D]
-    const float* wts; // fp32 [rows, slots]
+    const float* wts; // fp32 [rows, wslots]
     float* out; // fp32 [rows, D]
     int p, d, sk, experts, slots;
+    const float* extra; // fp32 [rows, D] or null: the row's slot `slots` (GLM's shared expert), weight wts[r][slots]
+    int wslots; // weights a row: slots (+ 1 with `extra`); the routed pairs stay compact, `slots` a row
 };
 
 extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
@@ -233,8 +203,16 @@ extern "C" __global__ void tf_exl3_down_combine(const DownArgs a) {
     if (k != 0) return;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int q = 0; q < a.slots; ++q) {
-        const float w = a.wts[r * a.slots + q];
+        const float w = a.wts[r * a.wslots + q];
         const float4 u = part[q][lane];
+        acc[0] = fmaf(w, u.x, acc[0]);
+        acc[1] = fmaf(w, u.y, acc[1]);
+        acc[2] = fmaf(w, u.z, acc[2]);
+        acc[3] = fmaf(w, u.w, acc[3]);
+    }
+    if (a.extra) { // the slot after the routed ones, last in the sum as tf_glm_combine adds it
+        const float w = a.wts[r * a.wslots + a.slots];
+        const float4 u = *reinterpret_cast<const float4*>(a.extra + (size_t)r * a.d + n);
         acc[0] = fmaf(w, u.x, acc[0]);
         acc[1] = fmaf(w, u.y, acc[1]);
         acc[2] = fmaf(w, u.z, acc[2]);

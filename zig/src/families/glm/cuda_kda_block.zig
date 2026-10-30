@@ -88,6 +88,12 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
             if (!one) try columns(set, stream, s.tmp, w - fa, s.p + fa * 2, w, rows);
         },
     }
+    if (selected.mm) |mk| if (!selected.prompt) { // a decode window: f_b and g_b (one shape) in one launch, the same sums
+        const mm = @import("cuda_mm.zig");
+        const tb: mm.Tiled = if (selected.packs) |pk| pk.tiled(l.fb, n, kda.dk) else .{ .w = l.fb, .n = n, .k = kda.dk };
+        const tg: mm.Tiled = if (selected.packs) |pk| pk.tiled(l.gb, n, kda.dk) else .{ .w = l.gb, .n = n, .k = kda.dk };
+        if (try mm.matmulPair(mk, stream, s.p + fa * 2, s.p + (fa + kda.dk) * 2, w, tb, tg, s.ka, s.kg, rows)) return;
+    };
     try b16.matmul(selected, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
     try b16.matmul(selected, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
 }

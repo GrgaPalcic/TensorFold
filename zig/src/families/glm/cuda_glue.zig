@@ -32,6 +32,7 @@ pub const Kernels = struct {
     swiglu_64: cuda.Function,
     group_sums: cuda.Function,
     topk: cuda.Function,
+    topk_group: cuda.Function,
     router_part: cuda.Function,
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
@@ -185,6 +186,19 @@ pub fn select(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, 
     var a: cuda.Args = .{};
     inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)) }) |v| a.add(v);
     try cuda.launch.launch(set.glue.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
+}
+
+/// The rows a fused select-and-group takes: a warp a row in one 1024-thread block (tf_glm_topk_group).
+pub const select_group_rows = 32;
+
+/// glue.select of a decode window (tf_glm_topk's code, a warp a row) and, for the EXL3 experts, the routed picks
+/// compact (`top_k` a row, in `pick8`) with tf_exl3_group's grouping into `ids`, `count` and `members` (`rows` each).
+pub fn selectGroup(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool, pick8: u64, ids: u64, count: u64, members: u64) !void {
+    if (experts > 512 or top_k >= 32) return error.TopkTooWide;
+    if (rows == 0 or rows > select_group_rows or rows * top_k > 1024 or experts > 4096) return error.TooManyRows;
+    var a: cuda.Args = .{};
+    inline for (.{ logits, bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)), cint(rows), pick8, ids, count, members }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.topk_group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, stream, &a);
 }
 
 /// glue.combine: out [rows][d] fp32 = sum over slots in order of wts[r][k] y[r][k] (y fp32 in decode, bf16 in prefill).

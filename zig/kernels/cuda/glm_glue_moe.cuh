@@ -1,6 +1,8 @@
 // GLM's MLP and MoE glue by hand: glue._swiglu, glue._topk and qmm._group_sums (the router's dot is glm_glue_router).
 #pragma once
 
+#include "exl3_group.cuh"
+
 #include "glm_triton.cuh"
 
 using namespace glm_triton;
@@ -66,13 +68,12 @@ extern "C" __global__ void __launch_bounds__(128)
   if ((threadIdx.x & 7) == 0 && g < kg) xs[m * kg + g] = s;
 }
 
-// glue._topk, a warp a row: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then shared expert.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
-                int norm) {
+// glue._topk of row `r` by one warp: top_k by sigmoid + bias (ties to lower id), normed if `norm`, x scale; then the
+// shared expert. `sh` (or null): the row's routed picks also at sh[r * top_k ..], compact, for the EXL3 grouping.
+namespace glm_moe {
+__device__ __forceinline__ void topk_row(int64_t r, int lane, const float* logits, const float* bias, int* pick, float* wts, float scale,
+                                         int ne, int top_k, int norm, int* sh) {
   constexpr int MAXE = 16;  // 512 experts a row
-  const int64_t r = blockIdx.x;
-  const int lane = threadIdx.x;
   float score[MAXE], choice[MAXE];
   for (int i = 0; i < MAXE; ++i) {
     const int e = i * 32 + lane;
@@ -106,8 +107,32 @@ extern "C" __global__ void __launch_bounds__(32)
     const float v = norm ? div_full(mine, total + 1e-20f) : mine;
     pick[r * (top_k + 1) + lane] = mine_id;
     wts[r * (top_k + 1) + lane] = __fmul_rn(v, scale);
+    if (sh) sh[r * top_k + lane] = mine_id;
   } else if (lane == top_k) {
     pick[r * (top_k + 1) + lane] = ne;
     wts[r * (top_k + 1) + lane] = 1.0f;
   }
+}
+}  // namespace glm_moe
+
+// glue._topk, a warp a row.
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_topk(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k,
+                int norm) {
+  glm_moe::topk_row(blockIdx.x, threadIdx.x, logits, bias, pick, wts, scale, ne, top_k, norm, nullptr);
+}
+
+// A decode window's glue._topk (rows <= 32, a warp a row, tf_glm_topk's own code) and then, for the EXL3 experts, the
+// routed picks compact (top_k a row) and their grouping (tf_exl3_group's own code) from the same block: no copy, no
+// separate group launch. 1024 threads (the grouping's block).
+extern "C" __global__ void __launch_bounds__(tf_exl3::GROUP_THREADS)
+    tf_glm_topk_group(const float* logits, const float* bias, int* pick, float* wts, float scale, int ne, int top_k, int norm,
+                      int rows, int* pick8, int* uids, int* ucount, int* members) {
+  __shared__ int sh_pick[tf_exl3::GROUP_THREADS];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  if (warp < rows) glm_moe::topk_row(warp, lane, logits, bias, pick, wts, scale, ne, top_k, norm, sh_pick);
+  __syncthreads();
+  const int n = rows * top_k;
+  for (int i = threadIdx.x; i < n; i += tf_exl3::GROUP_THREADS) pick8[i] = sh_pick[i];
+  tf_exl3::group_rows(sh_pick, n, top_k, ne, rows, uids, ucount, members);
 }

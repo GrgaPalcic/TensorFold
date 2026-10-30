@@ -40,6 +40,7 @@ pub const Packed = struct {
 pub const Kernels = struct {
     by_rows: [4]cuda.Function, // bf16: 16, 32, 64, 128 rows a block
     packed_rows: [3][4]cuda.Function, // 4, 6 and 8 bits, as by_rows
+    pair: [4]cuda.Function, // glm_mm{16,4,6,8}_16x2: two problems of one shape a launch, the 16-row blocks' sums
     packed_prompt: [3]cuda.Function, // glm_mm4/6/8_128s2: packed prompts in two stages, two blocks an SM, the same sums
     prompt: cuda.Function, // 128-row blocks, row blocks fastest: a prompt's blocks share each weight tile in L2
     reduce: cuda.Function,
@@ -49,7 +50,7 @@ pub const Kernels = struct {
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
 
     pub fn load(m: cuda.Module) !Kernels {
-        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
+        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
         inline for (.{ "glm_mm16_16", "glm_mm16_32", "glm_mm16_64", "glm_mm16_128" }, 0..) |name, i| {
             k.by_rows[i] = try m.function(name);
             try k.by_rows[i].allowDynamicShared(smem(bucket(i)));
@@ -62,6 +63,10 @@ pub const Kernels = struct {
             k.tile_packed[wi] = try m.function(std.fmt.comptimePrint("glm_mm_tile{d}", .{b}));
             k.packed_prompt[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_128s2", .{b}));
             try k.packed_prompt[wi].allowDynamicShared(sharedBytesStages(b, 128, 2));
+        }
+        inline for (widths, 0..) |b, wi| {
+            k.pair[wi] = try m.function(std.fmt.comptimePrint("glm_mm{d}_16x2", .{b}));
+            try k.pair[wi].allowDynamicShared(sharedBytes(b, 16));
         }
         try k.prompt.allowDynamicShared(smem(128));
         if (std.c.getenv("TF_GLM_PDL")) |v| k.pdl = !std.mem.eql(u8, std.mem.span(v), "0");
@@ -150,6 +155,32 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
         }
         done += rows;
     }
+}
+
+/// Two decode linears of one shape and width in one launch (z: the problem), when each would take one K slice and the
+/// 16-row blocks: the same blocks and sums as two `matmul` calls; false (nothing launched) when they would not.
+pub fn matmulPair(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, ldx: usize, w0: Tiled, w1: Tiled, out0: u64, out1: u64, m: usize) !bool {
+    if (m == 0 or m > 16 or w0.n != w1.n or w0.k != w1.k or w0.bits != w1.bits) return false;
+    if (w0.k % 64 != 0 or w0.n % 8 != 0 or x0 % 16 != 0 or x1 % 16 != 0 or ldx % 8 != 0) return false;
+    if (splitK(w0.n, w0.k) != 1) return false;
+    const wi = widthIndex(w0.bits) catch return false;
+    var a: cuda.Args = .{};
+    a.add(x0);
+    a.add(x1);
+    a.add(@as(c_longlong, @intCast(ldx)));
+    a.add(w0.w);
+    a.add(w1.w);
+    a.add(w0.s);
+    a.add(w1.s);
+    a.add(out0);
+    a.add(out1);
+    a.add(@as(c_int, 0)); // bf16 out, as matmul's `wide` false
+    a.add(@as(c_int, @intCast(m)));
+    a.add(@as(c_int, @intCast(w0.n)));
+    a.add(@as(c_int, @intCast(w0.k)));
+    const cols: u32 = @intCast((w0.n + 63) / 64);
+    try cuda.launch.launch(k.pair[wi], .{ .grid = .{ .x = cols, .y = 1, .z = 2 }, .block = .{ .x = 128 }, .shared = sharedBytes(w0.bits, 16), .pdl = k.pdl }, s, &a);
+    return true;
 }
 
 /// Packed rows (cuda_qpack's) and fp16 scales [n][k / 64] at `src`, `ss` tiled into `dst`, `ds` (`bits` 4/6/8).

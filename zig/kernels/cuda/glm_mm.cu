@@ -88,14 +88,14 @@ struct Tile {
 template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
-        int f32, int M, int N, int K, int SK) {
+        int f32, int M, int N, int K, int SK, int zslice = -1) {
     using T = Tile<BITS, BM, WM, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
     const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
-    const int slice = blockIdx.z, g0 = slice * per;
+    const int slice = zslice >= 0 ? zslice : (int)blockIdx.z, g0 = slice * per;  // a pair launch's z is its problem
     const int t0 = n0 >> 3;                                   // the block's first column tile
     auto stage = [&](int st) { return buf + st * T::STAGE; };
     auto loadX = [&](int st, int g) {
@@ -260,6 +260,26 @@ GLM_MM_ALL(16)
 GLM_MM_PROMPT2(4)
 GLM_MM_PROMPT2(6)
 GLM_MM_PROMPT2(8)
+
+// Two problems of one shape and one K slice in one launch (z picks the problem): the same blocks and sums as two
+// launches of glm_mm*_16 (GLM's KDA f_b and g_b projections of a decode window).
+struct MmPair {
+    const __nv_bfloat16* x[2];
+    long long ldx;
+    const uint32_t* w[2];
+    const __half* s[2];
+    void* out[2];
+    int f32, M, N, K;
+};
+#define GLM_MM_PAIR(B)                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16x2(const MmPair p) {                              \
+        const int z = blockIdx.z;                                                                                      \
+        mm_kernel<B, 16, 1, 3>(p.x[z], p.ldx, p.w[z], p.s[z], p.out[z], nullptr, p.f32, p.M, p.N, p.K, 1, 0);           \
+    }
+GLM_MM_PAIR(4)
+GLM_MM_PAIR(6)
+GLM_MM_PAIR(8)
+GLM_MM_PAIR(16)
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>

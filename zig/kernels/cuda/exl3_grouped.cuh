@@ -159,4 +159,104 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     }
 }
 
+// grouped_body at one trellis width K2F (no width switch: fewer registers) and RR reduction rows (a member tile of at
+// most RR rows: decode windows); every column keeps its k slices and warp-order sum, so the bits are grouped_body's.
+template <int CB, int NT, int W, int LOAD, int K2F, int RR>
+__device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int nblock, int zz) {
+    if (u >= a.ucount[0]) return;
+    const int MT = (a.maxm + 15) / 16;
+    const int mtile = zz % MT;
+    const int split = (zz / MT) % a.sk;
+    const int mat = zz / MT / a.sk;
+    const half* X = mat ? a.x1 : a.x0;
+    const int e = a.standard ? a.uids[3 * u] : a.uids[u];
+    if (a.standard && e == a.skip) return;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
+    const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4); // row stride of the trellis, in tiles
+
+    __shared__ int rows_sh[16];
+    if (threadIdx.x < 16) {
+        const int m = mtile * 16 + threadIdx.x;
+        const int count = a.standard ? a.uids[3 * u + 2] : a.maxm;
+        const int first = a.standard ? a.uids[3 * u + 1] : u * a.maxm;
+        const int code = m < count ? a.members[first + m] : -1;
+        rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
+    }
+    __syncthreads();
+    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
+    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
+    const int per_warp = (a.k >> 4) / a.sk / W;
+    const int kt0 = split * (per_warp * W) + warp * per_warp;
+    const int nt0 = nblock * NT;
+
+    float acc[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+    __shared__ __align__(16) float red[W][RR][NT * 16];
+    if constexpr (K2F > 0) {
+        if (k2 != K2F) __trap();  // the launcher picks it for a projection whose every expert is K2F wide
+        warp_tiles<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+    } else {
+    switch (k2) {
+#define TF_EXL3X_CASE(K2_)                                                                                   \
+    case K2_:                                                                                                \
+        warp_tiles<CB, K2_, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
+        break;
+        TF_EXL3X_CASE(2)
+        TF_EXL3X_CASE(3)
+        TF_EXL3X_CASE(4)
+        TF_EXL3X_CASE(5)
+        TF_EXL3X_CASE(6)
+        TF_EXL3X_CASE(7)
+        TF_EXL3X_CASE(8)
+        TF_EXL3X_CASE(9)
+        TF_EXL3X_CASE(10)
+        TF_EXL3X_CASE(11)
+        TF_EXL3X_CASE(12)
+        TF_EXL3X_CASE(13)
+        TF_EXL3X_CASE(14)
+        TF_EXL3X_CASE(15)
+        TF_EXL3X_CASE(16)
+#undef TF_EXL3X_CASE
+        default:
+            __trap();
+    }
+    }
+
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int col = i * 16 + h * 8 + 2 * t;
+            if (g < RR) {
+                red[warp][g][col] = acc[i][h][0];
+                red[warp][g][col + 1] = acc[i][h][1];
+            }
+            if (g + 8 < RR) {
+                red[warp][g + 8][col] = acc[i][h][2];
+                red[warp][g + 8][col + 1] = acc[i][h][3];
+            }
+        }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < RR * NT * 16; idx += W * 32) {
+        const int row = idx / (NT * 16), col = idx % (NT * 16);
+        const int r = rows_sh[row];
+        if (r < 0) continue;
+        float s = red[0][row][col];
+#pragma unroll
+        for (int w = 1; w < W; ++w) s += red[w][row][col];
+        a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+    }
+}
+
 }  // namespace tf_exl3
