@@ -55,7 +55,9 @@ constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
 
-template <int HB, bool FP8 = false>
+// PAGED8: an E4M3 cache on KV pages (pt, pstep bytes apart): a dense chunk is one page, a sparse key's logical token goes
+// through the table to its page; codes and scales then load as on a window, so the arithmetic is the window's.
+template <int HB, bool FP8 = false, bool PAGED8 = false>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
@@ -79,6 +81,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   constexpr int UPT = KT * (LW / 8) / CHUNK_THREADS;  // units a thread moves a tile
   uint2 raw[FP8 ? UPT : 1];
   float rsc[FP8 ? UPT : 1];
+  // on pages: a dense chunk's page (its 512 keys are that page's rows), found once
+  const int64_t dense_page = PAGED8 && !sparse && live ? (int64_t)pt[c] * pstep : 0;
   auto fetch8 = [&](int tile) {
     const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
     const int64_t first = start + tile * KT;
@@ -88,8 +92,16 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
-      rsc[i] = ok ? __ldg(scales + src) : 1.0f;
+      if constexpr (PAGED8) {
+        const int64_t page = sparse ? (ok ? (int64_t)pt[src / CH] * pstep : 0) : dense_page;
+        const int64_t row = src % CH;
+        const float* row_scale = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(scales) + page) + row;
+        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + page + row * LW + u * 8)) : make_uint2(0u, 0u);
+        rsc[i] = ok ? __ldg(row_scale) : 1.0f;
+      } else {
+        raw[i] = ok ? __ldg(reinterpret_cast<const uint2*>(codes + src * LW + u * 8)) : make_uint2(0u, 0u);
+        rsc[i] = ok ? __ldg(scales + src) : 1.0f;
+      }
     }
   };
   auto store8 = [&](int tile) {
@@ -286,6 +298,22 @@ extern "C" __global__ void __launch_bounds__(256)
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
   glm_attn::chunks_wide<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                  po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+}
+
+// The E4M3 variants on KV pages: the stream's table `pt`, its pages `pstep` bytes apart (codes and scales in each).
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
+  glm_attn::chunks_wide<16, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                       po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_32_fp8_paged(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
+                               const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                               int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
+  glm_attn::chunks_wide<32, true, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+                                       po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
