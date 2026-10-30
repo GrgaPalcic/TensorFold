@@ -516,8 +516,8 @@ pub const Lanes = struct {
     }
 
     /// DFlash2: every request's kept rows committed, then one block round for them all (cuda_follow's block step).
-    /// With TF_GLM_DFLASH2_COPY_SKIP=1 a stream whose next window a copy takes (the core asks one draft while its room
-    /// holds more) has its kept rows ingested with no block pass: those drafts would be thrown away.
+    /// A stream whose next window a copy takes (the core asks one draft while its room holds more) has its kept rows
+    /// ingested with no block pass, since those drafts would be thrown away (TF_GLM_DFLASH2_COPY_SKIP=0: the pass runs).
     fn draftBlock(self: *Lanes, requests: []const be.DraftRequest) !void {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;

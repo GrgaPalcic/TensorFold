@@ -173,7 +173,7 @@ pub const Knobs = struct {
     rule: enum { cut, tpm } = .cut,
     trace: bool = false,
     coupled: bool = false, // TF_GLM_DFLASH2_COUPLED=1: a sampled stream's drafts race under its target rows' keyed noise
-    copy_skip: bool = false, // TF_GLM_DFLASH2_COPY_SKIP=1: no block pass for a stream whose next window a copy takes
+    copy_skip: bool = true, // TF_GLM_DFLASH2_COPY_SKIP=0 turns it off: no block pass for a stream a copy drafts next
     force: ?[]const u8 = null, // TF_GLM_DFLASH2_FORCE: a window's rows in turn (diagnostic), e.g. "8,1,8,2,..."
     verify_a: f64 = 9.4, // TF_GLM_VERIFY_MS=a,b,d: the cost seed (measured: sm_120 x8 400 W, 0005-0013, forced widths 1-8)
     verify_b: f64 = 1.31,
@@ -191,7 +191,7 @@ pub const Knobs = struct {
         }
         if (get("TF_GLM_DFLASH2_TRACE")) |v| k.trace = !std.mem.eql(u8, v, "0");
         if (get("TF_GLM_DFLASH2_COUPLED")) |v| k.coupled = !std.mem.eql(u8, v, "0");
-        if (get("TF_GLM_DFLASH2_COPY_SKIP")) |v| k.copy_skip = !std.mem.eql(u8, v, "0");
+        if (get("TF_GLM_DFLASH2_COPY_SKIP")) |v| k.copy_skip = !std.mem.eql(u8, v, "0"); // on unless "0"
         k.force = get("TF_GLM_DFLASH2_FORCE");
         if (get("TF_GLM_VERIFY_MS")) |v| {
             var it = std.mem.splitScalar(u8, v, ',');
