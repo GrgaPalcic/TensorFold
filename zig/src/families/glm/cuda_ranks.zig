@@ -20,6 +20,7 @@ pub const Settings = struct {
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -85,6 +86,12 @@ pub const Settings = struct {
                 },
             };
         };
+        if (get("TF_GLM_ABSORB_MMA")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.numerics.absorb_mma = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_ABSORB_MMA: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -94,6 +101,16 @@ pub const Settings = struct {
             return error.BadSetting;
         }
         return s;
+    }
+};
+
+/// Opt-in prompt kernels whose sums round differently from the default path (a KL check each, off by default).
+pub const Numerics = packed struct(u32) {
+    absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt's absorb_q and expand_v as head-batched tensor-core GEMMs
+    unused: u31 = 0,
+
+    pub fn bits(n: Numerics) u32 {
+        return @bitCast(n);
     }
 };
 
@@ -107,7 +124,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 12, // this struct's version
+    layout: u32 = 13, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -125,6 +142,7 @@ pub const Fingerprint = extern struct {
     max_videos: u32 = 0,
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -151,6 +169,7 @@ pub const Fingerprint = extern struct {
         max_videos,
         max_frames,
         bits,
+        numerics,
         capacity,
         heat_high,
         heat_low,
@@ -182,6 +201,7 @@ pub const Fingerprint = extern struct {
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .numerics = s.numerics.bits(),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -217,6 +237,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_videos",
             "max_frames",
             "bits",
+            "numerics",
             "capacity",
             "heat_high",
             "heat_low",
@@ -325,6 +346,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .numerics => "TF_GLM_ABSORB_MMA",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

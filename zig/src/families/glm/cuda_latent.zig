@@ -33,7 +33,24 @@ fn cdiv(a: usize, b: usize) u32 {
 /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
+    if (mmaRows(set, rows, .{ q, wk, out })) return headsMma(set.glue.latent_mma_kn, glue.latent_mma_smem[0], stream, q, heads * d, wk, out, heads * lw, rows, heads, lw, d);
     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+}
+
+/// TF_GLM_ABSORB_MMA=1 and a prompt's rows (aligned): the tensor-core GEMMs; else the SIMT kernels (always in windows).
+fn mmaRows(set: glue.Set, rows: usize, ptrs: [3]u64) bool {
+    if (!set.absorb_mma or rows < prompt_rows) return false;
+    for (ptrs) |p| if (p % 16 != 0) return false;
+    return true;
+}
+
+/// Head h's out [rows][n] (rows `orow` apart, at + h n) = x [rows][k] (rows `xr` apart, at + h k) by its weight:
+/// 128 x 128 blocks of 8 warps, one head a z.
+fn headsMma(f: cuda.Function, smem: u32, stream: cuda.Stream, x: u64, xr: usize, w: u64, out: u64, orow: usize, rows: usize, heads: usize, n: usize, k: usize) !void {
+    if (n % 128 != 0 or k % 32 != 0 or xr % 8 != 0 or orow % 8 != 0) return error.LatentShape;
+    var a: cuda.Args = .{};
+    inline for (.{ x, @as(i64, @intCast(xr)), w, out, @as(i64, @intCast(orow)), @as(i64, @intCast(rows)), @as(c_int, @intCast(n)), @as(c_int, @intCast(k)) }) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / 128), .y = cdiv(rows, 128), .z = @intCast(heads) }, .block = .{ .x = 256 }, .shared = smem }, stream, &a);
 }
 
 /// The absorb and expand launches: rows in one block in decode windows, prompt_rb a block in prompt chunks.
@@ -47,6 +64,7 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
 /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    if (mmaRows(set, rows, .{ ol, wv, out })) return headsMma(set.glue.latent_mma_nk, glue.latent_mma_smem[1], stream, ol, heads * lw, wv, out, heads * dv, rows, heads, dv, lw);
     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
 }
 

@@ -6,7 +6,8 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+/// `absorb_mma`: TF_GLM_ABSORB_MMA=1 on a prompt pass (absorb_q and expand_v on tensor cores, cuda_latent).
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, absorb_mma: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -65,6 +66,8 @@ pub const Kernels = struct {
     chunks_32_fp8_paged: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
+    latent_mma_kn: cuda.Function, // TF_GLM_ABSORB_MMA (glm_glue_num.cuh): absorb_q's head-batched GEMM, B as [K][N]
+    latent_mma_nk: cuda.Function, // and expand_v's, B as [N][K]
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -77,6 +80,8 @@ pub const Kernels = struct {
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8_paged.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8_paged.allowDynamicShared(chunksSmem(32));
+        try k.latent_mma_kn.allowDynamicShared(latent_mma_smem[0]);
+        try k.latent_mma_nk.allowDynamicShared(latent_mma_smem[1]);
         return k;
     }
 };
@@ -245,6 +250,9 @@ pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u6
     inline for (.{ x, xout, g, post, comb, i64of(rows * d), i64of(d), cint(world) }) |v| a.add(v);
     try rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
 }
+
+/// glm_glue_num.cuh's latent_mma dynamic shared bytes, three stages: [kn (absorb), nk (expand)].
+pub const latent_mma_smem = [2]u32{ 3 * (128 * 40 + 32 * 136) * 2, 3 * (128 * 40 + 128 * 40) * 2 };
 
 /// glue.rank_sum: out bf16 = partials summed rank 0 first, `me`'s from `own`, others' from `peers` in rank order.
 pub fn rankSum(set: Set, stream: cuda.Stream, own: u64, peers: u64, peer_stride: usize, out: u64, me: usize, rows: usize, d: usize, world: usize) !void {

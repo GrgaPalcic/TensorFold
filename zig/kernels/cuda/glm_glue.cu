@@ -9,3 +9,4 @@
 #include "glm_glue_bmm.cuh"
 #include "glm_glue_attn.cuh"
 #include "glm_glue_p2p.cuh"
+#include "glm_glue_num.cuh"
