@@ -18,7 +18,7 @@ const kda_block = @import("cuda_kda_block.zig");
 /// A prompt chunk's rows (decode.PREFILL_ROWS).
 pub const prefill_rows = 2048;
 /// A decode window's rows (Engine's max_rows).
-pub const window_rows = 8;
+pub const window_rows = 16;
 /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
 pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
