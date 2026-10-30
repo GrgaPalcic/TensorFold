@@ -8,6 +8,7 @@ const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const cuda = @import("cuda");
+const rule = @import("draft_rule.zig");
 
 const be = lanes.backend;
 
@@ -38,6 +39,10 @@ const Lane = struct {
     held_n: usize = 0,
     first: ?u64 = null,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    raw: [max_held]f64 = undefined, // DFlash2's selector chances as drawn (chances may be cut or calibrated)
+    lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
+    windows: u64 = 0, // DFlash2 windows drafted (TF_GLM_DFLASH2_FORCE's turn)
+    draft_ms: f64 = 0, // the drafter's last pass for this stream (shared passes: the whole pass)
 };
 
 pub const Lanes = struct {
@@ -51,6 +56,9 @@ pub const Lanes = struct {
     next: u64 = 0,
     bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
     bits_dev: u64 = 0,
+    knobs: ?rule.Knobs = null, // the window rule's environment, read at the first DFlash2 window (rank 0 alone)
+    cal: [2]rule.Calibration = undefined, // landing by selector chance: greedy streams', sampled streams'
+    costs: rule.Costs = undefined, // verify ms by rows, fit on lone windows
 
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
@@ -122,7 +130,22 @@ pub const Lanes = struct {
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
+            .copy_match = copyMatch(),
+            .own_copy_rates = copyRates(),
         };
+    }
+
+    /// TF_GLM_COPY_MATCH: matching context tokens a copy needs before it takes a round's window (8, the core's).
+    fn copyMatch() i64 {
+        const v = std.c.getenv("TF_GLM_COPY_MATCH") orelse return 8;
+        const n = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return 8;
+        return std.math.clamp(n, 1, 1 << 20);
+    }
+
+    /// TF_GLM_COPY_RATES=own: a copy window is priced by its stream's own copies, not the core's 0.94 prior.
+    fn copyRates() bool {
+        const v = std.c.getenv("TF_GLM_COPY_RATES") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "own");
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -412,7 +435,9 @@ pub const Lanes = struct {
             const bits = try self.putBits(0, rows, w.masks); // before the step goes out: a refusal after it strands the ranks
             self.x.e.structured = bits != 0;
             defer self.x.e.structured = false;
+            const t0 = self.now();
             try self.x.verify(ids[0..rows], sampled[0..rows], bits);
+            self.observe(l, w, ids[1..rows], sampled[0..rows], self.since(t0), true);
             @memcpy(o.sampled[0..rows], sampled[0..rows]);
             @memcpy(o.drafts[0..drafts.len], drafts);
             l.pending_rows = rows;
@@ -447,8 +472,11 @@ pub const Lanes = struct {
         }
         self.x.e.structured = structured; // one window under a grammar: the whole step draws from whole rows
         defer self.x.e.structured = false;
+        const t0 = self.now();
         try self.x.verifyShared(parts[0..windows.len]);
+        const ms = self.since(t0);
         self.shared += 1;
+        for (windows, parts[0..windows.len], lane[0..windows.len]) |w, p, l| self.observe(l, w, p.ids[1..], p.out, ms, false);
         for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
             const rows = p.ids.len;
             @memcpy(o.sampled[0..rows], p.out);
@@ -492,6 +520,7 @@ pub const Lanes = struct {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
+        const k = self.tuned();
         for (requests, 0..) |r, i| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
@@ -502,20 +531,110 @@ pub const Lanes = struct {
                 n = rows.len;
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
+            const keyed: ?@import("dflash_select.zig").Keyed = if (!k.coupled or !sampledOf(r.stream)) null else .{
+                .seed = r.stream.sampling.?.seed,
+                .inv_t = @floatCast(1.0 / @max(r.stream.sampling.?.temperature, 1e-6)),
+                .top_p = @floatCast(r.stream.sampling.?.top_p),
+            };
+            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances, .keyed = keyed };
             held[i] = l;
         }
+        const t0 = self.now();
         try self.x.block(reqs[0..requests.len]);
+        const ms = self.since(t0);
+        const alone = self.lanes.count() == 1;
         const cut = confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);
-            var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
-            for (l.chances[0..l.held_n], 0..) |*c, j| {
-                chain *= c.*;
-                if (j > 0 and chain < cut) c.* = 0; // held with chance 0: the window sizing leaves it out
-                if (c.* == 0) chain = 0;
+            l.draft_ms = ms;
+            @memcpy(l.raw[0..l.held_n], l.chances[0..l.held_n]);
+            if (alone) self.costs.observeDraft(ms, 0.1);
+            if (k.forced(l.windows)) |rows| { // a diagnostic sweep: this window's rows whatever the chances
+                for (l.chances[0..l.held_n], 0..) |*c, j| c.* = if (j + 1 < rows) 1 else 0;
+            } else if (k.rule == .tpm) {
+                self.calibrated(l, sampledOf(r.stream), alone);
+            } else {
+                var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
+                for (l.chances[0..l.held_n], 0..) |*c, j| {
+                    chain *= c.*;
+                    if (j > 0 and chain < cut) c.* = 0; // held with chance 0: the window sizing leaves it out
+                    if (c.* == 0) chain = 0;
+                }
+            }
+            l.windows += 1;
+        }
+    }
+
+    /// TF_GLM_DRAFT_RULE=tpm: each held draft's landing chance from the calibration and the stream's lean; a lone
+    /// stream's window then offers the drafts that pay (chance 1, the rest 0), a shared round's the calibrated chances.
+    fn calibrated(self: *Lanes, l: *Lane, sampled: bool, alone: bool) void {
+        const k = &self.knobs.?;
+        const cal = &self.cal[@intFromBool(sampled)];
+        var p: [max_held]f64 = undefined;
+        for (p[0..l.held_n], l.raw[0..l.held_n]) |*o, c| o.* = l.lean.chance(cal.rate(c));
+        if (!alone) {
+            @memcpy(l.chances[0..l.held_n], p[0..l.held_n]);
+            return;
+        }
+        const fit = self.costs.line(0.2);
+        const n = rule.offer(p[0..l.held_n], l.lean.lambda(k.lambda), fit.a, fit.b);
+        for (l.chances[0..l.held_n], 0..) |*c, j| c.* = if (j < n) 1 else 0;
+    }
+
+    /// The rule's knobs and state, made at the first DFlash2 window.
+    fn tuned(self: *Lanes) *const rule.Knobs {
+        if (self.knobs == null) {
+            const k = rule.Knobs.read(&@import("cuda_ranks.zig").environment);
+            self.knobs = k;
+            self.cal = .{ rule.Calibration.init(k.prior, 8), rule.Calibration.init(k.prior_sampled, 8) };
+            self.costs = rule.Costs.init(k.verify_a, k.verify_b, 4, k.draft_ms);
+            if (k.rule == .tpm or k.trace or k.force != null)
+                std.log.info("dflash2 windows: rule {s}, trace {}, forced {s}, verify seed {d:.2} + {d:.2} ms a row", .{ @tagName(k.rule), k.trace, k.force orelse "-", k.verify_a, k.verify_b });
+        }
+        return &self.knobs.?;
+    }
+
+    fn now(self: *const Lanes) i96 {
+        return std.Io.Clock.awake.now(self.x.e.io).toNanoseconds();
+    }
+
+    fn since(self: *const Lanes, t0: i96) f64 {
+        return @as(f64, @floatFromInt(self.now() - t0)) / 1e6;
+    }
+
+    /// A verified window: DFlash2's drafts to the first miss feed the calibration, a lone window the costs, a line the
+    /// trace (TF_GLM_DFLASH2_TRACE=1: rows, landed, kind, sampled, verify ms, drafter ms, slot, raw chances).
+    fn observe(self: *Lanes, l: *Lane, w: be.Window, drafts: []const u32, sampled: []const u32, ms: f64, alone: bool) void {
+        if (self.x.e.drafter == null) return;
+        const k = self.tuned();
+        var landed: usize = 0;
+        while (landed < drafts.len and drafts[landed] == sampled[landed]) landed += 1;
+        const mode = sampledOf(w.stream);
+        const head = w.held > 0;
+        if (head) {
+            const cal = &self.cal[@intFromBool(mode)];
+            for (0..@min(drafts.len, landed + 1)) |j| {
+                const hit = j < landed;
+                l.lean.observe(cal.rate(l.raw[j]), hit, k.step);
+                cal.observe(l.raw[j], hit, k.decay);
             }
         }
+        if (alone) self.costs.observe(drafts.len + 1, ms, 0.98);
+        l.lean.round(landed + 1, ms + l.draft_ms, 0.1);
+        if (!k.trace) return;
+        var buf: [8 * max_held]u8 = undefined;
+        var at: usize = 0;
+        if (head) for (l.raw[0..l.held_n]) |c| {
+            const t = std.fmt.bufPrint(buf[at..], "{d:.3},", .{c}) catch break;
+            at += t.len;
+        };
+        const kind: u8 = if (head) 'h' else if (drafts.len > 0) 'c' else 'n';
+        std.log.info("dft r={d} a={d} k={c} g={d} v={d:.3} d={d:.3} s={d} w={d} lam={d:.4} c={s}", .{ drafts.len + 1, landed, kind, @intFromBool(mode), ms, l.draft_ms, l.slot, @intFromBool(alone), l.lean.lambda(k.lambda), buf[0..at] });
+    }
+
+    /// A stream drawing keyed samples (temperature over 0) rather than greedy picks.
+    fn sampledOf(s: *const lanes.Stream) bool {
+        return if (s.sampling) |p| p.temperature > 0 else false;
     }
 
     /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (glm_cuda's 0.7).

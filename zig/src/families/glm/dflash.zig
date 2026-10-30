@@ -84,7 +84,7 @@ pub const Slot = struct {
 };
 
 /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null };
+pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, keyed: ?select.Keyed = null };
 
 /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
 pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
