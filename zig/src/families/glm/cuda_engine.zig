@@ -403,7 +403,9 @@ pub const Engine = struct {
         if (f.prof) |p| p.mark(e.stream, .draw);
         if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
         stamp = prof_mod.span(f.prof, e.stream, .mtp);
-        if (e.mtp) {
+        // With a drafter (DFlash2) every draft is its block's (cuda_lanes draftFn); the target MTP layer's caches are never
+        // read, so the prompt does not absorb into them (mtp_len stays 0, as snapshots and the next prompt expect).
+        if (e.mtp and e.drafter == null) {
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
                 const mp = f.prof;
