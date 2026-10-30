@@ -118,6 +118,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     if (e.drafter) |dr| { // a's rows from its taps_prefill, then b's from the twin's, each as its own chunk would
         try dr.prompt(e, e.slot, start, ra, len);
         try dr.promptFrom(e, e.slot, start + ra, rb, len, pair.taps.?.ptr);
+        if (start + ra + rb == len) try dr.ringDigest(e, e.slot, len);
     }
     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
     try fa.commit(ra);

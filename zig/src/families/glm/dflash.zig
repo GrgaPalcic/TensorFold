@@ -243,6 +243,19 @@ pub const Drafter = struct {
         s.* = .{ .ring = s.ring, .from = s.from, .first = s.first, .end = s.end, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
     }
 
+    /// TF_GLM_DFLASH2_RING_DIGEST=1 (a check, off by default): once a prompt is in, slot `i`'s whole context ring hashed
+    /// and logged for prompts of 8192 ids or more, so two runs (paired or a chunk at a time) can show the same context.
+    pub fn ringDigest(dr: *Drafter, e: anytype, i: u32, len: usize) !void {
+        const v = std.c.getenv("TF_GLM_DFLASH2_RING_DIGEST") orelse return;
+        if (!std.mem.eql(u8, std.mem.span(v), "1") or len < 8192) return; // long prompts only: a short one's time stays clean
+        const s = try dr.slot(i);
+        try e.stream.synchronize();
+        const host = try dr.gpa.alloc(u8, ring_bytes);
+        defer dr.gpa.free(host);
+        try s.ring.?.download(0, host);
+        std.log.info("dflash2: ring digest slot {d} after a {d}-id prompt: {x:0>16}", .{ i, len, std.hash.Wyhash.hash(0, host) });
+    }
+
     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
     pub fn prompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize) !void {
         return dr.promptSegment(e, i, start, rows, len, 0);

@@ -456,6 +456,7 @@ pub const Engine = struct {
         stamp.end();
         stamp = prof_mod.span(f.prof, e.stream, .drafter);
         if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
+        if (e.drafter) |dr| if (start + rows == len) try dr.ringDigest(e, e.slot, len);
         stamp.end();
         stamp = prof_mod.span(f.prof, e.stream, .draw);
         const last = start + rows == len;
