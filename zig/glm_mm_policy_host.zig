@@ -9,8 +9,10 @@ const kernels: mm.Kernels = .{
     .tile = .{},
     .tile_packed = @splat(.{}),
     .pair = @splat(.{}), // decode windows' two-problem launches (not this test's)
-    .packed_prompt = @splat(.{}), // the two-stage packed prompt kernels (not this test's)
+    .packed_prompt = @splat(.{ .id = 256 }),
     .pdl = false,
+    .q8 = .{ .id = 2048 },
+    .mm8a8 = .{ .{ .{ .id = 4096 }, .{ .id = 8192 } }, .{ .{ .id = 4097 }, .{ .id = 8193 } } },
 };
 test "verify and draft windows keep shape-selected split K at every width" {
     for ([_]u8{ 16, 4, 6, 8 }) |bits| for ([_]usize{ 1, 2, 3, 4, 8, 16, 17, 31, 32 }) |rows| {
@@ -45,4 +47,38 @@ test "fixed K prompt experiment uses the same shape split across bucket, offset 
         }
     };
     try std.testing.expect(!kernels.prompt_fixed_k);
+}
+
+test "TF_GLM_W8A8: only packed 8-bit prompt calls inside the scratch quantize their rows, then one IMMA launch" {
+    var k = kernels;
+    k.a8 = .{ .q = 1 << 20, .xs = 1 << 24, .rows = 2048, .k = 4096 };
+    for ([_]u8{ 16, 4, 6, 8 }) |bits| for ([_]usize{ 1, 127, 128, 768, 1024, 1025, 2048 }) |rows| for ([_]bool{ false, true }) |prompt| {
+        cuda.count = 0;
+        try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = bits }, 16384, 32768, rows, false, prompt);
+        if (bits == 8 and prompt) {
+            try std.testing.expectEqual(@as(usize, 2), cuda.count);
+            try std.testing.expectEqual(@as(u32, 2048), cuda.symbols[0]);
+            try std.testing.expectEqual(@as(u32, if (rows > 1024) 8192 else 4096), cuda.symbols[1]);
+            try std.testing.expectEqual(@as(u32, @intCast((rows + 127) / 128)), cuda.configs[1].grid.x); // row blocks fastest
+        } else for (cuda.symbols[0..cuda.count]) |sym| try std.testing.expect(sym != 2048 and sym != 4096 and sym != 8192);
+    };
+    // TF_GLM_W8A8=32: the 32-group kernels
+    k.a8.?.gs = 32;
+    cuda.count = 0;
+    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, 2048, false, true);
+    try std.testing.expectEqual(@as(u32, 8193), cuda.symbols[1]);
+    k.a8.?.gs = 64;
+    // a K width the diagnostic skips: the bf16-row kernels
+    k.a8.?.skip_k[0] = 2048;
+    cuda.count = 0;
+    try mm.matmul(&k, .{}, 4096, 2048, .{ .w = 8192, .s = 12288, .n = 4096, .k = 2048, .bits = 8 }, 16384, 32768, 2048, false, true);
+    try std.testing.expectEqual(@as(usize, 1), cuda.count);
+    k.a8.?.skip_k[0] = 0;
+    // past the scratch (rows or K): the bf16-row kernels
+    for ([_][2]usize{ .{ 4096, 2048 }, .{ 2048, 8192 } }) |rk| {
+        cuda.count = 0;
+        try mm.matmul(&k, .{}, 4096, rk[1], .{ .w = 8192, .s = 12288, .n = 4096, .k = rk[1], .bits = 8 }, 16384, 32768, rk[0], false, true);
+        try std.testing.expectEqual(@as(usize, 1), cuda.count);
+        try std.testing.expectEqual(@as(u32, 256), cuda.symbols[0]);
+    }
 }

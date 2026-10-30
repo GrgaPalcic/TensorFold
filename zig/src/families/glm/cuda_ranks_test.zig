@@ -316,6 +316,13 @@ test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusa
 }
 
 fn numeric(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "1";
+    if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "0";
+    return null;
+}
+
+fn numeric32(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_W8A8")) return "32";
     if (std.mem.eql(u8, name, "TF_GLM_ABSORB_MMA")) return "1";
     return null;
 }
@@ -330,9 +337,11 @@ test "the opt-in prompt numerics: off by default, read by name, in the fingerpri
     const none = try Settings.read(&typo_free, &problem);
     try std.testing.expectEqual(@as(u32, 0), none.numerics.bits());
     const s = try Settings.read(&numeric, &problem);
-    try std.testing.expect(s.numerics.absorb_mma);
+    try std.testing.expect(s.numerics.w8a8 and !s.numerics.absorb_mma);
     const f = Fingerprint.of(2, 0, s, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
     try std.testing.expectEqual(s.numerics.bits(), f.numerics);
+    const g = try Settings.read(&numeric32, &problem);
+    try std.testing.expect(g.numerics.w8a8 and g.numerics.w8a8_g32 and g.numerics.absorb_mma);
     try std.testing.expectError(error.BadSetting, Settings.read(&numericTypo, &problem));
     try std.testing.expectEqualStrings("TF_GLM_ABSORB_MMA: 0 or 1", problem);
 }

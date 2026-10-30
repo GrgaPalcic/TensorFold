@@ -128,6 +128,7 @@ pub const Engine = struct {
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -219,7 +220,8 @@ pub const Engine = struct {
         }
         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
         errdefer e.bp.deinit();
-        e.initNumerics();
+        try e.initNumerics();
+        errdefer if (e.a8_buf) |*b| b.free();
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity, !o.settings.split); // split: one room
         errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -273,6 +275,7 @@ pub const Engine = struct {
         e.bd.deinit();
         if (e.pair) |*p| p.deinit();
         e.bp.deinit();
+        if (e.a8_buf) |*b| b.free();
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
@@ -288,11 +291,33 @@ pub const Engine = struct {
 
     const freeProfs = @import("cuda_engine_prof.zig").freeProfs;
 
-    /// The opt-in numerics flags (cuda_ranks.Numerics), named once at startup.
-    fn initNumerics(e: *Engine) void {
+    /// The widest K a W8A8 prompt call takes from the scratch (TP2's DSA o_proj: 32 heads of 256); wider ones stay bf16.
+    const a8_max_k = 8192;
+
+    /// The opt-in numerics flags (cuda_ranks.Numerics), named once at startup; TF_GLM_W8A8's scratch for one pass.
+    fn initNumerics(e: *Engine) !void {
         const n = e.settings.numerics;
         if (n.bits() == 0) return;
-        std.log.warn("opt-in prompt numerics: absorb/expand {s}", .{if (n.absorb_mma) "tensor cores (TF_GLM_ABSORB_MMA)" else "SIMT"});
+        if (n.w8a8 and e.settings.tiled and (e.settings.dense_bits == 8 or e.settings.head_bits == 8)) {
+            const gs: usize = if (n.w8a8_g32) 32 else 64;
+            const sz = mm_mod.A8.bytes(fw.prefill_rows, a8_max_k, gs);
+            const buf = try cuda.DeviceBuffer.alloc(e.d, sz[0] + sz[1]);
+            e.a8_buf = buf;
+            e.m.mm.a8 = .{ .q = buf.ptr, .xs = buf.ptr + sz[0], .rows = fw.prefill_rows, .k = a8_max_k, .gs = gs };
+            if (std.c.getenv("TF_GLM_W8A8_SKIP_K")) |v| { // diagnostic: these K widths keep bf16 rows (e.g. 1024,6144,8192)
+                var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+                var i: usize = 0;
+                while (it.next()) |tok| : (i += 1) {
+                    if (i == 4) break;
+                    e.m.mm.a8.?.skip_k[i] = std.fmt.parseInt(usize, tok, 10) catch 0;
+                }
+                std.log.warn("TF_GLM_W8A8_SKIP_K={s}: those K widths keep bf16 rows", .{std.mem.span(v)});
+            }
+        } else if (n.w8a8) std.log.warn("TF_GLM_W8A8=1 needs 8-bit packed linears (TF_GLM_DENSE_BITS=8, TF_GLM_MM=1); prompts stay on bf16 rows", .{});
+        std.log.warn("opt-in prompt numerics: absorb/expand {s}, packed 8-bit linears on {s} rows", .{
+            if (n.absorb_mma) "tensor cores (TF_GLM_ABSORB_MMA)" else "SIMT",
+            if (e.m.mm.a8) |a| (if (a.gs == 32) "int8, a scale per 32 (TF_GLM_W8A8=32)" else "int8, a scale per 64 (TF_GLM_W8A8=1)") else "bf16",
+        });
     }
 
     pub fn exchange(e: *const Engine) fw.Exchange {

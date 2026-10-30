@@ -99,6 +99,15 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        if (get("TF_GLM_W8A8")) |v| {
+            if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "64")) s.numerics.w8a8 = true else if (std.mem.eql(u8, v, "32")) {
+                s.numerics.w8a8 = true;
+                s.numerics.w8a8_g32 = true;
+            } else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_W8A8: 0, 1 (a scale per 64 inputs) or 32 (per 32)";
+                return error.BadSetting;
+            }
+        }
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -114,7 +123,9 @@ pub const Settings = struct {
 /// Opt-in prompt kernels whose sums round differently from the default path (a KL check each, off by default).
 pub const Numerics = packed struct(u32) {
     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt's absorb_q and expand_v as head-batched tensor-core GEMMs
-    unused: u31 = 0,
+    w8a8: bool = false, // TF_GLM_W8A8=1: packed 8-bit prompt linears on int8 activations (per row and 64-group scales)
+    w8a8_g32: bool = false, // TF_GLM_W8A8=32: the same with an activation scale per 32 inputs
+    unused: u29 = 0,
 
     pub fn bits(n: Numerics) u32 {
         return @bitCast(n);
@@ -358,7 +369,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
-        .numerics => "TF_GLM_ABSORB_MMA",
+        .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

@@ -322,3 +322,6 @@ extern "C" __global__ void glm_mm_tile16(const __nv_bfloat16* __restrict__ src, 
 #pragma unroll
     for (int v = 0; v < 16; ++v) dst[c * 16 + v] = src[(long long)n * K + g * 64 + frag_k(lane, v)];
 }
+
+// Opt-in W8A8 prompt linears (TF_GLM_W8A8=1): see glm_mm_a8.cuh.
+#include "glm_mm_a8.cuh"

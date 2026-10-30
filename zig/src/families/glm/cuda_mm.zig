@@ -48,9 +48,16 @@ pub const Kernels = struct {
     tile_packed: [3]cuda.Function, // glm_mm_tile4/6/8: packed rows and their scales into the tiles
     prompt_fixed_k: bool = false, // opt-in prompt experiment; never selected from the number of batched rows
     pdl: bool, // dependent launches: a matmul's weights stream in while the kernel before it finishes
+    q8: cuda.Function, // glm_q8_rows: a prompt's bf16 rows to int8 with a scale per row and 64- or 32-group (TF_GLM_W8A8)
+    mm8a8: [2][2]cuda.Function, // [64-, 32-groups][glm_mm8a8_64s3r (to 1024 rows), _128s3r]: int8 rows by the 8-bit codes
+    a8: ?A8 = null, // TF_GLM_W8A8=1: the int8 rows' scratch; null: packed prompts stay on bf16 rows (the default)
 
     pub fn load(m: cuda.Module) !Kernels {
-        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true };
+        var k: Kernels = .{ .by_rows = undefined, .packed_rows = undefined, .packed_prompt = undefined, .pair = undefined, .tile_packed = undefined, .prompt = try m.function("glm_mm16_rows"), .reduce = try m.function("glm_mm_reduce"), .tile = try m.function("glm_mm_tile16"), .pdl = true, .q8 = try m.function("glm_q8_rows"), .mm8a8 = .{
+            .{ try m.function("glm_mm8a8_64s3r"), try m.function("glm_mm8a8_128s3r") },
+            .{ try m.function("glm_mm8a8_64s3r_g32"), try m.function("glm_mm8a8_128s3r_g32") },
+        } };
+        for (k.mm8a8, [2]usize{ 64, 32 }) |fs, gs| for (fs, a8_bn) |f, bn| try f.allowDynamicShared(a8Shared(bn, gs));
         inline for (.{ "glm_mm16_16", "glm_mm16_32", "glm_mm16_64", "glm_mm16_128" }, 0..) |name, i| {
             k.by_rows[i] = try m.function(name);
             try k.by_rows[i].allowDynamicShared(smem(bucket(i)));
@@ -73,6 +80,65 @@ pub const Kernels = struct {
         return k;
     }
 };
+
+/// TF_GLM_W8A8's scratch for one prompt pass: int8 rows [rows][k] and their fp32 scales [k / gs][rows to 4] (+ 128);
+/// `gs` the activations' group: 64 (TF_GLM_W8A8=1) or 32 (=32).
+pub const A8 = struct {
+    q: u64,
+    xs: u64,
+    rows: usize,
+    k: usize,
+    gs: usize = 64,
+    skip_k: [4]usize = @splat(0), // TF_GLM_W8A8_SKIP_K (diagnostic): calls of these K widths keep bf16 rows
+
+    fn takes(a: A8, rows: usize, k: usize) bool {
+        if (rows > a.rows or k > a.k) return false;
+        for (a.skip_k) |x| if (x == k) return false;
+        return true;
+    }
+
+    pub fn bytes(rows: usize, k: usize, gs: usize) [2]usize {
+        return .{ std.mem.alignForward(usize, rows * k, 256), ((k / gs) * std.mem.alignForward(usize, rows, 4) + 128) * 4 };
+    }
+};
+
+const a8_bn = [2]usize{ 64, 128 };
+
+/// glm_mm8a8's three stages: 128 int8 rows of 64 and their scales (64 / gs a row), `bn` columns of codes and theirs.
+fn a8Shared(bn: usize, gs: usize) u32 {
+    return @intCast(3 * (128 * 64 + 128 * 4 * (64 / gs) + bn / 8 * 512 + bn / 8 * 16));
+}
+
+/// A packed 8-bit prompt call on int8 rows (TF_GLM_W8A8): the rows quantized into the scratch, then the IMMA kernel.
+fn matmulA8(k: *const Kernels, a: A8, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, out: u64, m: usize, wide: bool) !void {
+    const mp = std.mem.alignForward(usize, m, 4);
+    const groups = m * (w.k / 64);
+    var q: cuda.Args = .{};
+    q.add(x);
+    q.add(@as(c_longlong, @intCast(ldx)));
+    q.add(a.q);
+    q.add(a.xs);
+    q.add(@as(c_int, @intCast(mp)));
+    q.add(@as(c_int, @intCast(m)));
+    q.add(@as(c_int, @intCast(w.k)));
+    q.add(@as(c_int, @intCast(a.gs)));
+    try cuda.launch.launch(k.q8, .{ .grid = .{ .x = @intCast((groups + 31) / 32) }, .block = .{ .x = 256 } }, s, &q);
+    const wide_tile = m > 1024; // 128 columns a block for a whole pass, 64 for pieces (the faster of each, measured)
+    const bn = a8_bn[@intFromBool(wide_tile)];
+    var g: cuda.Args = .{};
+    g.add(a.q);
+    g.add(a.xs);
+    g.add(@as(c_int, @intCast(mp)));
+    g.add(w.w);
+    g.add(w.s);
+    g.add(out);
+    g.add(@as(c_int, @intFromBool(wide)));
+    g.add(@as(c_int, @intCast(m)));
+    g.add(@as(c_int, @intCast(w.n)));
+    g.add(@as(c_int, @intCast(w.k)));
+    // row blocks fastest
+    try cuda.launch.launch(k.mm8a8[@intFromBool(a.gs == 32)][@intFromBool(wide_tile)], .{ .grid = .{ .x = @intCast((m + 127) / 128), .y = @intCast((w.n + bn - 1) / bn) }, .block = .{ .x = 256 }, .shared = a8Shared(bn, a.gs), .pdl = k.pdl }, s, &g);
+}
 
 const split_target = 192; // column tiles times K slices a launch aims at (the GB10's SMs, a few blocks each)
 
@@ -117,6 +183,11 @@ pub fn matmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, w: Tiled, o
     while (done < m) { // windows to 64 rows a launch with K slices; prompts in one launch of 128-row blocks, one slice
         const big = if (one) !k.prompt_fixed_k else m - done >= 128;
         const rows = if (big) m - done else @min(m - done, 64);
+        if (big and one and w.bits == 8) if (k.a8) |a| if (a.takes(rows, w.k)) {
+            try matmulA8(k, a, s, x + done * ldx * 2, ldx, w, out + done * w.n * @as(usize, if (wide) 4 else 2), rows, wide);
+            done += rows;
+            continue;
+        };
         const i: usize = if (big) 3 else if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
         const bm = bucket(i);
         const sk = if (big) 1 else splitK(w.n, w.k); // a prompt's blocks share each weight tile in L2: no slices
