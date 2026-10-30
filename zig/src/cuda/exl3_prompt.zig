@@ -8,7 +8,9 @@ const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
 
 pub const tile = 64;
-pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize };
+/// `y` [pairs][dims] fp32 when `yrow` is 0; with `yrow` set the caller points `y` at its own slot rows ([rows][yrow][dims],
+/// pair p = row * slots + slot at row * yrow + slot) and the down kernel writes there, so no copy follows.
+pub const Scratch = struct { xg: u64, xu: u64, xd: u64, y: u64, rows: usize, slots: usize, yrow: usize = 0 };
 /// A group's verified half-bit width: its own field, else uniform_k2; 0 when unverified or the two disagree.
 fn verified(group: u32, uniform: u32) u32 {
     if (group == 0) return uniform;
@@ -35,23 +37,34 @@ fn aligned(n: usize) !usize {
     return (try add(n, 255)) / 256 * 256;
 }
 fn sizes(l: ex.Layer, rows: usize, slots: usize) ![4]usize {
+    return sizesFor(l, rows, slots, true);
+}
+/// `own_y` false: the caller's slot rows take the output (Scratch.yrow), so the arena holds no y.
+fn sizesFor(l: ex.Layer, rows: usize, slots: usize, own_y: bool) ![4]usize {
     if (!eligible(l) or rows == 0 or slots == 0 or slots > 32 or l.experts == 0 or l.experts > grouped.max_experts) return error.Exl3Shape;
     const pairs = try mul(rows, slots);
     if (pairs > std.math.maxInt(i32) or l.dims > std.math.maxInt(i32) or l.width > std.math.maxInt(i32)) return error.Exl3Shape;
     const rotated = try aligned(try mul(try mul(if (l.shared_input) rows else pairs, l.dims), 2));
-    return .{ rotated, if (l.shared_input) 0 else rotated, try aligned(try mul(try mul(pairs, l.width), 2)), try aligned(try mul(try mul(pairs, l.dims), 4)) };
+    return .{ rotated, if (l.shared_input) 0 else rotated, try aligned(try mul(try mul(pairs, l.width), 2)), if (own_y) try aligned(try mul(try mul(pairs, l.dims), 4)) else 0 };
 }
 pub fn bytes(l: ex.Layer, rows: usize, slots: usize) !usize {
-    const ns = try sizes(l, rows, slots);
+    return bytesFor(l, rows, slots, true);
+}
+pub fn bytesFor(l: ex.Layer, rows: usize, slots: usize, own_y: bool) !usize {
+    const ns = try sizesFor(l, rows, slots, own_y);
     var sum: usize = 0;
     for (ns) |n| sum = try add(sum, n);
     return sum;
 }
 pub fn scratch(base: u64, l: ex.Layer, rows: usize, slots: usize) !Scratch {
-    const ns = try sizes(l, rows, slots);
-    const total = try bytes(l, rows, slots);
+    return scratchFor(base, l, rows, slots, true);
+}
+/// `own_y` false: `y` is 0 until the caller sets it and `yrow` (its slot rows).
+pub fn scratchFor(base: u64, l: ex.Layer, rows: usize, slots: usize, own_y: bool) !Scratch {
+    const ns = try sizesFor(l, rows, slots, own_y);
+    const total = try bytesFor(l, rows, slots, own_y);
     _ = std.math.add(u64, base, total) catch return error.Exl3Shape;
-    return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = base + ns[0] + ns[1] + ns[2], .rows = rows, .slots = slots };
+    return .{ .xg = base, .xu = if (l.shared_input) base else base + ns[0], .xd = base + ns[0] + ns[1], .y = if (own_y) base + ns[0] + ns[1] + ns[2] else 0, .rows = rows, .slots = slots };
 }
 fn go(f: Function, s: Stream, grid: [3]usize, threads: u32, values: anytype) !void {
     var args: launch.Args = .{};
@@ -78,6 +91,7 @@ pub const Kernels = struct {
     }
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
+        if (sc.y == 0 or (sc.yrow != 0 and sc.yrow < sc.slots)) return error.Exl3Shape;
         _ = try bytes(l, rows, sc.slots);
         const pairs = rows * sc.slots;
         const w = widths(l);
@@ -91,7 +105,7 @@ pub const Kernels = struct {
         }
         const items = grouped.maxItems(pairs, l.experts, tile);
         try go(if (w.gu == 6) k.gateup_k6 else k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
-        try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots) });
+        try go(if (w.d == 6) k.down_k6 else k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots), i(sc.yrow) });
     }
 };
 

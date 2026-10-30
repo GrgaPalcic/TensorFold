@@ -209,7 +209,7 @@ pub const Prompt = struct {
             inline for (.{ p.sc.xg, p.sc.xu, p.l.gate, p.l.up, p.p.items, p.p.counts, p.p.members, p.l.svh_g, p.l.svh_u, p.l.suh_d, p.sc.xd, @as(i32, D), @as(i32, N), @as(i32, if (p.l.shared_input) K else 1), p.l.limit, p.l.act_mode }) |v| a.add(v);
             try cuda.launch.launch(if (w.gu == 6) k.gateup_k6 else k.gateup, .{ .grid = .{ .x = N / 128, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 } }, p.c.s, &a);
         } else {
-            inline for (.{ p.sc.xd, p.l.down, p.p.items, p.p.counts, p.p.members, p.l.svh_d, p.sc.y, @as(i32, N), @as(i32, D), @as(i32, K) }) |v| a.add(v);
+            inline for (.{ p.sc.xd, p.l.down, p.p.items, p.p.counts, p.p.members, p.l.svh_d, p.sc.y, @as(i32, N), @as(i32, D), @as(i32, K), @as(i32, 0) }) |v| a.add(v);
             try cuda.launch.launch(if (w.d == 6) k.down_k6 else k.down, .{ .grid = .{ .x = D / 256, .y = @intCast(items), .z = 1 }, .block = .{ .x = 256 } }, p.c.s, &a);
         }
     }

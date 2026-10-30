@@ -497,7 +497,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const 
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
 template <int K2>
 __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp, int lane) {
+        float* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
+        int lane) {
     float acc[TMT][TNB][4];
     tmain<1, TPM, K2>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
     float* Ed = reinterpret_cast<float*>(smem_raw);
@@ -514,7 +515,9 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
                 fwht128(v, lane);
-                float* o = y + (size_t)p * D + n;
+                // yrow 0: y [pairs][D]; else pair p = row * ys + slot lands in y [rows][yrow][D] (the MoE slot rows, no copy)
+                const size_t at = yrow ? (size_t)(p / ys) * yrow + p % ys : (size_t)p;
+                float* o = y + at * D + n;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
             }
@@ -524,22 +527,22 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
 
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys) {
+        float* __restrict__ y, int K, int D, int ys, int yrow) {
 
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<8>()];
     __shared__ int rows_sh[TPM];
     TF_EXL3_PROMPT_DOWN_HEAD()
-    prompt_down<8>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+    prompt_down<8>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane);
 }
 
 // The same at 3 bits (3-bit mcg down), the arguments tf_exl3_prompt_down's.
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down_k6(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,
         const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
-        float* __restrict__ y, int K, int D, int ys) {
+        float* __restrict__ y, int K, int D, int ys, int yrow) {
 
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes<6>()];
     __shared__ int rows_sh[TPM];
     TF_EXL3_PROMPT_DOWN_HEAD()
-    prompt_down<6>(Xd, Td, svh_d, y, K, D, smem_raw, rows_sh, cb, e, cnt, warp, lane);
+    prompt_down<6>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane);
 }
 #undef TF_EXL3_PROMPT_DOWN_HEAD

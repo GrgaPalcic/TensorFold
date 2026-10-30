@@ -220,8 +220,10 @@ pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
-/// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
-pub const chunk_rows = 1024;
+/// Rows a call to the common experts takes: each call decodes every expert's weights, so a prompt pass takes one call
+/// (it follows cuda_state.prefill_rows, 4,096 with PR #1576). At 1024 every trellis tile was decoded twice a pass for ~28
+/// pairs an expert; a pair's sums do not depend on which item holds it, so the bits are the same.
+pub const chunk_rows = @import("cuda_state.zig").prefill_rows;
 /// The common module's layer: a width table a projection, and the widths the loader found uniform.
 pub fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
     return .{
@@ -259,7 +261,8 @@ pub fn picksBytes(rows: usize) usize {
 pub fn scratchFor(rows: usize, dims: usize, width: usize, prefill: bool, w: Experts) [4]usize {
     const n: usize = @min(rows, chunk_rows);
     const l = layer(w, cuda.grouped.max_experts, dims, width, 0);
-    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
+    // the prompt kernels write the slot rows (Scratch.yrow): no y [pairs][dims] in the arena
+    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytesFor(l, n, top_k, false) catch unreachable), 4, 4, 4 };
     return .{ picksBytes(rows) + (common.scratchBytes(l, n, top_k) catch unreachable), 4, 4, 4 };
 }
 /// `scratchFor` a 4-bit layer (every projection 8 half-bits), `shx` its shared rotation.
@@ -287,16 +290,16 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
-        const output = if (fused) blk: {
-            const scratch = try common.prompt.scratch(arena, l, cap, top_k);
+        if (fused) { // the down kernel writes this chunk's routed slots of ey straight (slot top_k: the shared expert's)
+            var scratch = try common.prompt.scratchFor(arena, l, cap, top_k, false);
+            scratch.y = ey + at * slots * dims * 4;
+            scratch.yrow = slots;
             try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
-            break :blk scratch.y;
-        } else blk: {
-            const scratch = try common.scratch(arena, l, cap, top_k);
-            try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
-            break :blk scratch.y;
-        };
-        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, output, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
+            continue;
+        }
+        const scratch = try common.scratch(arena, l, cap, top_k);
+        try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
+        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, scratch.y, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
     }
 }
 

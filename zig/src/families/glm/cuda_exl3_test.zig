@@ -343,12 +343,12 @@ test "GLM EXL3: scratch covers the path each layer takes: the prompt kernels' wh
         for ([_]x3.Experts{ four, mixed, any }) |w| for ([_]bool{ false, true }) |prefill| {
             const l = x3.layer(w, cuda.grouped.max_experts, dims, width, 0);
             const prompt = prefill and common.prompt.eligible(l);
-            const need = x3.picksBytes(rows) + if (prompt) try common.prompt.bytes(l, n, x3.top_k) else try common.scratchBytes(l, n, x3.top_k);
+            const need = x3.picksBytes(rows) + if (prompt) try common.prompt.bytesFor(l, n, x3.top_k, false) else try common.scratchBytes(l, n, x3.top_k);
             try testing.expectEqual(need, x3.scratchFor(rows, dims, width, prefill, w)[0]);
         };
         // a 4-bit layer's scratch is upstream's: picks, then the prompt kernels' (one rotation a row), or the grouped path's
         const upstream: common.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = cuda.grouped.max_experts, .dims = dims, .width = width, .codebook = .mcg, .act_mode = 0, .uniform_k2 = 8, .shared_input = true };
-        try testing.expectEqual(x3.picksBytes(rows) + try common.prompt.bytes(upstream, n, x3.top_k), x3.scratchFor(rows, dims, width, true, four)[0]);
+        try testing.expectEqual(x3.picksBytes(rows) + try common.prompt.bytesFor(upstream, n, x3.top_k, false), x3.scratchFor(rows, dims, width, true, four)[0]);
         try testing.expectEqual(x3.picksBytes(rows) + try common.scratchBytes(upstream, n, x3.top_k), x3.scratchFor(rows, dims, width, false, four)[0]);
         for ([_]bool{ false, true }) |prefill| try testing.expectEqual(x3.scratchFor(rows, dims, width, prefill, four), x3.scratchBytes(rows, dims, width, prefill, true));
         // buffers for every layer take the largest: a 4-bit layer's prompt arena grows to the mixed layer's grouped one
