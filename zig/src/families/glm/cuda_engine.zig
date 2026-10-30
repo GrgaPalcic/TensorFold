@@ -353,8 +353,7 @@ pub const Engine = struct {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
-        try e.restoreState(r.id);
-        if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
+        try e.restoreState(r.id); // DFlash2's context too: its kept rows, or from r.at when it kept none
         return r.at;
     }
 
@@ -446,6 +445,8 @@ pub const Engine = struct {
 
     pub const stateBytes = snapshots.bytes;
     pub const prepareSnapshots = snapshots.prepare;
+    pub const prepareTiers = snapshots.prepareTiers;
+    pub const unprepareSnapshots = snapshots.unprepare;
     pub const keepState = snapshots.keep;
     pub const keepAs = snapshots.keepAs;
     pub const restoreState = snapshots.restore;

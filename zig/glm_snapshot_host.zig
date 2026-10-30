@@ -55,11 +55,13 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
     try t.expect(short < longer);
     try t.expect(longer < seq.st.arena.buf.len);
     try t.expectEqual(@as(u64, 0), short % (2 << 20));
-    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget
+    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget,
+    // and DFlash2's context ring joins it (a state carries the drafter's rows up to its mark)
     e.drafter = @ptrFromInt(4096); // only its presence is read
     const drafted = glm.native.snap_bytes(&e, 34816);
     e.drafter = null;
-    try t.expect(drafted < longer);
+    try t.expect(drafted - glm.dflash.ring_bytes < longer);
+    try t.expect(drafted > longer - glm.dflash.ring_bytes);
     try t.expectEqual(@as(u64, 0), drafted % (2 << 20));
 }
 
@@ -96,7 +98,7 @@ test "GLM snapshots: grid and committed off-grid read sets survive copies on bot
             try t.expectEqual(@as(usize, 0), f.seq.in_head);
             const tail = f.seq.st.caches[0].lc + at * f.e.c.kv_lora * 2;
             try t.expectEqual(@as(u8, 0xE9), rec.bytes(tail, 1)[0]);
-            const charge = f.e.snaps.get(id).?.lease.ids.items.len * glm.snapshots.pages.page;
+            const charge = f.e.snaps.get(id).?.lease.count() * glm.snapshots.pages.page;
             try t.expect(charge <= f.e.stateBytes(at));
             try t.expectEqual(f.e.snap_pages.?.arena.?.len, charge + f.e.snap_pages.?.spare());
             f.e.dropState(id);
@@ -192,7 +194,7 @@ test "GLM snapshots: fragmented pages join a larger state and cannot exceed the 
 }
 
 const Control = struct {
-    share: struct { rank: usize },
+    share: struct { rank: usize, world: usize = 2 },
     dropped: std.ArrayList(u32) = .empty,
     announce: u64 = 0,
     words: [8]f64 = @splat(0),
@@ -204,6 +206,9 @@ const Control = struct {
     position: u32 = 0,
     kept_at: u32 = 0,
     fail_shared: bool = false,
+    tiers: u64 = 0,
+    fail_tiers: bool = false,
+    unprepared: usize = 0,
     pub fn shared(c: *@This(), word: f64) !f64 {
         if (c.fail_shared) return error.PeerFailed;
         const i = c.calls;
@@ -222,6 +227,15 @@ const Control = struct {
     pub fn prepareSnapshots(c: *@This(), _: u64) !void {
         c.prepares += 1;
         if (c.fail_prepare) return error.OutOfMemory;
+    }
+    pub fn prepareTiers(c: *@This(), _: u64, host: u64) !void {
+        c.prepares += 1;
+        if (c.fail_tiers) return error.OutOfMemory;
+        c.tiers = host;
+    }
+    pub fn unprepareSnapshots(c: *@This()) void {
+        c.tiers = 0;
+        c.unprepared += 1;
     }
     fn mark(ctx: *anyopaque, at: u32) void {
         const c: *Control = @ptrCast(@alignCast(ctx));
@@ -635,4 +649,187 @@ test "GLM snapshots: without the target MTP head a window's sequence drops exact
         try t.expectEqual(headed.len, plan.len);
         try t.expect(plan.len < without.arena.buf.len);
     }
+}
+
+const snap_page = glm.snapshots.pages.page;
+
+test "GLM snapshots: past the device pages a state spills into pinned host pages, restores byte-exact, and both tiers' pages come back" {
+    var d = rec.init();
+    const before = cuda.usage(false);
+    for ([_]bool{ false, true }) |kv8| for (0..2) |rank| {
+        var f: Fixture = undefined;
+        try f.initFormat(&d, rank, 2, false, kv8); // beside DFlash2: no target MTP head
+        defer f.deinit();
+        const one = f.e.stateBytes(8192);
+        try f.e.prepareTiers(one / 2, 2 * one); // the device holds half a state, the host the rest and more
+        const pool = &f.e.snap_pages.?;
+        const total = pool.spare();
+        try t.expectEqual(one / 2 / snap_page * snap_page + 2 * one, total);
+        try t.expectEqual(2 * one, pool.hostBytes());
+        try f.mark(8192, 0, 7);
+        const saved = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
+        defer t.allocator.free(saved);
+        const id = try f.e.keepState();
+        const s = f.e.snaps.get(id).?;
+        try t.expect(s.lease.dev.ids.items.len > 0 and s.lease.host.ids.items.len > 0); // device pages first, then host
+        try t.expectEqual(@as(usize, 0), pool.pages.available());
+        try t.expect(s.lease.hostBytes(s.len) > 0 and s.lease.hostBytes(s.len) < s.len);
+        @memset(rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len), 0xE9);
+        try f.seq.st.restoreHost(f.e.stream, 17, 0, &.{0}, .{ 0, 0 });
+        const copies = rec.host_copies;
+        try f.e.restoreState(id);
+        try t.expect(rec.host_copies > copies);
+        try f.expectPrefix(saved, 8192, 0);
+        try t.expectEqual(@as(usize, 8192), f.seq.st.pos);
+        // a second state finds no device snap_page: it lands in host pages alone, and both restore their own bytes
+        try f.mark(4096, 0, 9);
+        const second = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
+        defer t.allocator.free(second);
+        const id2 = try f.e.keepState();
+        try t.expectEqual(@as(usize, 0), f.e.snaps.get(id2).?.lease.dev.ids.items.len);
+        try f.e.restoreState(id);
+        try f.expectPrefix(saved, 8192, 0);
+        try f.e.restoreState(id2);
+        try f.expectPrefix(second, 4096, 0);
+        try t.expectEqual((f.e.snaps.get(id).?.lease.host.ids.items.len + f.e.snaps.get(id2).?.lease.count()) * snap_page, pool.hostHeld());
+        f.e.dropState(id);
+        f.e.dropState(id2);
+        f.e.dropped.clearRetainingCapacity();
+        try t.expectEqual(total, pool.spare());
+        try t.expectEqual(@as(u64, 0), pool.hostHeld());
+    };
+    try t.expectEqual(before.device, cuda.usage(false).device);
+    try t.expectEqual(before.host, cuda.usage(false).host);
+}
+
+test "GLM snapshots: the actual store's budget spans the host tier, keeps past the card's pages and evicts within both" {
+    var d = rec.init();
+    var f: Fixture = undefined;
+    try f.init(&d, 0, 1, false);
+    defer f.deinit();
+    const one = f.e.stateBytes(2048);
+    const Ready = struct {
+        var host: u64 = 0;
+        fn run(p: *anyopaque, budget: u64) anyerror!void {
+            const e: *glm.engine.Engine = @ptrCast(@alignCast(p));
+            try e.prepareTiers(budget, host);
+        }
+    };
+    Ready.host = 3 * one;
+    f.e.snap_setup = .{ .ptr = &f.e, .run = Ready.run };
+    const budget = try adapter.cacheBudget(glm.native, &f.e, one + 31);
+    try t.expectEqual(one + 31 + 3 * one, budget); // the device's budget as asked and the host tier
+    const family: pc.Snapshots = .{ .ptr = &f.e, .vtable = &adapter.Snaps(glm.native, null).vtable };
+    var store = pc.Store.init(t.allocator, family, adapter.cacheRules(glm.native), budget);
+    defer store.deinit();
+    var prompt: [2049]u32 = @splat(1);
+    for (0..9) |i| {
+        prompt[0] = @intCast(i);
+        try f.mark(2048, 0, @intCast(i));
+        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
+        try t.expectEqual(budget - 31, store.held + glm.native.snap_spare(&f.e)); // whole pages: every one held or spare
+        try t.expect(store.entries.items.len <= 4);
+    }
+    try t.expectEqual(@as(usize, 4), store.entries.items.len); // one on the card, three in host memory
+    try t.expectEqual(@as(u64, 3 * one), f.e.snap_pages.?.hostHeld());
+    try t.expectEqual(@as(u64, 5), store.counts.evicted);
+    // the oldest kept is the first to go: the newest four still resume their own rows
+    for (5..9) |i| {
+        prompt[0] = @intCast(i);
+        const found = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
+        defer t.allocator.free(found.marks);
+        const e = found.entry orelse return error.ExpectedHit;
+        defer store.release(e);
+        const kept: *glm.engine.Kept = @ptrCast(@alignCast(e.saved));
+        try f.e.restoreState(kept.id);
+        try t.expectEqual(@as(usize, 2048), f.seq.st.pos);
+    }
+}
+
+test "GLM snapshots: ranks pin the least any of them may, fall back to device pages together, and pin nothing when off" {
+    const g: u64 = 1 << 30;
+    // rank 0 may pin its share of what it asked (8 GiB over two ranks of a host with 100 available): the all-reduce
+    // answers its own word here
+    var leader: Control = .{ .share = .{ .rank = 0 } };
+    try t.expectEqual(@as(u64, 4 * g), try glm.snapshots.agreeTiersWith(&leader, g, 8 * g, 100 * g));
+    try t.expectEqual(-@as(f64, @floatFromInt(4 * g)), leader.words[0]);
+    try t.expectEqual(@as(u64, 4 * g), leader.tiers);
+    try t.expectEqual(@as(usize, 2), leader.calls); // the least, then the pin's agreement
+    // a follower hears a smaller least (another rank's reading), pins it, then hears that a rank failed: it frees its
+    // tier and joins the device pages' agreement
+    var peer: Control = .{ .share = .{ .rank = 1 } };
+    peer.words[0] = -@as(f64, @floatFromInt(3 * g));
+    peer.words[1] = 1;
+    peer.words[2] = 0;
+    try t.expectEqual(@as(u64, 0), try glm.snapshots.agreeTiersWith(&peer, g, 8 * g, 100 * g));
+    try t.expectEqual(@as(usize, 1), peer.unprepared);
+    try t.expectEqual(@as(u64, 0), peer.tiers);
+    try t.expectEqual(@as(usize, 2), peer.prepares); // its tier of 3 GiB, then the device pages alone
+    try t.expectEqual(@as(usize, 3), peer.calls);
+    // the auto share under the headroom, or off: no tier, the device pages' one agreement
+    for ([_]u64{ 0, glm.snapshots.host_tier.auto }) |asked| {
+        var off: Control = .{ .share = .{ .rank = 0 } };
+        try t.expectEqual(@as(u64, 0), try glm.snapshots.agreeTiersWith(&off, g, asked, 10 * g));
+        try t.expectEqual(@as(u64, 0), off.tiers);
+        try t.expectEqual(@as(usize, 1), off.prepares);
+    }
+}
+
+test "GLM snapshots: beside DFlash2 a state carries the drafter's context rows to its mark, into another slot's ring" {
+    var d = rec.init();
+    const df = glm.dflash;
+    var f: Fixture = undefined;
+    try f.init(&d, 1, 2, false);
+    defer f.deinit();
+    var dr: df.Drafter = undefined;
+    dr.gpa = t.allocator;
+    dr.d = &d;
+    dr.slots = .empty;
+    defer {
+        for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
+        dr.slots.deinit(t.allocator);
+    }
+    f.e.drafter = &dr;
+    f.e.slot = 0;
+    const plain = f.e.stateBytes(8192);
+    try f.e.prepareTiers(plain, 2 * plain + 2 * df.ring_bytes); // a state on the card, the others in host memory
+    // slot 0's pass tapped its prompt rows 6144 .. 8192 (dflash.promptRun keeps the last window of a prompt)
+    try dr.restart(0, 0);
+    dr.slots.items[0].first = 6144;
+    dr.slots.items[0].end = 8192;
+    const ring0 = rec.bytes(try dr.ringPtr(0), df.ring_bytes);
+    for (ring0, 0..) |*b, i| b.* = @truncate(i *% 131 +% 5);
+    try f.mark(8192, 0, 3);
+    const id = try f.e.keepState();
+    const s = f.e.snaps.get(id).?;
+    try t.expectEqual(@as(?i64, 6144), s.ring_from);
+    try t.expectEqual(@as(usize, df.ring_bytes), s.len - (try glm.snapshots.layout.Plan.init(&f.seq.st, &f.e.c, 8192, null)).len);
+    // restored into slot 1: its ring holds those rows, and it drafts from 6144 as the fresh pass would
+    try dr.restart(1, 0);
+    const ring1 = rec.bytes(try dr.ringPtr(1), df.ring_bytes);
+    @memset(ring1, 0);
+    f.e.slot = 1;
+    try f.e.restoreState(id);
+    try t.expectEqualSlices(u8, ring0, ring1);
+    try t.expectEqual(@as(i64, 6144), dr.slots.items[1].from);
+    try t.expectEqual(dr.keptFrom(1, 8192), 6144); // a later keep at the same mark carries them again
+    // a pass that tapped nothing right before its mark keeps no ring, and a resume from it starts at the mark
+    try dr.restart(0, 0);
+    dr.slots.items[0].first = 2048;
+    dr.slots.items[0].end = 4096;
+    f.e.slot = 0;
+    try f.mark(8192, 0, 4);
+    const bare = try f.e.keepState();
+    try t.expectEqual(@as(?i64, null), f.e.snaps.get(bare).?.ring_from);
+    try t.expect(f.e.snaps.get(bare).?.len < s.len);
+    f.e.slot = 1;
+    try f.e.restoreState(bare);
+    try t.expectEqual(@as(i64, 8192), dr.slots.items[1].from);
+    try t.expectEqual(df.no_rows, dr.slots.items[1].first);
+    try t.expectEqual(@as(?i64, null), dr.keptFrom(1, 8192));
+    // the ring's window: rows further back than a window before the mark are not the sequence's any more
+    dr.slots.items[0].first = 0;
+    dr.slots.items[0].end = 8192;
+    try t.expectEqual(@as(?i64, 8192 - df.WIN), dr.keptFrom(0, 8192));
+    f.e.drafter = null;
 }

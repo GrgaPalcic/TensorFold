@@ -21,7 +21,7 @@ pub const Header = extern struct {
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
-    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
+    seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
     temperature: f64 = 0,
     top_p: f64 = 0,
     min_p: f64 = 0,
@@ -192,10 +192,11 @@ pub const Leader = struct {
         try x.e.begin(c);
     }
 
-    /// Every rank's prompt cache at rank 0's budget (snapshots.agree): the others make theirs on this step.
-    pub fn snapshots(x: Leader, budget: u64) !void {
-        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget }, &.{});
-        try @import("cuda_snapshots.zig").agree(x.e, budget);
+    /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
+    /// others make theirs on this step. The pinned bytes each rank holds come back (0: device pages alone).
+    pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
+        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked }, &.{});
+        return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
     }
 
     /// The other ranks make rank 0's pool: `streams` paged sequences and `pages` pages, each page's bytes checked.
@@ -399,7 +400,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try v.take(h.slot, step.ids);
                 try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
             },
-            .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
+            .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
             .idle => cuda.tp_watch.sleep(e.io),

@@ -18,7 +18,15 @@ pub const Seq = struct {
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
-pub const Snap = struct { lease: @import("cuda_snapshot_pages.zig").Lease, len: usize, pos: usize, mtp_len: usize, cur: []u1, bases: [2]usize };
+pub const Snap = struct {
+    lease: @import("cuda_snapshot_pages.zig").Lease,
+    len: usize,
+    pos: usize,
+    mtp_len: usize,
+    cur: []u1,
+    bases: [2]usize,
+    ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
+};
 
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
 pub const Resume = struct { id: u64, at: usize };

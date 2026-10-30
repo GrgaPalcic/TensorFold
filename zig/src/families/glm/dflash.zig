@@ -68,10 +68,15 @@ pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
 /// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
 pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
 
+/// A ring's `first` before any row of its sequence is in it.
+pub const no_rows: i64 = std.math.maxInt(i64);
+
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
     ring: ?cuda.DeviceBuffer = null,
     from: i64 = 0, // the first position the ring holds for this sequence
+    first: i64 = no_rows, // prompt rows held: the first of the run in the ring that ends at `end` (no_rows: none yet)
+    end: i64 = 0,
     v_step: u64 = 0, // the verify that wrote its rows (Drafter.verifies then)
     v_row0: usize = 0,
     v_rows: usize = 0,
@@ -202,6 +207,32 @@ pub const Drafter = struct {
     pub fn restart(dr: *Drafter, i: u32, from: usize) !void {
         const s = try dr.slot(i);
         s.from = @intCast(from);
+        s.first = no_rows;
+        s.end = @intCast(from);
+        s.v_rows = 0;
+    }
+
+    /// Slot `i`'s ring (made on first use), for a kept state to copy out of or into.
+    pub fn ringPtr(dr: *Drafter, i: u32) !u64 {
+        return (try dr.slot(i)).ring.?.ptr;
+    }
+
+    /// Where the context rows a state kept at `at` carries start: the prompt rows in the ring right up to `at`, at most
+    /// a window of them (null: the pass tapped none just before `at`, so the ring holds nothing a resume could use).
+    pub fn keptFrom(dr: *const Drafter, i: u32, at: usize) ?i64 {
+        if (i >= dr.slots.items.len) return null;
+        const s = &dr.slots.items[i];
+        const end: i64 = @intCast(at);
+        if (s.ring == null or s.first == no_rows or s.end != end or s.first >= end) return null;
+        return @max(@max(s.first, s.from), end - WIN);
+    }
+
+    /// A kept state's ring copied into slot `i`: its sequence's rows `from` .. `at` are in it, as a fresh pass left them.
+    pub fn resumeAt(dr: *Drafter, i: u32, from: i64, at: usize) !void {
+        const s = try dr.slot(i);
+        s.from = from;
+        s.first = from;
+        s.end = @intCast(at);
         s.v_rows = 0;
     }
 
@@ -209,7 +240,7 @@ pub const Drafter = struct {
     pub fn noteVerify(dr: *Drafter, i: u32, row0: usize, rows: usize, pos0: usize, first: bool) !void {
         if (first) dr.verifies += 1; // a shared verify's parts share one
         const s = try dr.slot(i);
-        s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
+        s.* = .{ .ring = s.ring, .from = s.from, .first = s.first, .end = s.end, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
     }
 
     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
@@ -312,4 +343,7 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, 
     const s = try dr.slot(i);
     const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
     try dr.ingest(e, &.{run});
+    // the run the ring holds: it goes on from `end`, or starts again past a gap (rows a kept state may carry)
+    if (s.first == no_rows or run.pos0 != s.end) s.first = run.pos0;
+    s.end = run.pos0 + @as(i64, @intCast(run.n));
 }

@@ -9,7 +9,7 @@ const sparse = @import("cuda_sparse.zig");
 /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart.
 pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0 };
 pub const Plan = struct {
-    parts: [5 * (@import("config.zig").max_layers + 1) + 2]Part = undefined,
+    parts: [5 * (@import("config.zig").max_layers + 1) + 3]Part = undefined, // and one outside the arena (`outside`)
     count: usize = 0,
     len: usize = 0,
     ids: []const u32 = &.{}, // a paged sequence's pages in row order
@@ -65,6 +65,15 @@ pub const Plan = struct {
         if ((!p.sizing and (len - 1) / span >= p.ids.len) or p.count == p.parts.len) return error.SnapshotShape;
         p.len = try std.math.add(usize, p.len, len);
         p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.ps };
+        p.count += 1;
+    }
+
+    /// `len` bytes the sequence's arena does not hold (DFlash2's context ring for the slot), after every arena part.
+    pub fn outside(p: *Plan, live: u64, len: usize) !void {
+        if (len == 0) return;
+        if (live == 0 or p.count == p.parts.len) return error.SnapshotShape;
+        p.len = try std.math.add(usize, p.len, len);
+        p.parts[p.count] = .{ .live = live, .len = len };
         p.count += 1;
     }
 

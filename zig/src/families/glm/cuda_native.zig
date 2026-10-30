@@ -345,14 +345,22 @@ pub fn snap_ready(ptr: *engine.Engine, budget: u64) !u64 {
 fn readySnapshots(ptr: *anyopaque, budget: u64) !void {
     const own: *Owned = @ptrCast(@alignCast(ptr));
     const x: follow.Leader = .{ .e = own.e, .link = &own.link }; // its steps wake the ranks asleep on their lines
-    try x.snapshots(budget);
+    // TF_GLM_HOST_CACHE_GIB, rank 0's: GiB of pinned host pages over all ranks (0: none; unset: a share of what's available)
+    const asked = try snapshots.host_tier.asked(if (std.c.getenv("TF_GLM_HOST_CACHE_GIB")) |v| std.mem.span(v) else null);
+    const host = try x.snapshots(budget, asked);
     try x.idle(); // no stream yet: they sleep again until the first
+    std.log.info("prompt cache: {d:.1} GiB of device pages and {d:.1} GiB of pinned host memory a rank ({d:.1} GiB over the {d} ranks{s})", .{ @as(f64, @floatFromInt(budget)) / (1 << 30), @as(f64, @floatFromInt(host)) / (1 << 30), @as(f64, @floatFromInt(host * own.e.share.world)) / (1 << 30), own.e.share.world, if (asked == snapshots.host_tier.auto) "; TF_GLM_HOST_CACHE_GIB unset: a quarter of the host's available memory, at most 16 GiB" else "" });
+}
+
+/// The host tier's bytes past the device pages: the prompt cache's budget holds both (native/cuda_snaps cacheBudget).
+pub fn snap_host_tier(ptr: *engine.Engine) u64 {
+    return if (ptr.snap_pages) |*p| p.hostBytes() else 0;
 }
 
 pub fn snap_charged(ptr: *anyopaque, saved: *anyopaque) u64 {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
     const k: *engine.Kept = @ptrCast(@alignCast(saved));
-    return e.snaps.get(k.id).?.lease.ids.items.len * snapshots.pages.page;
+    return e.snaps.get(k.id).?.lease.count() * snapshots.pages.page;
 }
 
 pub fn snap_spare(ptr: *anyopaque) u64 {
@@ -414,6 +422,7 @@ fn release(own: *Owned) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
+        error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
