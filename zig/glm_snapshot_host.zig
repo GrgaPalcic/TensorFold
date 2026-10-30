@@ -43,6 +43,7 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
     e.cur = &seq;
     e.c = w.config;
     e.mtp = true;
+    e.drafter = null; // the target MTP head absorbs prompts: its rows are budgeted
     e.capacity = seq.st.capacity;
     for ([_]u32{ 2048, 34816, 266240 }) |at| {
         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
@@ -54,6 +55,12 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
     try t.expect(short < longer);
     try t.expect(longer < seq.st.arena.buf.len);
     try t.expectEqual(@as(u64, 0), short % (2 << 20));
+    // beside a drafter (DFlash2) the prompts leave the head's caches empty (mtp_len 0): their rows leave the budget
+    e.drafter = @ptrFromInt(4096); // only its presence is read
+    const drafted = glm.native.snap_bytes(&e, 34816);
+    e.drafter = null;
+    try t.expect(drafted < longer);
+    try t.expectEqual(@as(u64, 0), drafted % (2 << 20));
 }
 
 const rec = @import("test_support/glm_snap_driver.zig").Driver;
@@ -423,6 +430,7 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
     e.cur = &seq;
     e.c = w.config;
     e.mtp = true;
+    e.drafter = null; // the target MTP head absorbs prompts: its rows are budgeted
     e.capacity = seq.st.capacity;
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;

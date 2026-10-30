@@ -24,8 +24,16 @@ pub fn agree(e: anytype, budget: u64) !void {
     if (try e.shared(if (failed != null) 1 else 0) > 0) return failed orelse error.PeerSnapshotCache;
 }
 
+/// The target MTP rows a state at `at` holds, as `keepAs` will save them: none without the head; beside a drafter its
+/// prompts leave the head's caches empty (cuda_engine prefillChunk), so mtp_len stays 0; else up to a window past `at`.
+fn mtpHead(e: anytype, at: usize) error{Overflow}!?usize {
+    if (!e.mtp) return null;
+    if (e.drafter != null) return 0;
+    return @min(e.capacity, try std.math.add(usize, at, @import("cuda_state.zig").window_rows));
+}
+
 pub fn bytes(e: anytype, at: usize) u64 {
-    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
+    const head = mtpHead(e, at) catch return std.math.maxInt(u64);
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);

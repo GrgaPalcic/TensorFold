@@ -30,6 +30,7 @@ pub const Fixture = struct {
         f.e.share = w.share;
         f.e.capacity = f.seq.st.capacity;
         f.e.mtp = mtp;
+        f.e.drafter = null; // snapshots.bytes budgets the head's rows unless a drafter is loaded
         f.e.snaps = .empty;
         f.e.snap_pages = null;
         f.e.snap_setup = null;
