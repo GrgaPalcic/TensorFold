@@ -415,6 +415,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             e.discard_draws = true;
             defer e.discard_draws = false;
             try e.verify(ids_in, s.sampled[0..ids_in.len], 0);
+            try e.checkGathers(); // no sync now: a peer-store wait the GPU gave up on (this step's or earlier) stops here
         },
         .redraw => _ = try e.redrawFirst(@intCast(h.a), 0),
         .shared => {
@@ -434,6 +435,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             e.discard_draws = true;
             defer e.discard_draws = false;
             try e.verifyShared(parts[0..k]);
+            try e.checkGathers(); // as for .verify
         },
         .many => {
             var parts: [engine.max_together]engine.Prompt = undefined;
