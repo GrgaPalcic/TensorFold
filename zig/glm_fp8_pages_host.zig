@@ -310,11 +310,11 @@ test "GLM FP8 pages: a stream that finishes gives its pages back through the eng
     var ln: glm.lanes.Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
     defer ln.lanes.deinit(t.allocator);
     var streams: [3]lanes.Stream = undefined;
-    try t.expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100)).len); // the engine's own sequence: slot 0
+    try t.expectEqual(@as(usize, 2), (try ln.seat(&streams[0], 600, 100, &.{})).len); // the engine's own sequence: slot 0
     try t.expectEqual(@as(u32, 0), ln.lanes.get(&streams[0]).?.slot);
-    try t.expectEqual(@as(usize, 5), (try ln.seat(&streams[1], 2000, 100)).len);
+    try t.expectEqual(@as(usize, 5), (try ln.seat(&streams[1], 2000, 100, &.{})).len);
     const live = F.live;
-    try t.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100)); // both paged sequences taken: it waits
+    try t.expectError(error.LaneMemory, ln.seat(&streams[2], 600, 100, &.{})); // both paged sequences taken: it waits
     try t.expectEqual(live, F.live); // and no window was made for it
     try t.expectEqual(@as(usize, 1), f.census().free);
     // stream 1 finishes: the lane host's release ends in the engine's, which gives its pages back
@@ -324,7 +324,7 @@ test "GLM FP8 pages: a stream that finishes gives its pages back through the eng
     try t.expectEqual(@as(usize, 0), f.st(slot).capacity);
     try t.expectEqual(@as(usize, 6), f.census().free);
     try t.expectEqual(@as(u32, 0), f.e.slot); // slot 0 bound again
-    try t.expectEqualSlices(u32, &.{ 6, 5 }, try ln.seat(&streams[2], 600, 100)); // the pages just given back, last first
+    try t.expectEqualSlices(u32, &.{ 6, 5 }, try ln.seat(&streams[2], 600, 100, &.{})); // the pages just given back, last first
     try t.expectEqual(slot, ln.lanes.get(&streams[2]).?.slot);
     try expectWhole(&f);
     for ([_]usize{ 0, 2 }) |i| {
@@ -447,13 +447,13 @@ test "GLM FP8 pages: a begin that fails on rank 0 after its step went out frees 
     Wire.n = 1; // the begin alone: the slot stays this rank's, and the next begin on it is BadStep (the reported fault)
     try Wire.replay(&g.e, 0);
     try t.expect(g.p.used[slot]);
-    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }));
+    try t.expectError(error.BadStep, g.p.map(slot, &.{ 0, 1 }, 0));
     Wire.n = saved;
     try Wire.replay(&g.e, 1); // the release rank 0 sent after it
     try t.expect(!g.p.used[slot] and g.st(slot).capacity == 0);
     // the retry: its begin maps on the follower, and its end frees the slot on both ranks
-    const ids = try back.seat(&stream, 3, 600);
-    try back.x.beginOn(null, ids);
+    const ids = try back.seat(&stream, 3, 600, &.{});
+    try back.x.beginOn(null, ids, 0);
     try t.expectEqual(glm.follow.Kind.begin, Wire.kind(2));
     try Wire.replay(&g.e, 2);
     try t.expect(g.p.used[slot]);
@@ -525,12 +525,12 @@ test "GLM FP8 pages: a follower maps rank 0's ids, and refuses a pool whose E4M3
     f.e.pages = f.p;
     defer f.deinit();
     try t.expect(!f.p.leader);
-    try f.p.map(1, &.{ 7, 2, 5 });
+    try f.p.map(1, &.{ 7, 2, 5 }, 0);
     try t.expectEqualSlices(u32, &.{ 7, 2, 5 }, F.table(f.st(1).table, 3));
     try t.expectEqual(@as(usize, 1536), f.st(1).capacity);
-    try t.expectError(error.BadStep, f.p.map(1, &.{1})); // already mapped
-    try t.expectError(error.BadStep, f.p.map(0, &.{8})); // past the pool
-    try t.expectError(error.BadStep, f.p.map(2, &.{0})); // not a paged slot
+    try t.expectError(error.BadStep, f.p.map(1, &.{1}, 0)); // already mapped
+    try t.expectError(error.BadStep, f.p.map(0, &.{8}, 0)); // past the pool
+    try t.expectError(error.BadStep, f.p.map(2, &.{0}, 0)); // not a paged slot
     f.p.close(1);
     try t.expectEqual(@as(usize, 0), f.st(1).capacity);
     try t.expect(f.p.pool.idle()); // a follower's pool lends nothing

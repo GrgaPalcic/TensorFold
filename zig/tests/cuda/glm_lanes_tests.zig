@@ -264,7 +264,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         if (set.pages) {
             const held = try e.pages.?.open(@intCast(slot), ids.len + 512, 64); // the prompt and every round's rows
             try x.bind(@intCast(slot));
-            try x.beginOn(sampling, held);
+            try x.beginOn(sampling, held, 0);
         } else {
             try x.bind(@intCast(slot));
             try x.begin(sampling);

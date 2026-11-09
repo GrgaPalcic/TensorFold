@@ -133,6 +133,7 @@ pub const Engine = struct {
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    share_pages: bool = false, // TF_KV_SHARE: a kept state leaves its prefix's pages to the shared store that holds them
     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
     kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
     kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
