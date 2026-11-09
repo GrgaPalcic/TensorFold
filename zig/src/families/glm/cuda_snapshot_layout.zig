@@ -6,6 +6,20 @@ const Config = @import("config.zig").Config;
 const cache = @import("cuda_dsa_block.zig");
 const sparse = @import("cuda_sparse.zig");
 
+/// TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone; nothing reads the dead half after a restore.
+pub fn liveHalfEnabled() bool {
+    const v = std.c.getenv("TF_GLM_KV_LIVE_HALF") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// The half a plan keeps: `on` with every KDA layer on the same half gives that half; otherwise both (null).
+pub fn halfOf(cur: []const u1, layers: usize, on: bool) ?u1 {
+    if (!on or layers == 0 or cur.len != layers) return null;
+    const h = cur[0];
+    for (cur) |b| if (b != h) return null;
+    return h;
+}
+
 /// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page `page` bytes apart, from byte `from`;
 /// `lat`: a sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
 pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0, lat: bool = false, from: usize = 0 };
@@ -19,54 +33,67 @@ pub const Plan = struct {
     sizing: bool = false, // `size`: the rows counted, not read, so no page need be mapped
     latent: bool = true, // the latent codes and scales are parts (sharded: only where this rank keeps them)
     shared: usize = 0, // TF_KV_SHARE: a paged sequence's first pages the shared store holds: their rows stay on them
+    half: ?u1 = null, // TF_GLM_KV_LIVE_HALF: the KDA half the plan carries (null: both, the arena head whole)
 
     /// The state at `at` (a kept copy's plan; `initForShared` past a shared store's pages).
     pub fn init(st: *const State, c: *const Config, at: usize, head: ?usize) !Plan {
-        return make(st, c, at, head, 0, false, true);
+        return make(st, c, at, head, 0, false, true, halfOf(st.cur, st.kda_layers, liveHalfEnabled()));
     }
 
     /// `init` past the shared store's `shared` pages (TF_KV_SHARE, a state's own copy).
     pub fn initShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize) !Plan {
-        return make(st, c, at, head, shared, false, true);
+        return make(st, c, at, head, shared, false, true, halfOf(st.cur, st.kda_layers, liveHalfEnabled()));
     }
 
-    /// `init` with or without the DSA caches' latent codes and scales (`latent`: a sharded state off its home rank
-    /// holds every other part; cuda_snapshots).
-    pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool) !Plan {
-        return initForShared(st, c, at, head, 0, latent);
+    /// `initFor` with the kept state's own `cur` bits: they say which half it carries (the slot's may differ by now,
+    /// so a restore passes them; an even keep passes the live state's).
+    pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool, cur: []const u1) !Plan {
+        return initForShared(st, c, at, head, 0, latent, cur);
     }
 
     /// `initFor` past the shared store's `shared` pages (TF_KV_SHARE; a resume's state leaves their rows out).
-    pub fn initForShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, latent: bool) !Plan {
-        return make(st, c, at, head, shared, false, latent);
+    pub fn initForShared(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, latent: bool, cur: []const u1) !Plan {
+        return make(st, c, at, head, shared, false, latent, halfOf(cur, st.kda_layers, liveHalfEnabled()));
+    }
+
+    /// The plan with a given half (tests and tools): both halves for null; `latent` as `initFor`'s.
+    pub fn withHalf(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool, half: ?u1) !Plan {
+        return make(st, c, at, head, 0, false, latent, half);
     }
 
     /// A prefix's bytes at `at`, rows to `capacity` counted held or not (a paged sequence holds its request's alone).
     pub fn size(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize) !usize {
-        return sizeFor(st, c, capacity, at, head, true);
+        return sizeFor(st, c, capacity, at, head, true, st.cur);
     }
 
     /// `size` with or without the latent codes and scales (`initFor`'s `latent`).
-    pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool) !usize {
-        return sizeForShared(st, c, capacity, at, head, 0, latent);
+    pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool, cur: []const u1) !usize {
+        return sizeForShared(st, c, capacity, at, head, 0, latent, cur);
     }
 
     /// `sizeFor` past the shared store's `shared` pages (TF_KV_SHARE).
-    pub fn sizeForShared(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, latent: bool) !usize {
+    pub fn sizeForShared(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, shared: usize, latent: bool, cur: []const u1) !usize {
         var whole = st.*;
         whole.capacity = capacity;
-        return (try make(&whole, c, at, head, shared, true, latent)).len;
+        return (try make(&whole, c, at, head, shared, true, latent, halfOf(cur, st.kda_layers, liveHalfEnabled()))).len;
     }
 
-    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, latent: bool) !Plan {
+    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, shared: usize, sizing: bool, latent: bool, half: ?u1) !Plan {
         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
         if (shared > 0 and (st.table == 0 or shared * page_rows > at)) return error.SnapshotShape; // pages below `at` only
-        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent, .shared = shared };
+        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent, .shared = shared, .half = half };
         // a paged sequence's caches are its pages: its fields up to them end at its first ring
         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
         if (first < st.arena.buf.ptr) return error.SnapshotShape;
-        try p.add(st, st.arena.buf.ptr, @intCast(first - st.arena.buf.ptr));
+        if (half) |h| {
+            // the arena head in two parts around the dead half: [start, dead) and [dead + len, first)
+            const len = try std.math.mul(usize, st.kda_layers, st.rec_layer);
+            const dead = st.rec + @as(u64, 1 - h) * len;
+            if (dead < st.arena.buf.ptr or dead > first or first - dead < len) return error.SnapshotShape;
+            try p.add(st, st.arena.buf.ptr, @intCast(dead - st.arena.buf.ptr));
+            try p.add(st, dead + len, @intCast(first - (dead + len)));
+        } else try p.add(st, st.arena.buf.ptr, @intCast(first - st.arena.buf.ptr));
         for (st.caches, 0..) |x, j| try p.rows(st, c, x, j, at);
         if (head) |n| {
             if (n > st.capacity) return error.SnapshotShape;

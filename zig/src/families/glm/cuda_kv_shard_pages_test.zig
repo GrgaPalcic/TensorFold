@@ -281,8 +281,8 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
     try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
     const st = f.st(1);
     const at = 1200;
-    const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true);
-    const bare = try layout.Plan.initFor(st, &f.e.w.config, at, null, false);
+    const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true, st.cur);
+    const bare = try layout.Plan.initFor(st, &f.e.w.config, at, null, false, st.cur);
     try expectEqual(full.len - at * (512 + 4), bare.len); // one DSA layer's codes and scales
     try expectEqual(full.len, try layout.Plan.size(st, &f.e.w.config, st.capacity, at, null));
     var lat: usize = 0;

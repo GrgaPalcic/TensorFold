@@ -186,7 +186,7 @@ test "every media limit is part of the ranks' agreement" {
 test "every scheduling and identity field that differs stops the ranks" {
     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
+    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kv_live_half", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "numerics", "capacity", "heat_high", "heat_low" }) |name| {
         var all = [_]Fingerprint{ zero, one };
         @field(all[1], name) += 1;
         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);
@@ -380,7 +380,7 @@ test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in th
     const f0 = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, hashBytes("/c"));
     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard);
     try std.testing.expectEqual(@as(u32, 0), f0.kv_shard_check);
-    try std.testing.expectEqual(@as(u32, 15), f0.layout);
+    try std.testing.expectEqual(@as(u32, 16), f0.layout);
     var all = [_]Fingerprint{ f0, Fingerprint.of(2, 1, s, 8192, true, h0, h0, hashBytes("/c")) };
     try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?); // on one rank only
     all[0] = Fingerprint.of(2, 0, s, 8192, true, h0, h0, hashBytes("/c"));
@@ -393,4 +393,26 @@ test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in th
     other.kv_shard.twins = true;
     all[1] = Fingerprint.of(2, 1, other, 8192, true, h0, h0, hashBytes("/c"));
     try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?);
+}
+
+test "TF_GLM_KV_LIVE_HALF: off by default, 0 or 1, a typo refused, and every rank must agree (their keeps' plans differ)" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn on(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_KV_LIVE_HALF")) "1" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_KV_LIVE_HALF")) "yes" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect(!(try Settings.read(Reader.absent, &problem)).kv_live_half);
+    const on = try Settings.read(Reader.on, &problem);
+    try std.testing.expect(on.kv_live_half);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_KV_LIVE_HALF: 0 or 1", problem);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
+    try std.testing.expectEqual(Mismatch{ .field = .kv_live_half, .rank = 1 }, mismatch(&all).?);
 }
