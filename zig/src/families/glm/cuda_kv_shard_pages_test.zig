@@ -306,6 +306,37 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
     };
 }
 
+test "kv shard pages: a kept state's plan past the shared store's pages leaves their latent rows on the pages" {
+    const gpa = std.testing.allocator;
+    const layout = @import("cuda_snapshot_layout.zig");
+    var f: Fake = undefined;
+    Fake.reset();
+    try f.init(gpa, 1, true);
+    const p = try f.pool(3, 20, false);
+    defer f.deinit(p);
+    try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0);
+    const st = f.st(1);
+    const at = 1200;
+    const whole = try layout.Plan.initForShared(st, &f.e.w.config, at, null, 0, true, st.cur);
+    const past = try layout.Plan.initForShared(st, &f.e.w.config, at, null, 2, true, st.cur); // the store holds 2 pages
+    // the two pages' 1,024 rows of codes and scales stay on the pages, with their pooled keys
+    try expect(whole.len - past.len >= 1024 * (512 + 4));
+    var lat: usize = 0;
+    for (past.parts[0..past.count]) |part| {
+        if (!part.lat) continue;
+        lat += 1;
+        try expectEqual(2 * part.span, part.from);
+        try expectEqual((at - 1024) * (part.span / 512), part.len);
+        // the first byte it copies is row 1,024: the stream's third page (latent page 6 of this rank's arena)
+        try expectEqual(part.live + 6 * part.page, past.piece(part, 0).live);
+    }
+    try expectEqual(@as(usize, 2), lat);
+    // a state wholly on the store's pages copies no latent row, sized or planned
+    const grid = try layout.Plan.sizeForShared(st, &f.e.w.config, st.capacity, 1024, null, 2, true, st.cur);
+    const bare = try layout.Plan.sizeForShared(st, &f.e.w.config, st.capacity, 1024, null, 2, false, st.cur);
+    try expectEqual(bare, grid);
+}
+
 test "kv shard pages: a stream resuming a kept state is seated in the state's home part, the lanes' view of it" {
     const gpa = std.testing.allocator;
     const Lanes = @import("cuda_lanes.zig").Lanes;
