@@ -1027,3 +1027,8 @@ test "GLM snapshots: an E4M3 state kept on one paged stream restores into anothe
     }
     f.e.cur = &f.seq;
 }
+
+test "GLM snapshots: TF_KV_SHARE's adapter reads GLM's decls as the store it replaced: the 4,096 grid, a lookahead of 1" {
+    const r = adapter.cacheRules(glm.native);
+    try std.testing.expect(r.planned and r.grid == 4096 and r.lookahead == 1 and r.min_prompt == 0 and r.warm == .waits and !r.fork);
+}
