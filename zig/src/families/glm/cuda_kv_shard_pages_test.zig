@@ -153,7 +153,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
     try expectEqual(@as(u64, 9 * 264_192), F.size(x.lat.?.ptr));
     try expectEqual(@as(usize, 0), p.pool.total()); // the unsharded pool holds no page
     try expect(p.fits(600, 100));
-    const wire = try p.openFor(1, 600, 100, null); // 2 pages in part 0, a twin of 2 in part 1
+    const wire = try p.openWith(1, 600, 100, null, &.{}); // 2 pages in part 0, a twin of 2 in part 1
     try expectEqualSlices(u32, &.{ 0, 1, 8, 9 }, wire);
     try expectEqual(@as(usize, 2), p.twinCount(1));
     const s1 = f.st(1);
@@ -170,7 +170,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
     try expectEqual(@as(u64, 264_192), c.latPs());
     try expectEqual(@as(usize, 1024), s1.capacity);
     // the next stream goes to part 1 (fewer live streams), its twin of one page in part 0: rank 0's latent table on it
-    const wire2 = try p.openFor(2, 300, 100, null);
+    const wire2 = try p.openWith(2, 300, 100, null, &.{});
     try expectEqualSlices(u32, &.{ 10, 2 }, wire2);
     try expectEqual(@as(usize, 1), p.twinCount(2));
     try expectEqualSlices(u32, &.{2}, F.table(f.st(2).ltable, 1));
@@ -178,7 +178,7 @@ test "kv shard pages: every page's keys, this rank's part's latent pages and a t
     try expectEqualSlices(u32, &.{8}, F.table(f.st(2).ltable, 1)); // the twin given back: the trash page
     // a resume's home part first, though it has more streams
     p.close(2);
-    _ = try p.openFor(2, 300, 100, 0);
+    _ = try p.openWith(2, 300, 100, 0, &.{});
     try expectEqual(@as(u8, 0), f.st(2).hold.?.owner);
     try p.giveTwin(1);
     try expectEqual(@as(usize, 0), p.twinCount(1));
@@ -197,7 +197,7 @@ test "kv shard pages: a request past a part is admitted at once and refused, nev
     const p = try f.pool(2, 14, true); // parts of 5 pages
     defer f.deinit(p);
     try expect(p.fits(2900, 100)); // 6 pages
-    try std.testing.expectError(error.PoolTooSmall, p.openFor(1, 2900, 100, null));
+    try std.testing.expectError(error.PoolTooSmall, p.openWith(1, 2900, 100, null, &.{}));
     try expect(!p.used[1] and p.shard.?.parts.pools[0].available() == 5);
 }
 
@@ -208,7 +208,7 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
     try lead.init(gpa, 0, true);
     const p0 = try lead.pool(3, 20, true);
     defer lead.deinit(p0);
-    const wire = try gpa.dupe(u32, try p0.openFor(1, 900, 100, null));
+    const wire = try gpa.dupe(u32, try p0.openWith(1, 900, 100, null, &.{}));
     defer gpa.free(wire);
     const twin = p0.twinCount(1);
     try expectEqual(@as(usize, 2), twin);
@@ -216,7 +216,7 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
     try other.init(gpa, 1, true);
     const p1 = try other.pool(3, 20, false);
     defer other.deinit(p1);
-    try p1.mapWith(1, wire, twin);
+    try p1.mapWith(1, wire, twin, 0);
     const s = other.st(1);
     try expectEqualSlices(u32, wire[0..2], F.table(s.table, 2));
     try expectEqualSlices(u32, &.{ 0, 1 }, F.table(s.ltable, 2)); // twin pages 8 and 9: part 1's first two, part-local
@@ -227,8 +227,8 @@ test "kv shard pages: a follower maps rank 0's ids and twin, its latent table on
     try expect(p0.digest() != p1.digest());
     try p0.giveTwin(1);
     try expectEqual(p0.digest(), p1.digest());
-    try std.testing.expectError(error.BadStep, p1.mapWith(2, wire, 5)); // a twin longer than the step
-    try std.testing.expectError(error.KvShardPlacement, p1.mapWith(2, &.{ 1, 9 }, 0)); // across the parts
+    try std.testing.expectError(error.BadStep, p1.mapWith(2, wire, 5, 0)); // a twin longer than the step
+    try std.testing.expectError(error.KvShardPlacement, p1.mapWith(2, &.{ 1, 9 }, 0, 0)); // across the parts
     try std.testing.expect(!p1.used[2]);
 }
 
@@ -239,9 +239,9 @@ test "kv shard pages: a twin the other part has no room for is refused and count
     try f.init(gpa, 0, true);
     const p = try f.pool(3, 20, true);
     defer f.deinit(p);
-    _ = try p.openFor(1, 3000, 100, 1); // 7 pages of part 1, a twin of 6 in part 0
+    _ = try p.openWith(1, 3000, 100, 1, &.{}); // 7 pages of part 1, a twin of 6 in part 0
     try expectEqual(@as(usize, 6), p.twinCount(1));
-    const wire = try p.openFor(2, 600, 100, null); // 2 pages: part 0 alone has them; part 1 has 1 left for a twin of 2
+    const wire = try p.openWith(2, 600, 100, null, &.{}); // 2 pages: part 0 alone has them; part 1 has 1 left for a twin of 2
     try expectEqual(@as(usize, 2), wire.len);
     try expectEqual(@as(usize, 0), kvs.partOf(wire[0], 8));
     try expectEqual(@as(usize, 0), p.twinCount(2));
@@ -258,13 +258,13 @@ test "kv shard pages: TF_KV_POISON fills a stream's key pages and this rank's la
     const p = try f.pool(2, 20, false);
     defer f.deinit(p);
     p.poison = true;
-    try p.mapWith(1, &.{ 0, 1, 2 }, 0); // part 0's stream on rank 1: keys only
+    try p.mapWith(1, &.{ 0, 1, 2 }, 0, 0); // part 0's stream on rank 1: keys only
     try expectEqual(@as(usize, 3), F.fills);
     p.close(1);
-    try p.mapWith(1, &.{ 9, 10 }, 0); // its own part: keys and latent pages
+    try p.mapWith(1, &.{ 9, 10 }, 0, 0); // its own part: keys and latent pages
     try expectEqual(@as(usize, 3 + 4), F.fills);
     p.close(1);
-    try p.mapWith(1, &.{ 0, 1, 2, 9, 11 }, 2); // part 0's stream with a twin here: its keys and the twin's pages
+    try p.mapWith(1, &.{ 0, 1, 2, 9, 11 }, 2, 0); // part 0's stream with a twin here: its keys and the twin's pages
     try expectEqual(@as(usize, 7 + 3 + 2), F.fills);
     try p.giveTwin(1); // the twin given back: the rows stay, nothing filled again
     try expectEqual(@as(usize, 12), F.fills);
@@ -278,7 +278,7 @@ test "kv shard pages: a kept state's plan walks the latent rows by the latent ta
     try f.init(gpa, 1, true);
     const p = try f.pool(3, 20, false);
     defer f.deinit(p);
-    try p.mapWith(1, &.{ 12, 9, 14 }, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
+    try p.mapWith(1, &.{ 12, 9, 14 }, 0, 0); // part 1's stream on rank 1: latent pages 4, 1, 6
     const st = f.st(1);
     const at = 1200;
     const full = try layout.Plan.initFor(st, &f.e.w.config, at, null, true);
@@ -325,8 +325,8 @@ test "kv shard pages: a stream resuming a kept state is seated in the state's ho
     var streams: [2]lanes.Stream = undefined;
     streams[0].reuse = .{ .saved = &kept, .at = 4096 };
     streams[1].reuse = .{};
-    _ = try ln.seat(&streams[0], 600, 100); // both parts empty: the tie would pick part 0, its home is part 1
+    _ = try ln.seat(&streams[0], 600, 100, &.{}); // both parts empty: the tie would pick part 0, its home is part 1
     try expectEqual(@as(u8, 1), f.st(ln.lanes.get(&streams[0]).?.slot).hold.?.owner);
-    _ = try ln.seat(&streams[1], 600, 100); // no kept state: the part with fewer live streams
+    _ = try ln.seat(&streams[1], 600, 100, &.{}); // no kept state: the part with fewer live streams
     try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
 }

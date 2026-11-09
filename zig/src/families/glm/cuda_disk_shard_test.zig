@@ -214,9 +214,9 @@ const Pair = struct {
 
     /// A stream on slot `slot` on both ranks: rank 0 places it (in `home` when it has the room), rank 1 maps its ids.
     fn open(p: *Pair, slot: u32, n_prompt: usize, home: ?u8) !void {
-        const ids = try p.r[0].p.openFor(slot, n_prompt, reply, home);
+        const ids = try p.r[0].p.openWith(slot, n_prompt, reply, home, &.{});
         const twin = p.r[0].p.twinCount(slot);
-        if (p.r[0].e.settings.kv_shard.on) try p.r[1].p.mapWith(slot, ids, twin) else try p.r[1].p.map(slot, ids);
+        if (p.r[0].e.settings.kv_shard.on) try p.r[1].p.mapWith(slot, ids, twin, 0) else try p.r[1].p.map(slot, ids, 0);
     }
 
     fn close(p: *Pair, slot: u32) void {

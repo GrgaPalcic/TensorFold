@@ -7,6 +7,7 @@ const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
+const share_mod = @import("cuda_share.zig");
 const cuda = @import("cuda");
 const rule = @import("draft_rule.zig");
 
@@ -43,6 +44,7 @@ const Lane = struct {
     held_n: usize = 0,
     first: ?u64 = null,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    marks: []const u32 = &.{}, // TF_KV_SHARE: where the shared prompt store keeps this stream's pass (owned)
     raw: [max_held]f64 = undefined, // DFlash2's selector chances as drawn (chances may be cut or calibrated)
     lean: rule.Lean = .{}, // TF_GLM_DRAFT_RULE=tpm: the stream's own lean and tokens a ms
     windows: u64 = 0, // DFlash2 windows drafted (TF_GLM_DFLASH2_FORCE's turn)
@@ -66,6 +68,8 @@ pub const Lanes = struct {
 
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
+        var it = self.lanes.valueIterator();
+        while (it.next()) |l| self.x.e.gpa.free(l.marks);
         self.lanes.deinit(self.x.e.gpa);
     }
 
@@ -227,13 +231,14 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+        var keeps: share_mod.Keeps = undefined;
+        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps));
         self.lanes.getPtr(s).?.first = self.take(first);
     }
 
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
+        if (!self.x.e.m.tiled or ss.len > engine.max_together or share_mod.of(self.x.e) != null) return false; // the store keeps a pass alone
         for (ss) |s| if (!canBatch(s)) return false;
         var opened: usize = 0;
         errdefer for (ss[0..opened]) |s| releaseFn(ptr, s);
@@ -275,7 +280,8 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+        var keeps: share_mod.Keeps = undefined;
+        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps));
         if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
@@ -292,7 +298,8 @@ pub const Lanes = struct {
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
         try self.x.bind(l.slot);
-        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+        var keeps: share_mod.Keeps = undefined;
+        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, self.marksOf(s, &keeps)) catch |err| {
             if (err == error.Cancelled) return;
             return err;
         };
@@ -307,16 +314,39 @@ pub const Lanes = struct {
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (!fitsContext(ids.len, s.max_new, self.x.e.capacity)) return error.PromptTooLong;
-        const pages = try self.seat(s, ids.len, s.max_new);
+        const gpa = self.x.e.gpa;
+        const share = self.cached(s);
+        var owner: share_mod.Owner = .{};
+        var adopt: std.ArrayList(u32) = .empty;
+        defer adopt.deinit(gpa);
+        // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
+        const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
+        var held = true;
+        errdefer if (held) gpa.free(marks);
+        const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
         errdefer {
             self.x.e.release(self.lanes.get(s).?.slot);
             _ = self.lanes.remove(s);
         }
         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
-        try self.x.beginOn(s.sampling, pages);
+        try self.x.beginOn(s.sampling, pages, adopt.items.len);
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
+        const l = self.lanes.getPtr(s).?;
+        gpa.free(l.marks);
+        l.marks = marks;
+        held = false;
+        if (share) {
+            const k = owner.pending orelse return null;
+            s.cached = k.at;
+            return .{ .id = k.id, .at = k.at };
+        }
         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+    }
+
+    /// Whether the shared prompt store keeps this content-keyed pass, with no prompt logprob rows asked.
+    fn cached(self: *const Lanes, s: *const lanes.Stream) bool {
+        return share_mod.of(self.x.e) != null and share_mod.cacheable(s);
     }
 
     /// A prompt, its reply and the last verify window inside the capacity: equal still fits (the window's last row is
@@ -325,9 +355,14 @@ pub const Lanes = struct {
         return prompt + max_new + max_rows <= capacity;
     }
 
-    /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
-    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
-        const l = try self.claim(s);
+    /// The stream's slot, its pages (the store's `adopted` first, given back on a refusal), then its sequence: a slot
+    /// past the paged ones waits before binding makes a window. Sharded (TF_GLM_KV_SHARD), in its kept state's home
+    /// part when that has the room (`home`).
+    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize, adopted: []const u32) ![]const u32 {
+        const l = self.claim(s) catch |err| {
+            if (self.x.e.pages) |p| p.give(adopted);
+            return err;
+        };
         l.pending_rows = null;
         l.held_n = 0;
         l.fill = null;
@@ -337,18 +372,22 @@ pub const Lanes = struct {
             _ = self.lanes.remove(s);
         }
         const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
-        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null);
+        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null, adopted);
         try self.x.bind(l.slot);
         return pages;
     }
 
     /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now. Sharded
-    /// (TF_GLM_KV_SHARD), in its kept state's home part when that has the room (`home`).
-    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, home: ?u8) ![]const u32 {
+    /// (TF_GLM_KV_SHARD), in its kept state's home part when that has the room (`home`); with TF_KV_SHARE the store's
+    /// `adopted` pages first (never beside the shard: refused at start).
+    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, home: ?u8, adopted: []const u32) ![]const u32 {
         const p = self.x.e.pages orelse return &.{};
-        if (!p.paged(slot)) return error.LaneMemory; // every paged sequence is taken
+        if (!p.paged(slot)) { // every paged sequence is taken
+            p.give(adopted);
+            return error.LaneMemory;
+        }
         p.close(slot); // a stream that opens again gives its earlier pages back first
-        return p.openFor(slot, prompt, max_new, home);
+        return p.openWith(slot, prompt, max_new, home, adopted);
     }
 
     /// The home part of the kept state a stream may resume (TF_GLM_KV_SHARD; null: none, or unsharded).
@@ -374,7 +413,11 @@ pub const Lanes = struct {
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    fn marksOf(s: *lanes.Stream) ?engine.Marks {
+    fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *share_mod.Keeps) ?engine.Marks {
+        if (self.cached(s)) {
+            const l = self.lanes.getPtr(s) orelse return null;
+            return share_mod.marks(self.x.e, l.slot, s, l.marks, keeps);
+        }
         return if (s.reuse.hook == null) null else .{
             .at = s.reuse.marks,
             .ctx = s,
@@ -734,6 +777,7 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
+        self.x.e.gpa.free(kv.value.marks);
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
     }
