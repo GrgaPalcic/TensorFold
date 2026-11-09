@@ -3,9 +3,12 @@
 Run against a live OpenAI-compatible server (tensorfold-native serve) before and after each engine change of
 the KV-share port; the JSON report it writes is what decides whether a build ships. Deterministic filler
 prompts from a fixed seed, temperature 0, streaming so time to first token is observed; every comparison is on
-sha256 of the streamed content. A pool census (GET /metrics and /health) is taken before and after the run and
-the deltas reported; the server's own idle line is in its log, not the API, so the metric names found are
-printed for the operator to match. Standard library only, so it runs on a bare host.
+sha256 of the streamed content. Prompt sizes are calibrated against the live server's tokenizer before the
+sized runs (one small probe fixes the tokens-per-line ratio), and the context limit is read from /health (or
+/v1/models) so an oversized request is a listed failure, not an exception. A pool census (GET /metrics and
+/health) is taken before and after the run and the deltas reported; the server's own idle line is in its log,
+not the API, so the metric names found are printed for the operator to match. Standard library only, so it
+runs on a bare host.
 
   python3 tools/share_gate.py http://127.0.0.1:8888 --model MODEL --out report.json
   python3 tools/share_gate.py http://127.0.0.1:8888 --model MODEL --sizes 128 --levels 1,2 --out t.json
@@ -31,44 +34,71 @@ if sys.version_info < (3, 11):
              "TensorFold's tools use PEP 604 unions. Try: python3.12 tools/share_gate.py ...")
 
 PHASES = ("cold", "warm", "appended")
-SCHEMA_VERSION = 1
-POOL_METRICS = ("kv_pool_", "prompt_cache_")
+SCHEMA_VERSION = 2
+PROBE_TOKENS = 256
+PROBE_TOLERANCE = 0.05  # a measured prompt_tokens within +-5 % of the asked size passes
 HEX64 = re.compile(r"[0-9a-f]{64}")
+METRIC_PREFIX = "tensorfold:"
+METRIC_KEYWORDS = ("kv_", "prompt_cache")
 
 
-def filler(seed: int, tokens: int) -> str:
+def filler(seed: int, tokens: int, per_line: float = 4.0) -> str:
     """A deterministic prompt of roughly ``tokens`` tokenizer tokens: numbered lines of words from a fixed list."""
     words = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
              "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
              "xray yankee zulu").split()
-    # roughly 4 tokens per line at the sizes in the plan (4 words, a number and the newline breaks)
-    lines = max(1, (tokens + 3) // 4)
+    # per_line tokens per line as measured by the calibration probe (roughly 4 by eye before it runs)
+    lines = max(1, round(tokens / per_line))
     out = []
     for i in range(lines):
         out.append(" ".join(words[(seed + i * 7 + j * 3) % len(words)] for j in range(4)) + f" line {i}")
     return (f"Fixture seed {seed}: count the lines below and reply with the number only.\n" + "\n".join(out))
 
 
+def context_limit(base: str) -> tuple[int | None, str | None]:
+    """The server's context limit: /health's ``context``/``max_context``, else /v1/models' ``max_model_len``."""
+    try:
+        with urllib.request.urlopen(base + "/health", timeout=30) as resp:
+            health = json.loads(resp.read().decode())
+        for key in ("context", "max_context"):
+            if isinstance(health.get(key), (int, float)) and health[key] > 0:
+                return int(health[key]), None
+    except (ValueError, urllib.error.URLError, OSError) as exc:
+        return None, f"health: {exc}"
+    try:
+        with urllib.request.urlopen(base + "/v1/models", timeout=30) as resp:
+            models = json.loads(resp.read().decode())
+        for model in models.get("data", []):
+            if isinstance(model.get("max_model_len"), (int, float)) and model["max_model_len"] > 0:
+                return int(model["max_model_len"]), None
+    except (ValueError, urllib.error.URLError, OSError) as exc:
+        return None, f"models: {exc}"
+    return None, None
+
+
 def metrics_snapshot(base: str) -> dict:
-    """The KV-pool census: the metric lines the gate matches, plus /health, all failures recorded not raised."""
+    """The KV-pool census: metric lines containing kv_ or prompt_cache after an optional tensorfold: prefix."""
     snap: dict = {"metrics": {}, "health": None, "error": None}
     try:
         with urllib.request.urlopen(base + "/metrics", timeout=30) as resp:
             body = resp.read().decode()
         for line in body.splitlines():
-            name = line.split(" ")[0].split("{")[0]
-            if name.startswith(POOL_METRICS):
+            name = line.split(" ")[0]
+            bare = name.split("{", 1)[0]
+            if bare.startswith(METRIC_PREFIX):
+                bare = bare[len(METRIC_PREFIX):]
+            if "kv_" in bare or "prompt_cache" in bare:
                 try:
                     snap["metrics"][line] = float(line.rsplit(" ", 1)[1])
                 except (ValueError, IndexError):
                     snap["metrics"][line] = line.rsplit(" ", 1)[-1]
     except (urllib.error.URLError, OSError) as exc:
-        snap["error"] = type(exc).__name__
+        snap["error"] = f"{type(exc).__name__}: {exc}"
     try:
         with urllib.request.urlopen(base + "/health", timeout=30) as resp:
             snap["health"] = resp.read().decode()[:200]
     except (urllib.error.URLError, OSError) as exc:
-        snap["error"] = snap["error"] or type(exc).__name__
+        snap["error"] = snap["error"] or f"{type(exc).__name__}: {exc}"
     return snap
 
 
@@ -152,7 +182,7 @@ def alone(base: str, model: str, prompt: str, *, thinking: bool, api_key: str | 
 def one_concurrent(base: str, model: str, prompt: str, seed: int, label: str, *, draft: bool,
                    thinking: bool, api_key: str | None, gate: threading.Barrier | None,
                    timeout: float = 3600.0) -> dict:
-    """One of the ``level`` requests sent at once; the reply's hash is compared with the prompt's alone run."""
+    """One of the ``level`` requests sent at once; the reply's hash is compared with its own seed's alone run."""
     try:
         if gate is not None:
             gate.wait(timeout=30)
@@ -161,24 +191,28 @@ def one_concurrent(base: str, model: str, prompt: str, seed: int, label: str, *,
     except Exception as exc:  # noqa: BLE001 - a failed request is reported, not fatal
         if gate is not None:
             gate.abort()
-        return {"label": label, "seed": seed, "sha256": None, "equal_alone": None, "error": type(exc).__name__}
+        return {"label": label, "seed": seed, "sha256": None, "equal_alone": None,
+                "error": f"{type(exc).__name__}: {exc}"}
     return {"label": label, "seed": seed, "sha256": sha, **record}
 
 
-def concurrency(base: str, model: str, prompt: str, reference: dict, level: int, *, draft: bool,
+def concurrency(base: str, model: str, reference: dict, level: int, *, draft: bool,
                 thinking: bool, api_key: str | None, timeout: float = 3600.0) -> dict:
-    """``level`` copies of the 4,096-token prompt at once: distinct seeds plus one same-prompt run."""
+    """``level`` copies at once: seeds 1..level-1 distinct plus one seed-0 same-prompt run, each against its own seed's alone hash."""
     gate = threading.Barrier(level)
     with concurrent.futures.ThreadPoolExecutor(max_workers=level) as pool:
-        futures = [pool.submit(one_concurrent, base, model, filler(seed, 4096), seed, "distinct", draft=draft,
-                               thinking=thinking, api_key=api_key, gate=gate, timeout=timeout)
-                   for seed in range(level - 1)]
-        futures.append(pool.submit(one_concurrent, base, model, prompt, 0, "same", draft=draft,
+        futures = [pool.submit(one_concurrent, base, model, reference["prompts"][seed], seed, "distinct",
+                               draft=draft, thinking=thinking, api_key=api_key, gate=gate, timeout=timeout)
+                   for seed in range(1, level)]
+        futures.append(pool.submit(one_concurrent, base, model, reference["prompts"][0], 0, "same", draft=draft,
                                    thinking=thinking, api_key=api_key, gate=gate, timeout=timeout))
         out = [f.result() for f in futures]
-    ref = reference["cold"]["sha256"]
     for run in out:
-        run["equal_alone"] = None if run["sha256"] is None or not HEX64.fullmatch(ref) else run["sha256"] == ref
+        ref = reference["hashes"].get(run["seed"])
+        run["alone_sha256"] = ref
+        run["alone_prompt"] = reference["prompts"].get(run["seed"])
+        run["equal_alone"] = None if run["sha256"] is None or not HEX64.fullmatch(ref or "") \
+            else run["sha256"] == ref
     return {"level": level, "draft": draft, "runs": out}
 
 
@@ -197,35 +231,72 @@ def compare(alone: dict) -> list[str]:
     return fails
 
 
+def calibration_probe(base: str, model: str, *, thinking: bool, api_key: str | None,
+                      timeout: float) -> tuple[float, int | None]:
+    """One small probe prompt: the reply's usage.prompt_tokens fixes this server's tokens per filler line."""
+    probe = filler(0, PROBE_TOKENS)
+    try:
+        record, _ = request_case(base, model, probe, draft=True, appended=False, thinking=thinking,
+                                 api_key=api_key, timeout=timeout)
+        tokens = record.get("prompt_tokens")
+        if not tokens:
+            raise RuntimeError("usage.prompt_tokens missing from the probe reply")
+        lines = probe.count("\n")  # every counted line is one filler line
+        return tokens / lines, tokens
+    except Exception as exc:  # noqa: BLE001 - a failed probe is a listed failure, not a crash
+        raise RuntimeError(f"calibration probe failed: {type(exc).__name__}: {exc}") from exc
+
+
 def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking: bool, timeout: float,
         api_key: str | None, seed: int = 0) -> dict:
-    """The whole gate: per-size alone runs, drafted runs, concurrent cells and a pool census around it all."""
+    """The whole gate: calibrate, per-size alone runs, drafted runs, concurrent cells and a pool census."""
     deadline = time.monotonic() + timeout
     report: dict = {"schema_version": SCHEMA_VERSION, "base": base, "model": model, "thinking": thinking,
                     "sizes": sizes, "levels": levels, "cases": [], "concurrency": [], "failures": []}
     report["census_before"] = metrics_snapshot(base)
     if report["census_before"]["error"]:
         report["failures"].append(f"census_before: {report['census_before']['error']}")
-    shared_prompt = filler(seed, 4096)          # the concurrent cells' same-prompt run and its alone reference
-    shared_sha: str | None = None               # that prompt's alone cold run, taken once
-    measured: list[int] = []
+    # calibration: one small probe fixes this server's tokens per filler line before any sized run
+    try:
+        per_line, probe_tokens = calibration_probe(base, model, thinking=thinking, api_key=api_key,
+                                                   timeout=timeout)
+        report["calibration"] = {"probe_tokens": probe_tokens,
+                                 "tokens_per_line": round(per_line, 4)}
+    except RuntimeError as exc:
+        report["calibration"] = {"error": str(exc)}
+        report["failures"].append(f"calibration: {exc}")
+        report["pass"] = False
+        return report
+    limit, limit_error = context_limit(base)
+    report["context_limit"] = limit
+    if limit_error:
+        report["failures"].append(f"context_limit: {limit_error}")
     for size in sizes:
-        prompt = shared_prompt if size == 4096 else filler(seed, size)
+        prompt = filler(seed, size, per_line=per_line)
         entry: dict = {"requested_tokens": size, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
+        fits = limit is None or size + 64 <= limit
+        if not fits:
+            report["failures"].append(f"size {size}: size_over_context (context limit {limit})")
+            entry["failures"] = ["size_over_context"]
+            report["cases"].append(entry)
+            continue
         try:
             entry["alone"] = alone(base, model, prompt, thinking=thinking, api_key=api_key, timeout=timeout)
             record, sha = request_case(base, model, prompt, draft=False, appended=False,
                                        thinking=thinking, api_key=api_key, timeout=timeout)
             entry["drafted"] = {**record, "sha256": sha}
-        except Exception as exc:  # noqa: BLE001 - stop on the first HTTP error and report it
-            entry["error"] = type(exc).__name__
+        except Exception as exc:  # noqa: BLE001 - a failed run is caught and recorded with its message
+            entry["error"] = f"{type(exc).__name__}: {exc}"
             report["failures"].append(f"size {size}: {entry['error']}")
             report["cases"].append(entry)
-            break
-        if size == 4096:
-            shared_sha = entry["alone"]["cold"]["sha256"]
-        measured.append(entry["alone"]["cold"]["prompt_tokens"] or 0)
-        entry["failures"] = compare(entry["alone"])
+            continue
+        measured_tokens = entry["alone"]["cold"]["prompt_tokens"] or 0
+        entry["measured_tokens"] = measured_tokens
+        # the asked size must land within +-5 % of what the tokenizer counted, or the report says size_off
+        entry["failures"] = []
+        if measured_tokens and abs(measured_tokens - size) / size > PROBE_TOLERANCE:
+            entry["failures"].append("size_off")
+        entry["failures"] += compare(entry["alone"])
         # drafted = plain: the plain-decode run must hash equal to the cold run of the same prompt
         if entry["drafted"].get("sha256") is not None:
             if entry["drafted"]["sha256"] != entry["alone"]["cold"]["sha256"]:
@@ -237,28 +308,36 @@ def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking:
         if time.monotonic() > deadline:
             report["failures"].append(f"timeout after {timeout:g}s")
             break
+    # every seed used in a level first gets its own alone reply; copies compare only with it.
+    # seed 0 is the same-prompt copy, seeds 1..level-1 the distinct ones
+    max_level = max(levels, default=0)
+    reference: dict = {"prompts": {}, "hashes": {}}
+    for seed_ in range(max(max_level, 1)):
+        prompt_ = filler(seed_, PROBE_TOKENS, per_line=per_line)
+        reference["prompts"][seed_] = prompt_
+        try:
+            reference["hashes"][seed_] = alone(base, model, prompt_, thinking=thinking, api_key=api_key,
+                                               timeout=timeout)["cold"]["sha256"]
+        except Exception as exc:  # noqa: BLE001 - a failed alone run is a listed failure
+            reference["hashes"][seed_] = None
+            report["failures"].append(f"concurrent reference seed {seed_}: {type(exc).__name__}: {exc}")
     for level in levels:
         for draft in (True, False):
-            if shared_sha is None:      # the size run broke before the 4,096 reference existed
-                try:
-                    shared_sha = alone(base, model, shared_prompt, thinking=thinking, api_key=api_key,
-                                       timeout=timeout)["cold"]["sha256"]
-                except Exception as exc:  # noqa: BLE001
-                    report["failures"].append(f"concurrent reference: {type(exc).__name__}")
-                    break
             try:
-                cell = concurrency(base, model, shared_prompt, {"cold": {"sha256": shared_sha}},
-                                   level, draft=draft, thinking=thinking, api_key=api_key, timeout=timeout)
-            except Exception as exc:  # noqa: BLE001
-                cell = {"level": level, "draft": draft, "error": type(exc).__name__}
-                report["failures"].append(f"concurrent level {level} draft {draft}: {cell['error']}")
-                break
+                cell = concurrency(base, model, reference, level, draft=draft, thinking=thinking,
+                                   api_key=api_key, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - a failed cell is a listed failure
+                report["failures"].append(
+                    f"concurrent level {level} draft {draft}: {type(exc).__name__}: {exc}")
+                continue
             report["concurrency"].append(cell)
             for run_ in cell["runs"]:
                 if run_["equal_alone"] is False:
-                    report["failures"].append(f"concurrent level {level} draft {draft}: hash differs from alone")
+                    report["failures"].append(
+                        f"concurrent level {level} draft {draft}: seed {run_['seed']} hash differs from alone")
                 elif run_["equal_alone"] is None and "error" not in run_:
-                    report["failures"].append(f"concurrent level {level} draft {draft}: unverified against alone")
+                    report["failures"].append(
+                        f"concurrent level {level} draft {draft}: seed {run_['seed']} unverified against alone")
             if time.monotonic() > deadline:
                 report["failures"].append(f"timeout after {timeout:g}s")
                 break
@@ -266,7 +345,6 @@ def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking:
     if report["census_after"]["error"]:
         report["failures"].append(f"census_after: {report['census_after']['error']}")
     report["census_delta"] = census_delta(report["census_before"], report["census_after"])
-    report["measured_prompt_tokens"] = measured[0] if measured else None
     report["pass"] = not report["failures"]
     return report
 
@@ -286,19 +364,22 @@ def plan(sizes: list[int], levels: list[int], *, thinking: bool, draft: bool = T
 
 
 def summary(report: dict) -> str:
-    """The one-screen table: case, tokens, cold s, warm s, equal?."""
-    rows = ["case                tokens  cold s   warm s   equal?"]
+    """The one-screen table: case, tokens (measured), cached, cold s, warm s, equal?."""
+    rows = ["case                tokens  cached  cold s   warm s   equal?"]
     for case in report.get("cases", []):
-        alone = case.get("alone")
-        if not alone:
-            rows.append(f"{case['requested_tokens']:<19} {case.get('error', 'error')}")
+        alone_ = case.get("alone")
+        if not alone_:
+            note = case["failures"][0] if case.get("failures") else case.get("error", "error")
+            rows.append(f"{case['requested_tokens']:<19} {note}")
             continue
         equal = "yes" if not case.get("failures") else "NO"
-        rows.append(f"{case['requested_tokens']:<19} {str(alone['cold']['prompt_tokens']):>6} "
-                    f"{alone['cold']['total_s']:>8.2f} {alone['warm']['total_s']:>8.2f}   {equal}")
+        cached = alone_["cold"].get("resumed_from")
+        rows.append(f"{case['requested_tokens']:<19} {str(case.get('measured_tokens', alone_['cold']['prompt_tokens'])):>6} "
+                    f"{str(cached if cached is not None else '-'):>6} "
+                    f"{alone_['cold']['total_s']:>8.2f} {alone_['warm']['total_s']:>8.2f}   {equal}")
     for cell in report.get("concurrency", []):
         equal = "yes" if all(r["equal_alone"] is True for r in cell["runs"]) else "NO"
-        rows.append(f"concurrent L{cell['level']} draft={cell['draft']!s:<5} {'':>6} {'':>8} {'':>8}   {equal}")
+        rows.append(f"concurrent L{cell['level']} draft={cell['draft']!s:<5} {'':>6} {'':>6} {'':>8} {'':>8}   {equal}")
     rows.append(f"pass: {report['pass']}")
     if report.get("failures"):
         rows.append("failing comparisons:")
