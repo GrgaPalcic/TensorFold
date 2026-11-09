@@ -423,7 +423,7 @@ const Store = struct {
         x.store.deinit();
     }
     fn reclaim(ctx: *anyopaque, want: usize) bool {
-        return of(ctx).store.reclaim(want);
+        return of(ctx).store.reclaim(want, null);
     }
     fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!kp.Plan {
         const x = of(ctx);

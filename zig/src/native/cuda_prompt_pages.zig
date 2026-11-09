@@ -27,8 +27,9 @@ pub fn hint(comptime F: type, loaded: anytype) []const u8 {
 /// The store over the family's pool: its pages in the tree, the rest of a state from the family's `snap_*` decls.
 pub const Adapter = struct {
     gpa: Allocator,
-    src: hooks.Pool, // the family's pages: one pool, or a sharded pool's parts (each part its own reclaim, below)
+    src: hooks.Pool, // the family's pages: one pool, or a sharded pool's parts (each part its own reclaim below)
     store: radix.Store,
+    part: [2]Part = undefined, // each part's reclaim hook (the parts variant)
     detach: *const fn (*anyopaque) void,
     target: *anyopaque,
 
@@ -51,7 +52,10 @@ pub const Adapter = struct {
         x.store = try radix.Store.init(gpa, copies, x.pages(), rules);
         switch (src) {
             .one => |pool| pool.reclaim = .{ .ctx = x, .call = reclaim }, // a promise or a hold evicts the tree's idle pages before it fails
-            .parts => {}, // each part's own reclaim, with the part filter a leaf evicts by (reclaimPart)
+            .parts => |s| for (0..s.count) |i| { // a part's promise evicts its own leaves first (its hook below)
+                x.part[i] = .{ .x = x, .at = i };
+                s.setReclaim(s.ctx, i, .{ .ctx = &x.part[i], .call = reclaimPart });
+            },
         }
         x.store.limit(.{ .pages = switch (src) {
             .one => |pool| pool.total(),
@@ -123,7 +127,28 @@ pub const Adapter = struct {
     }
 
     fn reclaim(ctx: *anyopaque, want: usize) bool {
-        return of(ctx).store.reclaim(want);
+        return of(ctx).store.reclaim(want, null);
+    }
+
+    /// A sharded pool's part as its pool's reclaim hook: evict the tree's idle leaves of this part until `want`
+    /// pages are free in it — never the other part's, whose rank's streams do not wait on this one.
+    const Part = struct { x: *Adapter, at: usize };
+
+    fn reclaimPart(ctx: *anyopaque, want: usize) bool {
+        const h: *Part = @ptrCast(@alignCast(ctx));
+        return h.x.store.reclaim(want, .{ .ctx = h, .f = leafInPart, .free = partFree });
+    }
+
+    fn leafInPart(ctx: *anyopaque, first: u32) bool {
+        const h: *Part = @ptrCast(@alignCast(ctx));
+        const s = h.x.src.parts;
+        return s.inPart(s.ctx, h.at, first);
+    }
+
+    fn partFree(ctx: *anyopaque) usize {
+        const h: *Part = @ptrCast(@alignCast(ctx));
+        const s = h.x.src.parts;
+        return s.free(s.ctx, h.at);
     }
 
     fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!hooks.Plan {

@@ -268,16 +268,61 @@ test "reclaim frees the pages of the least valuable leaf nobody holds, and spare
     var rest: [54]u32 = undefined;
     f.lane(&rest); // the pool is full
     try std.testing.expectEqual(@as(usize, 0), Fake.available(&f));
-    try std.testing.expect(s.reclaim(3));
+    try std.testing.expect(s.reclaim(3, null));
     try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
     try std.testing.expect(s.find(&seq(26, 0)) == null);
     for (y_pages) |id| f.refs[id] += 1; // a stream holds the other's pages
-    try std.testing.expect(!s.reclaim(100));
+    try std.testing.expect(!s.reclaim(100, null));
     try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
     for (y_pages) |id| f.refs[id] -= 1;
     s.limit(.{ .pages = 40, .snaps = 0 });
     try std.testing.expectEqual(@as(usize, 0), s.tree.held_pages);
     try std.testing.expectEqual(@as(usize, 0), f.live);
+}
+
+/// A leaf filter's part over the Fake's pages (a sharded pool's): part 0 the low ids, part 1 the high.
+const Part0 = struct {
+    fn leaf(_: *anyopaque, first: u32) bool {
+        return first < 32;
+    }
+    fn free(ptr: *anyopaque) usize {
+        const f: *Fake = @ptrCast(@alignCast(ptr));
+        var n: usize = 0;
+        for (f.refs[0..32]) |r| n += @intFromBool(r == 0);
+        return n;
+    }
+};
+
+test "reclaim with a leaf filter evicts only the leaves that pass, the sharded pool's part that is short" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = std.testing.allocator };
+    var s = try newStore(&f, rules);
+    defer s.deinit();
+    s.limit(.{ .pages = 64, .snaps = 4 });
+    var mine: std.ArrayList(u32) = .empty;
+    const x = seq(24, 0); // the first pass keeps its state on the pool's low pages: part 0
+    _ = try pass(&f, &s, a, &x, 20, &.{}, &mine);
+    f.leave(mine.items);
+    var held0: [27]u32 = undefined;
+    f.lane(&held0); // part 0's free pages stay taken: the part is short, its leaves its only room
+    const y = seq(24, 100); // the second pass's pages are the pool's high ones: part 1
+    _ = try pass(&f, &s, a, &y, 20, &.{}, &mine);
+    f.leave(mine.items);
+    for (mine.items) |id| try std.testing.expect(id >= 32); // the second state's leaves are part 1's
+    try std.testing.expectEqual(@as(usize, 2), s.tree.snaps);
+    const filter: radix.LeafFilter = .{ .ctx = &f, .f = Part0.leaf, .free = Part0.free };
+    try std.testing.expect(s.reclaim(1, filter)); // the part-0 promise evicts part-0 leaves alone
+    try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
+    try std.testing.expect(s.find(&seq(26, 0)) == null); // the part-0 state went
+    try std.testing.expect(s.find(&y) != null); // the part-1 state stays
+    var again: [5]u32 = undefined;
+    f.lane(&again); // part 0 short again, and no part-0 leaf left to evict
+    try std.testing.expect(!s.reclaim(1, filter));
+    try std.testing.expectEqual(@as(usize, 1), s.tree.snaps);
+    try std.testing.expect(!s.reclaim(100, null)); // no filter: the part-1 leaf goes too, then none is left
+    try std.testing.expectEqual(@as(usize, 0), s.tree.snaps);
 }
 
 test "a history every turn resumes again after one kept a longer state is a branch point: its turns never supersede it" {

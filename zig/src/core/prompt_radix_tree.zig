@@ -10,6 +10,16 @@ pub const Snapshots = pc.Snapshots;
 pub const Pages = pc.Pages;
 pub const Counts = pc.Counts;
 
+/// Which leaves an evict may take, and how free where they lie: a sharded pool's part (cuda_prompt_pages,
+/// TF_GLM_KV_SHARD) evicts only its own leaves until `want` are free in it; null (or `free` null) takes any leaf
+/// until the pages' available says so. A leaf's pages always lie in one part.
+pub const LeafFilter = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, first: u32) bool,
+    /// Pages free where the filter's leaves lie (null: the pages' available).
+    free: ?*const fn (ctx: *anyopaque) usize = null,
+};
+
 /// The state kept at a node's end.
 pub const Entry = struct {
     saved: Saved,
@@ -244,15 +254,17 @@ pub const Tree = struct {
         return a.used < b.used;
     }
 
-    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node) void {
-        if (n.parent != null and n.kids.items.len == 0 and t.idle(n) and (best.* == null or lessValuable(n, best.*.?))) best.* = n;
-        for (n.kids.items) |k| t.weakestLeaf(k, best);
+    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node, in: ?LeafFilter) void {
+        if (n.parent != null and n.kids.items.len == 0 and n.pages.len > 0 and t.idle(n) and
+            (in == null or in.?.f(in.?.ctx, n.pages[0])) and (best.* == null or lessValuable(n, best.*.?))) best.* = n;
+        for (n.kids.items) |k| t.weakestLeaf(k, best, in);
     }
 
-    /// Evicts the least valuable leaf nobody holds; false when there is none.
-    pub fn evictLeaf(t: *Tree) bool {
+    /// Evicts the least valuable leaf nobody holds; false when there is none. `in`: only leaves whose first page
+    /// passes (a sharded pool's per-part reclaim evicts the part that is short's leaves alone, cuda_prompt_pages).
+    pub fn evictLeaf(t: *Tree, in: ?LeafFilter) bool {
         var best: ?*Node = null;
-        t.weakestLeaf(t.root, &best);
+        t.weakestLeaf(t.root, &best, in);
         const n = best orelse return false;
         if (n.entry != null) t.evict(n) else t.prune(n);
         return true;

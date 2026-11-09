@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 pub const Saved = tree_mod.Saved;
 pub const Snapshots = tree_mod.Snapshots;
 pub const Pages = tree_mod.Pages;
+pub const LeafFilter = tree_mod.LeafFilter;
 pub const Counts = tree_mod.Counts;
 pub const Node = tree_mod.Node;
 pub const Tree = tree_mod.Tree;
@@ -77,7 +78,7 @@ pub const Store = struct {
     pub fn limit(s: *Store, limits: Limits) void {
         s.limits = limits;
         while (s.tree.snaps > limits.snaps) s.tree.evict(s.victim(&.{}, null) orelse break);
-        while (s.tree.held_pages > limits.pages) if (!s.tree.evictLeaf()) break;
+        while (s.tree.held_pages > limits.pages) if (!s.tree.evictLeaf(null)) break;
     }
 
     /// Whether anything can be kept.
@@ -296,11 +297,17 @@ pub const Store = struct {
         return moved orelse oldest;
     }
 
-    /// Evicts until `want` pool pages are free and not promised; false when the tree cannot give that many.
-    pub fn reclaim(s: *Store, want: usize) bool {
-        const pages = s.tree.pages;
-        while (pages.vtable.available(pages.ptr) < want) if (!s.tree.evictLeaf()) return false;
+    /// Evicts until `want` pages are free where `in`'s leaves lie (null: the pages' available) and not promised;
+    /// false when the tree cannot give that many.
+    pub fn reclaim(s: *Store, want: usize, in: ?tree_mod.LeafFilter) bool {
+        while (freeIn(s.tree.pages, want, in)) if (!s.tree.evictLeaf(in)) return false;
         return true;
+    }
+
+    /// Whether fewer than `want` pages are free where `in`'s leaves lie (null: the pages' available).
+    fn freeIn(pages: tree_mod.Pages, want: usize, in: ?tree_mod.LeafFilter) bool {
+        const n = if (in) |x| (if (x.free) |f| f(x.ctx) else pages.vtable.available(pages.ptr)) else pages.vtable.available(pages.ptr);
+        return n < want;
     }
 
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the tree holds.
