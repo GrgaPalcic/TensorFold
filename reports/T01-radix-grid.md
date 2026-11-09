@@ -1,125 +1,81 @@
-# T02 report: port upstream `40c03bf13` — `TF_KV_SHARE=n` native-CUDA adapter over the core pool
+# T01 report: `prompt_radix` learns a lookahead and a planned grid (upstream a2d27dac7, a3a53dbe3)
 
 ## What was done
 
-Ported upstream `40c03bf13` (+337/−14, PR #1755, part of #1657) onto our pin (`f350cd3e` + the recipe's 112 engine
-patches, after T01's `prompt_radix` lookahead + grid). Commit `f28cb7a` on `task/T02-share-adapter`.
+Ported upstream PR #1659 (commits `a2d27dac7` and `a3a53dbe3`) onto the pin:
 
-- **`zig/src/core/kv_prompts.zig`** (new, 89 lines, from the patch verbatim): the hooks a family on the core pool
-  calls — `Prompts` (begin/keep/report/free vtable), `Plan` (resume point + marks), `Blob` (a kept state's copied
-  rows in store-held pages, `pagesFor`/`each`) — plus `sharing()`, which reads `TF_KV_SHARE` (unset/empty/0: off;
-  a count: on; other text: `error.BadKvShare`, refused by name at start) and the blob-walk test.
-- **`zig/src/core/kv_pool.zig`**: `Budget.kept_ppm` (parts per million of the cache made pages past the windows),
-  `Plan.kept` (the cache bytes made pages), the `plan()` arithmetic upstream's hunks 2–3 add (kept carved out of the
-  cache before the slots/copies split, added to the page cap), and `Pool.hold(out)` — `out.len` free pages the store
-  holds itself, the pool's `reclaim` asked first, exactly as `promise` does.
-- **`zig/src/core/kv_pool_test.zig`**: upstream's three new cases (the kept-share plan; the store holding free pages,
-  never promised ones; a hold past the free pages asking the store to reclaim, via a `Shed` test double).
-- **`zig/src/core/root.zig`**: `kv_prompts` exported and referenced from the core test block.
-- **`zig/src/native/cuda_prompt_pages.zig`** (new, from the patch + the reference tree's final forms):
-  `wanted`/`could`/`hint` and `Adapter.open(F, gpa, target, page_tokens, snap_limit)` — one `radix.Store` over the
-  family's `kv.Pool` via `radix.pagesOf(kv.Pool, pool, pool.page_bytes)`, rules from `snaps.cacheRules(F)` plus
-  `page`, `planned`/`grid` from `F.share_grid` (final form, from fb1094b16), `min_gap = 256`, `tail = true`; limits
-  `pages = pool.total()`, `snaps = n`; the pool's `reclaim` evicts the tree's idle pages first; `F.share_attach`
-  gets the hooks (and `null` on `close`, which also clears the pool's `reclaim` and deinits the store). Two host
-  tests (the Fake family: a kept prompt's pages resume a later one, adopted, every page back on close; and the
-  `hint` note a state past the unpaged budget names).
-- **`zig/src/native/cuda.zig`**: `Host.prompts`; `prompt_pages.wanted(F, loaded)` after load, refusing
-  `--learn-conversations` together with it; `kv_pages.plan(..., kept_ppm)` with `1_000_000` when sharing (so the
-  cache's budget becomes pool pages for that family); the startup line's cache part becomes
-  ", the prompt cache over the pool's pages" when sharing; the flat `prompt_cache.Store` is skipped when sharing
-  (`and !share` on our `kept_budget > 0` condition, upstream's `cache > 0 and !ownCache(loaded) and !share`);
-  `Adapter.open` beside the store's errdefer, closed in `Host.close`.
-- **`zig/src/native/cuda_host_close.zig`**: `if (h.prompts) |x| x.close()` before the family frees the pool.
-- **`zig/src/native/cuda_kv_pool.zig`**: `plan()` takes `kept_ppm: u32` (0 in host mode) beside our `Facts`;
-  `kept()` adds `p.kept` to the no-`snap_slots` family's copied budget (the store's budget held as pool pages) —
-  beside our `skipped` field, which the recipe's host-tier work added and stays as it was.
-- **`zig/src/native/cuda_kv_safety_test.zig`**: the planner call passes `0`.
-- **`zig/build/cuda.zig`**: the `prompt_pages` module import on the `tf-cuda-test` runner, as upstream wires it (the
-  adapter's tests compile in the runner; on the host they run inside the native module's `test-cuda-host` run).
+- `zig/src/core/prompt_radix.zig` — the store's rules gain `lookahead` and use the existing `planned`/`grid`:
+  a store asserts nothing at init any more; rules it cannot keep (`page == 0`, or `planned` with a grid that is
+  0 or not a multiple of `page`) return `error.BadPromptRadixRules` in every build (`a3a53dbe3`). The step a pass
+  cuts and resumes on is the grid for a planned store, else the page; `past()` is the lookahead a resume leaves
+  (at least one token left to prefill); `find` and the keep/held paths match a state together with the tokens past
+  it, so a page whose next token differs is not shared.
+- `zig/src/core/prompt_radix_tree.zig` — `deepest` takes the store's step and only stops on multiples of it;
+  page matching and tree insertions carry the lookahead.
+- `zig/src/core/prompt_radix_test.zig` — seven new tests: the golden test (lookahead 0 and no grid: resume and
+  evict exactly as the store before the PR kept them), lookahead 1 resume and sharing, planned grid marks/keeps,
+  the GLM shape (grid 16, page 4, lookahead 1) and the rules-refusal test.
 
-## Rejects resolved (12 hunks)
+The first commit of the task (an earlier run cut off) had applied both patches with `git apply --reject` and
+resolved the rejects; I verified that state rather than starting over:
 
-`git apply --reject` landed 17 of 29 hunks; 12 rejected and were resolved by hand against the reference tree
-(`/home/user/invt/glm-kv-share/tf-at-share`, final forms):
+- No `*.rej` or `*.orig` files remain.
+- All 20 patch hunks landed: `a2d27dac7` 9 hunks in `prompt_radix.zig`, 1 in `prompt_radix_test.zig`,
+  8 in `prompt_radix_tree.zig`; `a3a53dbe3` 1 hunk in `prompt_radix.zig`, 1 in the test file.
+- All three files are byte-identical to the reference tree `/home/user/invt/glm-kv-share/tf-at-radix`
+  (upstream at exactly `a3a53dbe3`), as the task requires: `diff` clean on all three.
+- The recipe's behaviour is untouched: the PR touches only the three core files; nothing else in our tree
+  (recipe patches 0108/0109/0110, the families, `kv_pool`) differs from the pin because of this port.
 
-- `zig/build/cuda.zig` (1): our runner lacks the `moss_image_cuda`/`spark25` lines the context anchored on; the
-  import went in after `gemma4_cuda`.
-- `zig/src/core/kv_pool.zig` (2): 0108 added `cache_first` to `Budget` and the recipe's tree already had `skipped`
-  in `Plan` — `kept_ppm`/`kept` added beside them; the `plan()`/`hold()` hunks applied to our `plan` (recipe's
-  `cache_first` behaviour untouched: `windows()` still reads `cache_first`, `held()` keeps its one-argument form).
-- `zig/src/native/cuda.zig` (4): our tree has no `ownCache`/`TF_QWEN_KV_SHARE` (that commit is not in the pin), and
-  the `Host`/`text()`/store conditions differ (recipe's `warm_quiet`, `kv_parts`, `kept_budget`); each was adapted
-  to the equivalent line here, keeping our forms.
-- `zig/src/native/cuda_kv_pool.zig` (4): our `plan()` takes `Facts` and reports refusals via `refusal()` (recipe
-  0108's fit clause); `kept_ppm` added after `facts`, `.kept_ppm` into the `Budget` literal beside `cache_first`;
-  the three test call sites gained `0`.
-- `zig/src/native/cuda_kv_safety_test.zig` (1): call site gained `0` after `. {}`.
+With `lookahead` unset (0) and no grid, every existing path is unchanged; the PR's own golden test pins that
+and passes. New switches stay off by default: no caller passes `lookahead` or `planned` yet (the two
+`radix.Rules` literals in `nemotron/hip/prefix.zig` and `qwen3_5/backend/hip/engine/hip_prefix.zig` are
+unchanged, matching `tf-at-radix`).
 
-## What was adapted and why
+## Test commands run (host, Zig 0.17.0)
 
-- **`sharing()` reads the environment directly** (`std.c.getenv("TF_KV_SHARE")`): the task says to, as our pin has
-  no `core/profile.zig` registry (later upstream work). This matches the patch's own text; the style follows the
-  recipe's other switches (`cuda_kv_pool.cacheFirst` for `TF_PROMPT_CACHE_FIRST`, 0110's `Switches.read`).
-- **`cache_first` (0108) kept exactly**: `Budget.cache_first`, `windows()`'s room carve-out, `cacheFirst()`, the
-  256 MiB short-fall log line and the 0108 test all stand unchanged; upstream's fields sit beside them.
-- **`skipped` (GLM host-tier share) kept**: `Plan.skipped` and `Kept.skipped` still carry the share the plan gave
-  the pages; `kept()` now adds `p.kept` alongside it.
-- **Final forms where they only extend this commit**: `could()`/`hint()` and the second adapter test (c8ee168d6),
-  and `share_grid` rules (fb1094b16). Not brought in: C7's reclaim chain (`kv_reclaim.zig`, `joinReclaim`/
-  `leaveReclaim`, `enter/leave` notify depth) and C2's groups (`group`, `shape`, `unit`, `ofRows`) — later work we
-  are not taking, per the task.
-- **Store skip condition**: upstream guards the flat store with `cache > 0 and !kv_pages.ownCache(loaded)`;
-  our tree prices it with `kv_pages.storeBudget` (`kept_budget`, card + host tier) after the recipe's host-tier
-  work, so the guard is `kept_budget > 0 and !share`. The `hint` plumbing (`s.over`) from c8ee168d6 was **not**
-  ported: it depends on a `prompt_cache.Store.over` field and a `store(F, store, loaded, kept)` signature change
-  that belong to that later commit, and the task bounds the port at `40c03bf13` + final forms of these two files.
-  `hint()` itself is present and tested, ready for whoever ports that line.
+- `zig build test-kv-pool --summary all -j8` (the task's target; compiles `prompt_radix_test.zig` through
+  `kv_pool_checks` → `kv_pool_store_test`): **29/29 tests pass** (23 in the pool module + 6 in `kv_pool_checks`).
+- Direct run of the store's own tests (module build of `engine_api` with a root importing the three files):
+  **417/417 pass**, including all 15 `prompt_radix_test` tests — the golden, both lookahead tests, both planned
+  tests, the tree-step test, the GLM-shape test and the rules-refusal test — plus `prompt_radix`'s and the rest
+  of engine_api's suite (`rows`, `prompt_cache`, lanes), which the change must not disturb.
+- `zig build test --summary all -j8`: passes except the pre-existing failures listed below; the store-relevant
+  GLM/KV targets pass on top of the port: `test-glm-kv-pages-host` 30/30, `test-glm-window-contract-host` 17/17,
+  `test-glm-prompt-settings-host` 8/8, `test-glm-pages-host`, `test-glm-page-contract-host`,
+  `test-glm-prompt-profile-host`, `test-glm-index-host` all green.
+- `zig fmt --check build.zig zig`: **pass**.
 
-## Off by default
+## Pre-existing failures (present with the port stashed, i.e. without it; not touched by this task)
 
-No family declares `share_pool`/`share_attach` after this task (T03 adds GLM's), and `TF_KV_SHARE` is read only
-through `prompt_pages.wanted`, which returns false without the `share_attach` decl. With the variable unset — or
-set, for that matter — every existing path is unchanged: the adapter is never constructed, `kept_ppm` is 0, and
-`plan()`'s arithmetic with `kept_ppm = 0` reduces to the previous expression (`kept = 0`; `most` gains a `+ 0`).
+These come from the recipe patches applied on top of the pin (`git stash` → same failures), not from the port:
 
-## Tests run (all pass counts from `--summary all`, Zig 0.17.0, host targets only)
+- `test-cuda-host`: `draft_sources_cuda_test` "CUDA GLM distinguishes its checkpoint head from loaded DFlash2"
+  (1/112), `glm_fp8_pages_host` "GLM FP8 pages: the prompt cache's store keeps paged E4M3 states…" (1/15) and
+  `cuda_mm` "TF_GLM_MM_STAGES" logs one error (the recipe's 0100 test calls `stageIndex("4")`, whose
+  `std.log.err` the test runner records; 227 pass).
+- `test-glm-snapshots-host`: 4/26 fail — recipe patch 0094 (4,096-row prompt chunks) changed
+  `stateBytes`/`snap_grid` sizes; the snapshot-sizing tests still expect the pin's numbers
+  (e.g. expected 222298112, found 260046848).
+- `test-glm-prompts-host`: 1/7 fails — recipe patch 0095 raised `dflash.MAX_CTX` to 4,096, so
+  `promptRun(0, 0, 0, 5, 5, 2044)` no longer returns `DrafterContextTooWide` (the test line at the pin was
+  written for `MAX_CTX == 2048` and no recipe patch updated it).
 
-| command | result |
-|---|---|
-| `zig fmt --check build.zig zig` | pass (no output) |
-| `zig build test-kv-pool --summary all -j8` | 5/5 steps, 32/32 tests passed (was 26/26 + T01's; +3 kv_pool cases, +1 kv_prompts blob, +2 from T01 already counted) |
-| `zig build test-kv-safety-host --summary all -j8` | 7/7 steps, 24/24 tests passed (compiles `native/cuda.zig` and `cuda_kv_pool.zig`; runs `cuda_kv_safety_test`) |
-| `zig build check-native-cuda-host --summary all -j8` | success (the real native CUDA server config entry point compiles) |
-| `zig build test-cuda-host --summary all -j8` | 270/274 steps succeeded (3 pre-existing failures), 4129/4140 tests passed (8 skipped, 2 failed) — baseline at the same commit: 270/274, 4123/4134 (8 skipped, 2 failed). The +6 are this task's new tests (3 kv_pool, 1 kv_prompts, 2 cuda_prompt_pages), all passing, inside the native module's two runs (441→445 and 111→113). |
-| `zig build test-server-cpu --summary all -j8` (fresh cache, twice) | 893/893 tests passed both with and without the change |
+Per the rules I did not weaken or change these; they belong to the recipe's owners. If they are known-stale on
+the recipe side, the 0094/0095 follow-ups should update the affected expectations.
 
-The three `test-cuda-host` failures are **pre-existing on the base commit**, verified by `git stash` runs with
-fresh `--cache-dir`s on both trees; the failing test names are byte-identical before and after:
+## What is left or uncertain
 
-- `draft_sources_cuda_test.test.draft sources: CUDA GLM distinguishes its checkpoint head from loaded DFlash2`
-  (`draft_sources_check.zig:15`, expected true found false)
-- `glm_fp8_pages_host.test.GLM FP8 pages: the prompt cache's store keeps paged E4M3 states past the card and
-  resumes the newest by prompt` (`glm_fp8_pages_host.zig:760`, `ExpectedHit`); also fails standalone via
-  `test-glm-fp8-pages-host` (14/15) on both trees
-- `cuda_mm.test.TF_GLM_MM_STAGES: 3, 5, 6, 8 by index; unset, empty or anything else the default` (logged-errors
-  gate: the test deliberately logs `[default] (err): TF_GLM_MM_STAGES: ...`, and the no-error-logs gate trips)
-
-None touch the files this task changes (draft-source metadata, the FP8 pages host harness, and the MM-stages env
-knob); no test was weakened, skipped or deleted.
-
-## Left or uncertain
-
-- `hint()` is wired into no log line yet (see the adaptation note above); the adapter, `wanted`/`could` and both
-  its tests are complete.
-- The adapter's second test asserts the `hint` strings only; a fuller exercise of `Blob.each` against real pages
-  arrives with the families that declare the hooks (T03).
-- Upstream's later `cuda_kv_pool.store` signature (`loaded` instead of `target`) is not taken, so `s.over` cannot
-  be set here without bringing that commit in; noted for whoever ports the "state past the whole budget" line.
+- Nothing in the port itself. All three files match `tf-at-radix` exactly; both upstream shas are in.
+- Later tasks: T02 (GLM's family turns the rules on) builds on the `lookahead`/`planned`/`grid` rules and
+  `error.BadPromptRadixRules`; the GLM-shape test here (grid 16 = 4,096-row `snap_grid` / 256-row pages at
+  real sizes, lookahead 1 = the MTP head's row) is the template.
 
 ## GPU checks needed
 
-None yet: no family declares `share_pool`/`share_attach` until T03, so no GPU path can reach the adapter. Once a
-family does (T03), the DGX checks to run are upstream's for #1755: a kept prompt's pages resuming a later prompt
-(resumed == fresh), eviction under a promise (reclaim from the store's idle pages), and close giving every page
-back (`pool.idle()` at shutdown), plus the flat-store-off startup line on a real load.
+None (core only; no family turns the rules on yet), as the task says. On the DGX boxes the existing GLM HIP/CUDA
+runs keep the rules unset, so no new device check is introduced by this port.
+
+## Commits
+
+- `d524e6d` core prompt_radix: a lookahead in the tree and a planned grid (upstream a2d27dac7, a3a53dbe3)
