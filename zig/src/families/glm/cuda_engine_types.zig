@@ -25,6 +25,7 @@ pub const Snap = struct {
     mtp_len: usize,
     cur: []u1,
     bases: [2]usize,
+    shared: usize = 0, // TF_KV_SHARE: leading pages the shared store holds, the copy leaves out
     ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
     home: ?u8 = null, // TF_GLM_KV_SHARD: the part its stream lay in; that rank's copy alone holds the latent rows
 };
