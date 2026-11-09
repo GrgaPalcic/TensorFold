@@ -13,6 +13,8 @@ const Engine = glm.engine.Engine;
 const Kept = glm.engine.Kept;
 const Allocator = std.mem.Allocator;
 
+const t = std.testing;
+
 pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
 
 /// Every rank's prefix bytes, read at attach (one GLM engine a process; rank 0 alone serves).
@@ -178,12 +180,41 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
         }
     }.bytes;
     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
-    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
+    const raw = std.c.getenv("TF_GLM_LEARN_STAGING_GIB");
+    const named = raw != null and std.mem.trim(u8, std.mem.span(raw.?), " \t").len > 0;
+    const staging_bytes = try stagingOf(if (raw) |v| std.mem.span(v) else null);
+    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .staging_bytes = staging_bytes });
     r.prefill_rate = p.rate;
     store.disk = r;
-    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts)", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len });
+    var permit_buf: [48]u8 = undefined;
+    const permit = if (named) try std.fmt.bufPrint(&permit_buf, "; staging {d} GiB", .{staging_bytes >> 30}) else "";
+    std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts{s})", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, permit });
+}
+
+/// The store's staging permit when TF_GLM_LEARN_STAGING_GIB names none: rows_store.Options' 1 GiB default.
+const staging_default: u64 = (rows.Options{ .root = "", .identity = 0, .cap = 0, .floor = 0, .daily = 0 }).staging_bytes;
+
+/// TF_GLM_LEARN_STAGING_GIB: GiB the store stages at once (unset or empty: the store's 1 GiB; a number: that many GiB, whole pages; anything else: refused).
+fn stagingOf(text: ?[]const u8) error{BadStagingGib}!u64 {
+    const s = std.mem.trim(u8, text orelse "", " \t");
+    if (s.len == 0) return staging_default;
+    const g = std.fmt.parseFloat(f64, s) catch return error.BadStagingGib;
+    if (!std.math.isFinite(g) or g < 0 or g > 4096) return error.BadStagingGib;
+    return std.mem.alignBackward(u64, @intFromFloat(g * (1 << 30)), rows.file.alignment);
 }
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "TF_GLM_LEARN_STAGING_GIB: unset keeps the store's 1 GiB, a number gives whole pages of GiB, anything else is refused" {
+    try t.expectEqual(staging_default, try stagingOf(null));
+    try t.expectEqual(staging_default, try stagingOf(""));
+    try t.expectEqual(staging_default, try stagingOf("  "));
+    try t.expectEqual(@as(u64, 2 << 30), try stagingOf("2"));
+    try t.expectEqual(@as(u64, 12 << 30), try stagingOf("12"));
+    try t.expectEqual(@as(u64, 4 << 30), try stagingOf("4.0001")); // down to whole pages
+    try t.expectEqual(@as(u64, 0), try stagingOf("0"));
+    try t.expectEqual(@as(u64, 0), try stagingOf("0.000001"));
+    for ([_][]const u8{ "x", "-1", "nan", "inf", "5000" }) |bad| try t.expectError(error.BadStagingGib, stagingOf(bad));
 }
