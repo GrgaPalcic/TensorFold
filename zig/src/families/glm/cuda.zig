@@ -34,6 +34,7 @@ pub const engine = @import("cuda_engine.zig");
 pub const prompt_pair = @import("cuda_prompt_pair.zig");
 pub const pages = @import("cuda_pages.zig");
 pub const kv_shard = @import("cuda_kv_shard.zig");
+pub const share = @import("cuda_share.zig");
 pub const open_owner = @import("cuda_open_owner.zig");
 pub const images = @import("cuda_images.zig");
 pub const follow = @import("cuda_follow.zig");
@@ -52,6 +53,7 @@ test {
     _ = @import("cuda_images_interleave_test.zig");
     _ = @import("cuda_pages_test.zig");
     _ = kv_shard;
+    _ = share;
     _ = @import("cuda_kv_shard_pages_test.zig");
     _ = @import("cuda_kv_shard_attn.zig");
     _ = @import("cuda_kv_shard_attn_test.zig");

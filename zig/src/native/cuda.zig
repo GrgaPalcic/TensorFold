@@ -455,7 +455,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
-    if (comptime @hasDecl(F, "share_attach")) if (share and cache > 0) {
+    if (comptime @hasDecl(F, "share_attach")) if (share and (cache > 0 or F.share_kept_ppm == 0)) { // GLM keeps copies: the store opens at any cache
         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
     };
     errdefer if (h.prompts) |x| x.close();
