@@ -119,3 +119,56 @@ As TASK.md says: on the DGX boxes, with `TF_GLM_KV_LIVE_HALF=1`,
   slot's);
 - also with TF_GLM_KV_SHARD on: a sharded keep at half `h` restored on a slot
   at the other parity, with and without a carry across ranks.
+
+## Rebased over T03
+
+The branch was rebased onto T03 (`TF_KV_SHARE`, `c12c858`), which landed
+between the original T07 commit and its report; the rebase stopped on
+`cuda_snapshot_layout.zig` and `cuda_snapshots.zig` and was resolved keeping
+both switches' shapes: T03's `shared: usize` (pages below the mark a shared
+store holds, left out of a state's own copy) beside T07's `half: ?u1`, with
+0110's `latent`/`lat` handling intact.
+
+Signatures chosen (0110's `latent` slots kept, T03's `shared` slots kept,
+T07's `half`/`cur` added last; `make` orders them shared → sizing → latent →
+half, upstream's order with `latent` between):
+
+- `Plan.init(st, c, at, head)` and `Plan.initShared(st, c, at, head, shared)`
+  — a keep plans by the live state's own `cur`.
+- `Plan.initFor(st, c, at, head, latent, cur)` and
+  `Plan.initForShared(st, c, at, head, shared, latent, cur)` — a restore
+  passes the kept state's `cur` bits beside 0110's `latent`.
+- `Plan.withHalf(st, c, at, head, latent, half)` — tests and tools; `latent`
+  as `initFor`'s (the new test file was written to this shape).
+- `Plan.size(st, c, capacity, at, head)`,
+  `Plan.sizeFor(st, c, capacity, at, head, latent, cur)`,
+  `Plan.sizeForShared(st, c, capacity, at, head, shared, latent, cur)`.
+- `Part` keeps 0110's `lat` and 0110/T03's `from`; `Plan` gains `half` after
+  T03's `shared` field.
+
+Callers updated in the resolution: `cuda_snapshots.zig` `bytes`/`keepAs`/
+`seal`/`restore`/`carryRecv` (each passes `e.cur.st.cur` or `s.cur` beside
+T03's `held`/`s.shared`); `cuda_disk_shard_test.zig` and
+`cuda_kv_shard_pages_test.zig` pass `st.cur` to `initFor`; `cuda_pages_test.zig`'s
+`initShared` calls keep their arity. `Plan.init`/`size` callers outside the
+glm snapshot files are unchanged in shape.
+
+Tests after the rebase (foreground, `-j8`, `--summary all`):
+
+- `zig fmt --check build.zig zig` — clean.
+- `zig build test-glm-kv-pages-host test-glm-pages-host
+  test-glm-snapshots-host --summary all -j8` — 10/10 steps succeeded,
+  70/70 tests passed (`test-glm-kv-pages-host` 30/30, `test-glm-pages-host`
+  13/13, `test-glm-snapshots-host` 27/27, including the live-half layout
+  tests and the switch-off plan-shape test).
+- `zig build test-cuda-host --summary all -j8` — 274/274 steps succeeded,
+  109/109 tests passed in this run (cached steps do not re-run, so the
+  per-invocation total varies between runs; nothing failed). This includes
+  `cuda_ranks_test.zig` (the `kv_live_half` fingerprint/read tests beside
+  0110's `kv_shard` words), the new `cuda_snapshot_layout_test.zig`,
+  0110's `cuda_kv_shard_pages_test.zig` and `cuda_disk_shard_test.zig`.
+
+`REPORT.md`'s test counts above were taken before the rebase; the rebase adds
+T03's own tests to the same targets, all green. No pre-existing failure
+regressed: the counts in NOTES.md stay fixed by the tests commit already on
+the branch.
