@@ -14,6 +14,8 @@ const shard = @import("cuda_shard.zig");
 const dflash = @import("dflash.zig");
 const dflash_load = @import("dflash_load.zig");
 const pages_mod = @import("cuda_pages.zig");
+const share_mod = @import("cuda_share.zig");
+const kp = @import("core").kv_prompts;
 const kv = @import("core").kv_pool;
 
 pub const model_type = "glm5_next";
@@ -24,6 +26,8 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
+/// TF_KV_SHARE: the shared store's marks (the same chunk grid; the core adapter's default is smaller).
+pub const share_grid: u32 = prompt_rows;
 /// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
 /// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
 /// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
@@ -82,6 +86,20 @@ pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
     try own.lanes.x.pool(streams + 1, pages, l.pageBytes());
     own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, pages, true);
     if (own.e.kvCtx() != null) own.e.kv_ctx.counts = &own.e.pages.?.shard.?.parts.counts; // rank 0's counters
+    if (own.share > 0) try share(own, streams + 1);
+}
+
+/// TF_KV_SHARE: each rank's `own.share` snapshots, sized at the window's last mark (rings whole), for the store.
+fn share(own: *Owned, parallel: u32) !void {
+    const e = own.e;
+    e.share_pages = true;
+    // cc-defer: the snapshots take the room set aside for --prompt-cache-gib; from the plan once it plans them
+    const slot = e.stateBytes(e.capacity - e.capacity % snap_grid);
+    try readySnapshots(own, own.share * slot);
+    if (share_mod.fewStates(own.share, parallel)) std.log.warn(
+        "TF_KV_SHARE={d} keeps under 4 states a GLM stream at --parallel {d}: live streams evict each other's before a resume; set it to {d} or more",
+        .{ own.share, parallel, 4 * parallel },
+    );
 }
 
 /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
@@ -134,6 +152,7 @@ const Owned = struct {
     link: follow.Link,
     lanes: glm_lanes.Lanes,
     layout: ?kv.Layout,
+    share: usize, // TF_KV_SHARE: states the shared store over the pool's pages keeps (0: the host store)
 };
 
 const env = @import("sys").env;
@@ -186,7 +205,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         return err;
     };
     set.kv8 = o.kv8;
-    return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes }, openRank);
+    if (std.c.getenv("TF_GLM_KV_SHARE") != null) return error.GlmKvShareMoved; // before any rank opens
+    const share_snaps = try kp.sharing();
+    return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes, .share = share_snaps }, openRank);
 }
 
 const StartArgs = struct {
@@ -197,6 +218,7 @@ const StartArgs = struct {
     o: Options,
     p: Place,
     roce_bytes: usize,
+    share: usize,
 };
 
 /// After liveness and page settings: NCCL, the engine and the link, then a follower's loop or rank zero's lanes.
@@ -208,10 +230,14 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     const o = a.o;
     const p = a.p;
     const roce_bytes = a.roce_bytes;
+    // TF_KV_SHARE keeps prompts as the pool's pages: refused before the weights load, every rank told (startup)
+    if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
+    if (a.share > 0 and set.kv_shard.on) return error.KvShareWithShard; // T05 lifts this: one store over the parts
     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
+    own.share = a.share;
     // every connection registered at init, while memory is free (lazily, a full GB10's ibv_reg_mr can refuse it)
     if (std.c.getenv("NCCL_RUNTIME_CONNECT") == null) _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     // NCCL's cuMem host buffers wore out GB10's driver pool under load (NV_ERR_NO_MEMORY; next ranks failed to start)
@@ -417,13 +443,29 @@ pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaq
     return k;
 }
 
-/// A restore outside a prompt pass (the store's `begin`) would leave the other ranks behind, so it refuses.
+/// TF_KV_SHARE's resume waits in `owner` for the pass's start on every rank; any other would leave the ranks behind.
 pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
-    _ = ptr;
-    _ = owner;
-    _ = saved;
-    return error.RestoredInPromptPass;
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    if (share_mod.of(e) == null) return error.RestoredInPromptPass;
+    const o: *share_mod.Owner = @ptrCast(@alignCast(owner orelse return error.NoGlmOwner));
+    o.pending = @ptrCast(@alignCast(saved));
 }
+
+/// TF_KV_SHARE: the pool the shared store keeps prompts in, rank 0's pages (null: a window a stream).
+pub fn share_pool(ptr: *anyopaque) ?*kv.Pool {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    const p = e.pages orelse return null;
+    return &p.pool;
+}
+
+/// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).
+pub fn share_attach(ptr: *anyopaque, prompts: ?kp.Prompts) void {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    if (e.pages) |p| p.prompts = prompts;
+}
+
+/// TF_KV_SHARE: rows past the store's pages are each rank's snapshots, paid by the cache's room: it makes no pages.
+pub const share_kept_ppm: u32 = 0;
 
 pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
@@ -463,6 +505,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
         error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
+        error.BadKvShare => "TF_KV_SHARE: give how many states the prompt store over the KV pages keeps, or 0 or unset for off",
+        error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
+        error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
+        error.KvShareWithShard => "TF_KV_SHARE with TF_GLM_KV_SHARD=1 is not supported yet: set one",
         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
         error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
