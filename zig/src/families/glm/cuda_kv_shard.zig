@@ -407,6 +407,54 @@ pub const Parts = struct {
         }
         p.counts.into(out);
     }
+
+    // -- the shared store's pages over the parts (TF_KV_SHARE with sharding, core.kv_prompts.Pool.parts) ---------------
+
+    /// The store's one more holder of page `id`: its part's pool, the part-local id.
+    pub fn retain(p: *Parts, id: u32) void {
+        const part = partOf(id, p.h);
+        p.pools[part].retain(id - @as(u32, @intCast(part * p.h)));
+    }
+
+    /// The store's hold of page `id` gone; the last holder's release frees the page in its part's pool.
+    pub fn release(p: *Parts, id: u32) void {
+        const part = partOf(id, p.h);
+        p.pools[part].release(id - @as(u32, @intCast(part * p.h)));
+    }
+
+    /// How many hold page `id`: each lease that maps it, and the store.
+    pub fn holders(p: *const Parts, id: u32) u32 {
+        const part = partOf(id, p.h);
+        return p.pools[part].holders(id - @as(u32, @intCast(part * p.h)));
+    }
+
+    /// Pages free and not promised, both parts together (the store's logging only).
+    pub fn available(p: *const Parts) usize {
+        return p.pools[0].available() + p.pools[1].available();
+    }
+
+    /// Free pages in part `part` now: its part's reclaim evicts its leaves until `want` of these.
+    pub fn free(p: *const Parts, part: usize) usize {
+        return p.pools[part].available();
+    }
+
+    /// Whether a tree leaf whose first page is `first` lies in part `part` (a leaf's pages always do).
+    pub fn inPart(p: *const Parts, part: usize, first: u32) bool {
+        return partOf(first, p.h) == part;
+    }
+
+    /// Whether `ids` all lie in one part (a stream's pages do; the tree takes a leaf's pages as one).
+    pub fn onePart(p: *const Parts, ids: []const u32) bool {
+        const part = partOf(ids[0], p.h);
+        for (ids) |id| if (partOf(id, p.h) != part) return false;
+        return true;
+    }
+
+    /// Part `part`'s pool takes the store's reclaim hook (or drops it): a promise there evicts the part's idle
+    /// leaves before it fails.
+    pub fn setReclaim(p: *Parts, part: usize, hook: ?kv.Reclaim) void {
+        p.pools[part].reclaim = hook;
+    }
 };
 
 /// The ownership counters rank 0 reports (each rank counts its own exchanges; rank 0's are reported).
@@ -628,4 +676,33 @@ test "kv shard: each guard's mutant is caught by its test" {
     try q.map(0, p.slots[0].ids.items, &.{});
     mutant = .digest_no_twin;
     try std.testing.expectEqual(p.digest(), q.digest()); // the twin's absence on q goes unseen
+}
+
+test "kv shard: the parts are the shared store's pages: a global id routes to its part's pool, the sum is free" {
+    const gpa = std.testing.allocator;
+    var p = try Parts.init(gpa, 8, 4096, 2, true);
+    defer p.deinit();
+    var lease: kv.Lease = .{};
+    try p.pools[1].promise(&lease, 3);
+    try p.pools[1].cover(&lease, 3, null); // a part-1 stream: part-local ids 0, 1, 2, global 8, 9, 10
+    defer p.pools[1].finish(&lease);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, lease.ids.items);
+    try std.testing.expectEqual(@as(u32, 1), p.holders(8)); // the lease's alone, by its global id
+    p.retain(8); // the store's hold: part 1's pool, its page 0
+    try std.testing.expectEqual(@as(u32, 2), p.holders(8));
+    try std.testing.expectEqual(@as(usize, 13), p.available()); // the sum of the parts
+    try std.testing.expectEqual(@as(usize, 13), p.free(0) + p.free(1));
+    p.release(8);
+    try std.testing.expectEqual(@as(u32, 1), p.holders(8));
+    try std.testing.expect(p.onePart(&.{ 8, 10 }) and !p.onePart(&.{ 8, 3 }));
+    try std.testing.expect(p.inPart(1, 9) and !p.inPart(0, 9));
+    var probe: u8 = 0;
+    p.setReclaim(1, .{ .ctx = &probe, .call = partReclaimProbe });
+    try std.testing.expect(p.pools[1].reclaim != null and p.pools[0].reclaim == null);
+    p.setReclaim(1, null);
+    try std.testing.expect(p.pools[1].reclaim == null);
+}
+
+fn partReclaimProbe(_: *anyopaque, _: usize) bool {
+    return false;
 }

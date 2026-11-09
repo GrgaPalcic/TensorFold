@@ -79,7 +79,8 @@ pub const Keeps = struct {
         const p = k.e.pages.?;
         if (!p.paged(k.slot)) return;
         const n = mark / page_rows;
-        const ids = p.leases[k.slot].ids.items;
+        // sharded (TF_GLM_KV_SHARD): the stream's pages are its part slot's global ids; unsharded its lease's
+        const ids: []const u32 = if (p.shard) |x| x.parts.slots[k.slot].ids.items else p.leases[k.slot].ids.items;
         if (n > ids.len) return;
         const path = k.e.gpa.alloc(u32, n) catch return;
         defer k.e.gpa.free(path);

@@ -410,7 +410,7 @@ const Store = struct {
         return @ptrCast(@alignCast(ctx));
     }
     fn open(x: *Store, gpa: std.mem.Allocator, e: *Engine, states: radix.Snapshots, snaps: usize) !void {
-        const pool = native.share_pool(e).?;
+        const pool = native.share_pool(e).?.one;
         const rules: radix.Rules = .{ .page = page_rows, .planned = true, .grid = native.snap_grid, .lookahead = 1, .min_prompt = 0, .tail = true };
         x.* = .{ .gpa = gpa, .store = try radix.Store.init(gpa, states, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules) };
         x.store.limit(.{ .pages = pool.total(), .snaps = snaps });
@@ -419,7 +419,7 @@ const Store = struct {
     }
     fn close(x: *Store, e: *Engine) void {
         native.share_attach(e, null);
-        native.share_pool(e).?.reclaim = null;
+        native.share_pool(e).?.one.reclaim = null;
         x.store.deinit();
     }
     fn reclaim(ctx: *anyopaque, want: usize) bool {

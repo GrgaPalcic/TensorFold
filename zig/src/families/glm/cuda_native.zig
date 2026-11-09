@@ -15,6 +15,7 @@ const dflash = @import("dflash.zig");
 const dflash_load = @import("dflash_load.zig");
 const pages_mod = @import("cuda_pages.zig");
 const share_mod = @import("cuda_share.zig");
+const kvs = @import("cuda_kv_shard.zig");
 const kp = @import("core").kv_prompts;
 const kv = @import("core").kv_pool;
 
@@ -457,11 +458,62 @@ pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anye
     o.pending = @ptrCast(@alignCast(saved));
 }
 
-/// TF_KV_SHARE: the pool the shared store keeps prompts in, rank 0's pages (null: a window a stream).
-pub fn share_pool(ptr: *anyopaque) ?*kv.Pool {
+/// TF_KV_SHARE: the pool the shared store keeps prompts in — rank 0's pages, or sharded the pool's parts
+/// (core.kv_prompts.Pool; null: a window a stream).
+pub fn share_pool(ptr: *anyopaque) ?kp.Pool {
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
     const p = e.pages orelse return null;
-    return &p.pool;
+    if (p.shard) |x| return .{ .parts = .{
+        .retain = partsRetain,
+        .release = partsRelease,
+        .holders = partsHolders,
+        .available = partsAvailable,
+        .page_bytes = x.g.wholePage(),
+        .total = 2 * x.parts.h,
+        .count = 2,
+        .free = partsFree,
+        .inPart = partsInPart,
+        .onePart = partsOnePart,
+        .setReclaim = partsSetReclaim,
+        .ctx = &x.parts,
+    } };
+    return .{ .one = &p.pool };
+}
+
+fn partsOf(ctx: *anyopaque) *kvs.Parts {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn partsRetain(ctx: *anyopaque, id: u32) void {
+    partsOf(ctx).retain(id);
+}
+
+fn partsRelease(ctx: *anyopaque, id: u32) void {
+    partsOf(ctx).release(id);
+}
+
+fn partsHolders(ctx: *anyopaque, id: u32) u32 {
+    return partsOf(ctx).holders(id);
+}
+
+fn partsAvailable(ctx: *anyopaque) usize {
+    return partsOf(ctx).available();
+}
+
+fn partsFree(ctx: *anyopaque, part: usize) usize {
+    return partsOf(ctx).free(part);
+}
+
+fn partsInPart(ctx: *anyopaque, part: usize, first: u32) bool {
+    return partsOf(ctx).inPart(part, first);
+}
+
+fn partsOnePart(ctx: *anyopaque, ids: []const u32) bool {
+    return partsOf(ctx).onePart(ids);
+}
+
+fn partsSetReclaim(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
+    partsOf(ctx).setReclaim(part, hook);
 }
 
 /// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).

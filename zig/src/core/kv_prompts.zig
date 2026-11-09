@@ -1,5 +1,6 @@
 //! TF_KV_SHARE: what a family on the core pool calls of one prompt store over its pages (native/cuda_prompt_pages.zig).
 const std = @import("std");
+const kv = @import("kv_pool.zig");
 
 /// Where a pass resumes and the marks it keeps states at (`marks` the store's allocation, freed by `free`).
 pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
@@ -61,6 +62,40 @@ pub const Blob = struct {
             o += n;
         }
     }
+};
+
+/// The pages a family's store keeps prompts in (`share_pool`'s): one pool, or a sharded pool's parts
+/// (TF_GLM_KV_SHARD's parts, each a kv_pool.Pool).
+pub const Pool = union(enum) {
+    one: *kv.Pool,
+    parts: Parts,
+};
+
+/// A sharded pool's parts as the store's pages (TF_GLM_KV_SHARD's, each part a kv_pool.Pool): global page ids in,
+/// each routed to its part's pool with the part-local id; the store's page limit is every part's, and each part's
+/// pool takes its own reclaim hook (a promise there evicts that part's idle leaves first).
+pub const Parts = struct {
+    /// The tree's page ids over the parts, the pages' four calls on `ctx` (prompt_cache.Pages').
+    retain: *const fn (ctx: *anyopaque, id: u32) void,
+    release: *const fn (ctx: *anyopaque, id: u32) void,
+    holders: *const fn (ctx: *anyopaque, id: u32) u32,
+    /// Pages free and not promised, both parts together (the store's logging only).
+    available: *const fn (ctx: *anyopaque) usize,
+    /// Bytes of one page, over every layer (the tree's held count).
+    page_bytes: u64,
+    /// The store's page limit: every part's pages.
+    total: usize,
+    /// The parts (two at TP=2, lanes.kv_parts.max_parts).
+    count: usize,
+    /// Free pages in `part` now (its part's reclaim evicts its leaves until `want` of these).
+    free: *const fn (ctx: *anyopaque, part: usize) usize,
+    /// Whether a tree leaf whose first page is `first` lies in `part` (a leaf's pages always lie in one).
+    inPart: *const fn (ctx: *anyopaque, part: usize, first: u32) bool,
+    /// Whether `ids` all lie in one part (a stream's pages do; the tree takes a leaf's pages as one).
+    onePart: *const fn (ctx: *anyopaque, ids: []const u32) bool,
+    /// `part`'s pool takes the store's reclaim hook, or drops it.
+    setReclaim: *const fn (ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void,
+    ctx: *anyopaque,
 };
 
 /// TF_KV_SHARE=n: keep prompts as pool pages and at most n states past them (0 or unset: copies, as before).
