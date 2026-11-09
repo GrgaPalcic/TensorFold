@@ -42,7 +42,7 @@ METRIC_PREFIX = "tensorfold:"
 METRIC_KEYWORDS = ("kv_", "prompt_cache")
 
 
-def filler(seed: int, tokens: int, per_line: float = 4.0) -> str:
+def filler(seed: int, tokens: int, per_line: float = 4.0, nonce: str = "") -> str:
     """A deterministic prompt of roughly ``tokens`` tokenizer tokens: numbered lines of words from a fixed list."""
     words = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
              "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
@@ -51,8 +51,8 @@ def filler(seed: int, tokens: int, per_line: float = 4.0) -> str:
     lines = max(1, round(tokens / per_line))
     out = []
     for i in range(lines):
-        out.append(" ".join(words[(seed + i * 7 + j * 3) % len(words)] for j in range(4)) + f" line {i}")
-    return (f"Fixture seed {seed}: count the lines below and reply with the number only.\n" + "\n".join(out))
+        out.append(" ".join(words[(seed + i * 7 + j * 3) % len(words)] for j in range(4)) + f" line {i:07d}")  # fixed width, so tokens per line do not grow with the count
+    return (f"Fixture {nonce} seed {seed}: count the lines below and reply with the number only.\n" + "\n".join(out))
 
 
 def context_limit(base: str) -> tuple[int | None, str | None]:
@@ -251,8 +251,9 @@ def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking:
         api_key: str | None, seed: int = 0) -> dict:
     """The whole gate: calibrate, per-size alone runs, drafted runs, concurrent cells and a pool census."""
     deadline = time.monotonic() + timeout
+    nonce = f"{time.time_ns():x}"  # leads every prompt, so a run never resumes a state an earlier run kept
     report: dict = {"schema_version": SCHEMA_VERSION, "base": base, "model": model, "thinking": thinking,
-                    "sizes": sizes, "levels": levels, "cases": [], "concurrency": [], "failures": []}
+                    "sizes": sizes, "levels": levels, "nonce": nonce, "cases": [], "concurrency": [], "failures": []}
     report["census_before"] = metrics_snapshot(base)
     if report["census_before"]["error"]:
         report["failures"].append(f"census_before: {report['census_before']['error']}")
@@ -272,7 +273,7 @@ def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking:
     if limit_error:
         report["failures"].append(f"context_limit: {limit_error}")
     for size in sizes:
-        prompt = filler(seed, size, per_line=per_line)
+        prompt = filler(seed, size, per_line=per_line, nonce=nonce)
         entry: dict = {"requested_tokens": size, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
         fits = limit is None or size + 64 <= limit
         if not fits:
@@ -313,7 +314,7 @@ def run(base: str, model: str, sizes: list[int], levels: list[int], *, thinking:
     max_level = max(levels, default=0)
     reference: dict = {"prompts": {}, "hashes": {}}
     for seed_ in range(max(max_level, 1)):
-        prompt_ = filler(seed_, PROBE_TOKENS, per_line=per_line)
+        prompt_ = filler(seed_, PROBE_TOKENS, per_line=per_line, nonce=nonce)
         reference["prompts"][seed_] = prompt_
         try:
             reference["hashes"][seed_] = alone(base, model, prompt_, thinking=thinking, api_key=api_key,
