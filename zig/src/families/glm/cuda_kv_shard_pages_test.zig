@@ -330,3 +330,82 @@ test "kv shard pages: a stream resuming a kept state is seated in the state's ho
     _ = try ln.seat(&streams[1], 600, 100, &.{}); // no kept state: the part with fewer live streams
     try expectEqual(@as(u8, 0), f.st(ln.lanes.get(&streams[1]).?.slot).hold.?.owner);
 }
+
+test "kv shard pages: a share resume seats in its adopted pages' part, no twin, and waits there when it lacks room" {
+    const gpa = std.testing.allocator;
+    const Lanes = @import("cuda_lanes.zig").Lanes;
+    const lanes = @import("lanes");
+    const kv = @import("core").kv_pool;
+    var f: Fake = undefined;
+    Fake.reset();
+    try f.init(gpa, 0, true);
+    const p = try f.pool(4, 20, true); // two parts of 8
+    defer f.deinit(p);
+    const x = p.shard.?;
+    // the store's two pages in part 1 (global 8, 9): a keep left them, a begin holds them once more
+    var lease: kv.Lease = .{};
+    try x.parts.pools[1].promise(&lease, 2);
+    try x.parts.pools[1].cover(&lease, 2, null);
+    const adopted = [_]u32{ lease.ids.items[0] + 8, lease.ids.items[1] + 8 };
+    for (adopted) |id| {
+        x.parts.retain(id); // the tree's own hold on the page
+        x.parts.retain(id); // the begin's hold for the resume it offered the pages to
+    }
+    x.parts.pools[1].finish(&lease); // the stream's lease goes, the store's two holds stay
+    var ln: Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
+    defer ln.lanes.deinit(gpa);
+    var s: lanes.Stream = undefined;
+    s.reuse = .{};
+    _ = try ln.seat(&s, 600, 100, &adopted); // part 0 has more free: the adopted pages' part wins
+    const slot = ln.lanes.get(&s).?.slot;
+    try expectEqual(@as(u8, 1), f.st(slot).hold.?.owner);
+    try expectEqualSlices(u32, &adopted, f.st(slot).pages[0..2]);
+    for (adopted) |id| try expectEqual(@as(u32, 2), x.parts.holders(id)); // the tree's and the lease's
+    try expectEqual(@as(usize, 0), p.twinCount(slot)); // no twin: the pass runs owner-computed
+    p.close(slot);
+    for (adopted) |id| try expectEqual(@as(u32, 1), x.parts.holders(id)); // the lease's hold went, the tree's stays
+    // part 1 full of other streams' pages: the resume waits there (LaneMemory), it never moves to part 0
+    var full: kv.Lease = .{};
+    try x.parts.pools[1].promise(&full, 6);
+    try x.parts.pools[1].cover(&full, 6, null);
+    for (adopted) |id| x.parts.retain(id); // a fresh begin's hold for this resume
+    var w: lanes.Stream = undefined;
+    w.reuse = .{};
+    try std.testing.expectError(error.LaneMemory, ln.seat(&w, 1500, 100, &adopted)); // 4 pages: 2 fresh past the adopted
+    for (adopted) |id| try expectEqual(@as(u32, 1), x.parts.holders(id)); // the failed seat gave the begin's hold back
+    x.parts.pools[1].finish(&full);
+}
+
+test "kv shard pages: the follower maps a begin whose leading ids are the store's, and the digests agree" {
+    const gpa = std.testing.allocator;
+    const kv = @import("core").kv_pool;
+    var lead: Fake = undefined;
+    Fake.reset();
+    try lead.init(gpa, 0, true);
+    const p0 = try lead.pool(3, 20, true); // two parts of 8
+    defer lead.deinit(p0);
+    const x0 = p0.shard.?;
+    // the store's two pages in part 1, a begin's holds beside the tree's own (a keep left them)
+    var lease: kv.Lease = .{};
+    try x0.parts.pools[1].promise(&lease, 2);
+    try x0.parts.pools[1].cover(&lease, 2, null);
+    const adopted = [_]u32{ lease.ids.items[0] + 8, lease.ids.items[1] + 8 };
+    for (adopted) |id| {
+        x0.parts.retain(id);
+        x0.parts.retain(id);
+    }
+    x0.parts.pools[1].finish(&lease);
+    const wire = try gpa.dupe(u32, try p0.openWith(1, 1500, 100, null, &adopted)); // 4 pages in part 1, no twin
+    defer gpa.free(wire);
+    try expectEqualSlices(u32, &adopted, wire[0..2]);
+    try expectEqual(@as(usize, 0), p0.twinCount(1));
+    var other: Fake = undefined;
+    try other.init(gpa, 1, true);
+    const p1 = try other.pool(3, 20, false);
+    defer other.deinit(p1);
+    try p1.mapWith(1, wire, 0, adopted.len); // the begin's ids, the store's first: mapped, not poisoned
+    const s = other.st(1);
+    try expectEqualSlices(u32, wire, F.table(s.table, wire.len));
+    try expectEqual(kvs.Hold{ .owner = 1 }, s.hold.?); // owner-computed pass: rank 0 alone holds the rows
+    try expectEqual(p0.digest(), p1.digest()); // the adopted pages are in the slot's ids, so in the digest
+}

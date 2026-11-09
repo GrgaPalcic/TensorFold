@@ -296,17 +296,26 @@ pub const Parts = struct {
     }
 
     /// Rank 0: slot `slot` takes `n` pages of part `part` (`ids` the global ids, row order), and with `twin` pages a
-    /// twin of that many in the other part when it has them (counted when it has not).
-    pub fn open(p: *Parts, slot: usize, part: u8, n: usize, twin: usize) !void {
+    /// twin of that many in the other part when it has them (counted when it has not). `adopted` (a TF_KV_SHARE
+    /// resume's, the shared store's pages it held, all of `part`): the head of the lease, held once more by it —
+    /// they are already the tree's, as kv.Pool.adopt holds them for one pool; the rest promised and covered here.
+    pub fn open(p: *Parts, slot: usize, part: u8, n: usize, twin: usize, adopted: []const u32) !void {
         const s = &p.slots[slot];
         if (s.used or part > 1) return error.SlotTaken;
+        if (adopted.len > n) return error.PromptTooLong;
+        for (adopted) |id| if (partOf(id, p.h) != part) return error.KvShardPlacement; // a stream's pages lie in one part
         const pool = &p.pools[part];
-        try pool.promise(&s.lease, n);
+        // a resume's home is its adopted pages' part and there it stays: no fall-back to the other part (LaneMemory)
+        try pool.promise(&s.lease, n - adopted.len);
         errdefer pool.finish(&s.lease);
-        try pool.cover(&s.lease, n, null);
         s.ids.clearRetainingCapacity();
         try s.ids.ensureTotalCapacity(p.gpa, n);
-        for (s.lease.ids.items) |id| s.ids.appendAssumeCapacity(@intCast(id + part * p.h));
+        if (adopted.len > 0) for (adopted) |id| {
+            try pool.adopt(&s.lease, &.{@intCast(id - part * p.h)});
+            try s.ids.append(p.gpa, id);
+        };
+        try pool.cover(&s.lease, n, null);
+        for (s.lease.ids.items[adopted.len..]) |id| s.ids.appendAssumeCapacity(@intCast(id + part * p.h));
         s.part = part;
         s.used = true;
         s.twin.clearRetainingCapacity();
@@ -593,14 +602,14 @@ test "kv shard: parts place home first, then fewer live streams, then more free 
     defer p.deinit();
     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, null)); // a tie: the lower index
     try std.testing.expectEqual(@as(?u8, 1), p.choose(2, 1)); // home first
-    try p.open(0, 0, 3, 0);
+    try p.open(0, 0, 3, 0, &.{});
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, p.slots[0].ids.items);
     try std.testing.expectEqual(@as(?u8, 1), p.choose(2, null)); // fewer live streams
     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, 0)); // home, though it has more streams
-    try p.open(1, 1, 7, 0);
+    try p.open(1, 1, 7, 0, &.{});
     try std.testing.expectEqual(@as(usize, 8), p.slots[1].ids.items[0] / 8 * 8); // part 1's ids from 8
     try std.testing.expectEqual(@as(?u8, 0), p.choose(2, 1)); // home lacks the room: the other
-    try p.open(2, 0, 2, 0); // part 0: 5 of 8 pages, 2 streams; part 1: 7 of 8, 1 stream
+    try p.open(2, 0, 2, 0, &.{}); // part 0: 5 of 8 pages, 2 streams; part 1: 7 of 8, 1 stream
     try std.testing.expectEqual(@as(?u8, 1), p.choose(1, null)); // fewer live streams, though fewer free pages
     try std.testing.expectEqual(@as(?u8, null), p.choose(4, null));
     // a twin of 2 pages for slot 1 (part 1) in part 0, all or none: 3 free there
@@ -627,8 +636,8 @@ test "kv shard: a follower maps rank 0's places and digests them alike; a missed
     defer lead.deinit();
     var other = try Parts.init(gpa, 16, 4096, 3, false);
     defer other.deinit();
-    try lead.open(0, 1, 5, 3);
-    try lead.open(2, 0, 4, 0);
+    try lead.open(0, 1, 5, 3, &.{});
+    try lead.open(2, 0, 4, 0, &.{});
     try other.map(0, lead.slots[0].ids.items, lead.slots[0].twin.items);
     try other.map(2, lead.slots[2].ids.items, lead.slots[2].twin.items);
     try std.testing.expectEqual(lead.digest(), other.digest());
@@ -666,7 +675,7 @@ test "kv shard: each guard's mutant is caught by its test" {
     mutant = .home_ignored;
     try std.testing.expect(p.choose(2, 1).? != 1);
     mutant = .none;
-    try p.open(0, 0, 2, 2); // part 0: 6 free, 1 stream; part 1: 6 free (its twin), none
+    try p.open(0, 0, 2, 2, &.{}); // part 0: 6 free, 1 stream; part 1: 6 free (its twin), none
     try std.testing.expectEqual(@as(?u8, 1), p.choose(1, null));
     mutant = .live_ignored;
     try std.testing.expectEqual(@as(?u8, 0), p.choose(1, null)); // more free pages alone
@@ -705,4 +714,44 @@ test "kv shard: the parts are the shared store's pages: a global id routes to it
 
 fn partReclaimProbe(_: *anyopaque, _: usize) bool {
     return false;
+}
+
+test "kv shard: a resume opens in its adopted pages' part, their hold passing to the lease; a short home waits" {
+    const gpa = std.testing.allocator;
+    var p = try Parts.init(gpa, 8, 4096, 4, true);
+    defer p.deinit();
+    // a keep in part 1: a stream there, the store taking two of its pages (global ids 9, 10)
+    try p.open(0, 1, 3, 0, &.{});
+    const kept = [_]u32{ 9, 10 };
+    for (kept) |id| {
+        p.retain(id); // the tree's own hold on the page
+        p.retain(id); // the begin's hold for the resume it offered the pages to
+    }
+    p.close(0); // the stream's pages back, the store's stay
+    try std.testing.expectEqual(@as(usize, 2), p.holders(9));
+    var lease: kv.Lease = .{};
+    try p.pools[1].promise(&lease, 1);
+    try p.pools[1].cover(&lease, 1, null); // another stream: part 1 has room
+    defer p.pools[1].finish(&lease);
+    // a resume adopts them into part 1, one fresh page beside: the begin's hold becomes the lease's
+    try p.open(1, 1, 3, 0, &kept);
+    try std.testing.expectEqualSlices(u32, &kept, p.slots[1].ids.items[0..2]);
+    try std.testing.expectEqual(@as(usize, 2), p.holders(9)); // the tree's and the lease's
+    try std.testing.expectEqual(@as(usize, 4), p.free(1)); // 8 - the other stream's - the resume's two adopted and one fresh
+    p.close(1);
+    try std.testing.expectEqual(@as(usize, 1), p.holders(9)); // the lease's hold went with it, the tree's stays
+    // the store's pages released, part 1 whole again
+    for (kept) |id| p.release(id);
+    try std.testing.expectEqual(@as(usize, 7), p.free(1));
+    // a resume whose home part lacks room waits (LaneMemory), it never moves to the other part
+    var full: kv.Lease = .{};
+    try p.pools[1].promise(&full, 7);
+    try p.pools[1].cover(&full, 7, null);
+    defer p.pools[1].finish(&full);
+    try std.testing.expectError(error.LaneMemory, p.open(2, 1, 3, 0, &kept));
+    try std.testing.expect(!p.slots[2].used);
+    try std.testing.expectEqual(@as(usize, 8), p.free(0)); // part 0 untouched by the waiting resume
+    // adopted pages of another part than the resume's home are refused
+    try std.testing.expectError(error.KvShardPlacement, p.open(2, 0, 3, 0, &kept));
+    try std.testing.expectError(error.KvShardPlacement, p.open(2, 1, 3, 0, &.{ 0, 9 }));
 }

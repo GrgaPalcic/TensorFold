@@ -216,6 +216,12 @@ pub const Pages = struct {
         return slot < p.used.len;
     }
 
+    /// The part page `id` lies in under sharding (null: unsharded): a share resume's home is its adopted pages'.
+    pub fn partOf(p: *const Pages, id: u32) ?u8 {
+        const x = p.shard orelse return null;
+        return @intCast(kvs.partOf(id, x.parts.h));
+    }
+
     /// Whether a request's pages fit now and a paged sequence is free for it. One that needs more pages than the whole
     /// pool holds is admitted at once, so its opening refuses it (error.PoolTooSmall) instead of it waiting forever.
     pub fn fits(p: *Pages, prompt: usize, max_tokens: usize) bool {
@@ -257,16 +263,22 @@ pub const Pages = struct {
 
     /// `open`, sharded in `home` (a kept state's part) when it has the room (cuda_kv_shard.Parts.choose), with a twin
     /// of the prompt's pages in the other part under TF_GLM_KV_SHARD_TWINS when it has them. The ids that cross with
-    /// the begin step: the stream's, then its twin's (`twinCount`). Unsharded with `adopted` (the shared store's pages
-    /// a resume held, first in the lease): their rows stay as the store kept them, the rest promised and covered.
+    /// the begin step: the stream's, then its twin's (`twinCount`). With `adopted` (the shared store's pages a resume
+    /// held, first in the lease): the stream opens in their part and there it stays — no fall-back to the other part
+    /// (LaneMemory: the request waits, as a kept state's home does when carries are off), and no twin (its adopted
+    /// prefix's latent rows exist on the owner alone; the pass runs owner-computed, cuda_kv_shard_attn).
     pub fn openWith(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8, adopted: []const u32) ![]const u32 {
         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
         if (p.shard) |x| {
             const n = need(p.layout, prompt, max_tokens);
             if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
             if (n > x.parts.h) return error.PoolTooSmall; // a stream's pages lie in one part
-            const part = x.parts.choose(n, home) orelse return error.LaneMemory;
-            try x.parts.open(slot, part, n, if (x.switches.twins) p.layout.pages(prompt) else 0);
+            if (adopted.len > n) return error.PromptTooLong;
+            const part: u8 = if (adopted.len > 0) @intCast(kvs.partOf(adopted[0], x.parts.h)) else (x.parts.choose(n, home) orelse return error.LaneMemory);
+            var held = adopted.len > 0; // the begin's holds, given back if no lease takes them (as unsharded)
+            errdefer if (held) for (adopted) |id| x.parts.release(id);
+            try x.parts.open(slot, part, n, if (adopted.len == 0 and x.switches.twins) p.layout.pages(prompt) else 0, adopted);
+            held = false;
             errdefer x.parts.close(slot);
             try p.mappedShard(slot, true);
             const sl = &x.parts.slots[slot];

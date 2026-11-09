@@ -235,7 +235,8 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     const roce_bytes = a.roce_bytes;
     // TF_KV_SHARE keeps prompts as the pool's pages: refused before the weights load, every rank told (startup)
     if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
-    if (a.share > 0 and set.kv_shard.on) return error.KvShareWithShard; // T05 lifts this: one store over the parts
+    // TF_KV_SHARE with TF_GLM_KV_SHARD: one store over the parts (T05); sharding's own refusals still run, among
+    // them --parallel 2 at least (KvShardNeedsParallel at the attach), which share under sharding needs too
     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -567,7 +568,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.GlmKvShareMoved => "TF_GLM_KV_SHARE is now TF_KV_SHARE, the prompt store every family on the KV pool shares: set that instead",
         error.GlmShareNeedsPages => "TF_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
         error.GlmShareTooMany => std.fmt.comptimePrint("TF_KV_SHARE keeps at most {d} states, a slot each in the startup plan: set {d} or fewer", .{ kv.most_snaps, kv.most_snaps }),
-        error.KvShareWithShard => "TF_KV_SHARE with TF_GLM_KV_SHARD=1 is not supported yet: set one",
         error.BadKvPages => "TF_KV_PAGES: give auto, on (or 1, all) or off (or 0)",
         error.PoolTooSmall => "this request's prompt and max_tokens need more KV pages than the whole pool holds, even with every other stream done: shorten the prompt or lower max_tokens",
         error.NoPagedCaches => "TF_KV_PAGES: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): unset TF_KV_PAGES or set it off",
