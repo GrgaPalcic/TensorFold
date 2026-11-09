@@ -26,6 +26,7 @@ pub const Snap = struct {
     cur: []u1,
     bases: [2]usize,
     ring_from: ?i64 = null, // DFlash2's context rows from here up to `pos`, in the plan's last part (null: none kept)
+    home: ?u8 = null, // TF_GLM_KV_SHARD: the part its stream lay in; that rank's copy alone holds the latent rows
 };
 
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.

@@ -27,7 +27,7 @@ pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
 pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
 pub const MAX_S: usize = 16; // streams one block pass drafts for
 pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
-pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
+pub const MAX_CTX: usize = 4096; // context rows one ingest takes (a prompt chunk's)
 pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
@@ -38,7 +38,8 @@ pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
 pub fn rawBytes(bits: u8, world: usize) usize {
     const ff: usize = if (world == 2) FF / 2 else FF; // the MLP width a rank holds, as dflash_load splits it
     const nk: usize = @max(5 * D * D, 2 * ff * D); // fc, or gate and up stacked
-    return if (bits == 4) nk / 2 + 2 * nk / 32 + 1024 else 256;
+    // the 32-group scratch (TF_GLM_DFLASH2_Q32) doubles the scales and biases: sized for it at either setting
+    return if (bits == 4) nk / 2 + 2 * nk / 16 + 1024 else 256;
 }
 
 /// glm_dflash's functions.
@@ -54,6 +55,7 @@ pub const Kernels = struct {
     top16_part: cuda.Function,
     top16_merge: cuda.Function,
     gsum: cuda.Function,
+    gsum32: cuda.Function, // the 32-group sums (TF_GLM_DFLASH2_Q32's linears)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -62,8 +64,9 @@ pub const Kernels = struct {
     }
 };
 
-/// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose) or bf16 tiled for glm_mm.
-pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
+/// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose), the same at 32 groups
+/// (TF_GLM_DFLASH2_Q32: the reference engine's granularity), or bf16 tiled for glm_mm.
+pub const Lin = union(enum) { q4: q4.Q4, q4g32: q4.Q4, bf16: mm.Tiled };
 
 /// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
 pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };

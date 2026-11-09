@@ -305,10 +305,11 @@ test "GLM FP8 KV: a logical table keeps the assembled token lists positions, whi
 test "GLM FP8 KV: the glue resolves the paged symbols and opts their chunks into the window's shared memory" {
     const glue = @import("cuda_glue.zig");
     const Res = struct {
-        var names: [96][]const u8 = undefined;
+        // room for every glue kernel and opt-in (the integrated stack: 66 kernels, 17 opt-ins)
+        var names: [128][]const u8 = undefined;
         var n: usize = 0;
-        var set_on: [16]usize = undefined;
-        var set_bytes: [16]c_int = undefined;
+        var set_on: [32]usize = undefined;
+        var set_bytes: [32]c_int = undefined;
         var sets: usize = 0;
         fn function(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) c_int {
             names[n] = std.mem.span(name);

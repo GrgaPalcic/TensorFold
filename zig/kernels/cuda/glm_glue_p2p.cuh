@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "glm_triton.cuh"
+
 namespace glm_p2p {
 
 constexpr int kMaxBlocks = 32;  // p2p_gather.zig max_blocks: a flag line per block and parity
@@ -36,6 +38,9 @@ __device__ __forceinline__ uint64_t now_ns() {
 // releases its flag there, acquires its own flag, then copies the peer's share from its inbox to all[peer].
 // A rank reaches epoch e + 2 only after the peer's e + 1 flag, so a parity's slot is never written while read.
 // A wait past timeout_ns or a raised abort word (status[0]) writes the epoch to status[1]; the host checks it.
+// Dependent launch: the gather waits for the grid that wrote `mine` (and so for every earlier one) before it touches
+// any memory, then lets the next grid launch, whose weights stream in during the exchange; that grid still waits for
+// this one to complete before it reads `all`. Flags, parities and abort handling are unchanged.
 extern "C" __global__ void __launch_bounds__(512) tf_glm_p2p_gather(const uint4* mine, uint4* all, int64_t n16,
                                                                      int rank, int copy_mine, uint4* peer_inbox,
                                                                      uint32_t* peer_flags, const uint4* my_inbox,
@@ -43,6 +48,8 @@ extern "C" __global__ void __launch_bounds__(512) tf_glm_p2p_gather(const uint4*
                                                                      uint32_t epoch, uint64_t timeout_ns,
                                                                      uint32_t* status) {
   using namespace glm_p2p;
+  glm_triton::pdl_wait();
+  glm_triton::pdl_trigger();
   const int b = blockIdx.x;
   const int64_t per = (n16 + gridDim.x - 1) / gridDim.x;
   const int64_t lo = min(n16, (int64_t)b * per), hi = min(n16, lo + per);

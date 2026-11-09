@@ -68,7 +68,7 @@ pub fn placeHost(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, a
 fn fits(comptime F: type, loaded: anytype, o: api.Open, room: u64, window: u64, stream_bytes: u64) bool {
     const want = budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
-    if (layout(loaded)) |l| return kv_pool.holds(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = enginePaged(loaded) });
+    if (layout(loaded)) |l| return kv_pool.holds(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = enginePaged(loaded), .cache_first = cacheFirst() });
     const n = budget.admit(room, stream_bytes, loaded.free_streams, o.lanes, o.lanes_fixed) catch return false;
     return room -| stream_bytes * (n -| loaded.free_streams) >= want;
 }
@@ -87,11 +87,13 @@ pub const Facts = struct { reserve: ?Reserve = null, min_state: u64 = 0 };
 pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts) !?Plan {
     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
-    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged };
+    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged, .cache_first = cacheFirst() };
     var p = kv_pool.plan(l, b) catch |e| {
         problem.* = try refusal(a, l, b, e, window, rows, facts.reserve);
         return null;
     };
+    if (!host_mode and engine_paged and o.prompt_cache_gib != null and p.copied + (256 << 20) < want)
+        std.log.info("prompt cache: the room funds {d:.1} GiB of the {d:.1} GiB --prompt-cache-gib asks, after {d} pages for the streams; a lower --context or --parallel leaves more{s}", .{ toGib(p.copied), toGib(want), p.pages, if (b.cache_first) "" else ", or TF_PROMPT_CACHE_FIRST=1 sets the cache aside before the streams' windows" });
     if (comptime @hasDecl(F, "snap_host_tier")) if (p.copied > 0 and p.copied < facts.min_state) {
         b.cache = 0; // the same streams: neither refusal reads the cache
         const skipped = p.copied;
@@ -189,6 +191,13 @@ pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layou
     const placed = comptime @hasDecl(F, "snap_place"); // the startup line says where its prompt states went, and why
     const cache = if (k.copied == 0 and k.skipped > 0) try std.fmt.allocPrint(a, ", the prompt cache in pinned host memory alone (the {d:.2} GiB the card had left it holds no state: the KV pages took it)", .{toGib(k.skipped)}) else if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
     return .{ shape, cache };
+}
+
+/// TF_PROMPT_CACHE_FIRST=1: the prompt cache (--prompt-cache-gib) is set aside before the room is counted in whole
+/// windows, so the streams share what is left (the engine's own window at least). Unset or 0: windows first, as before.
+fn cacheFirst() bool {
+    const v = std.c.getenv("TF_PROMPT_CACHE_FIRST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
 fn named(o: api.Open) ?usize {

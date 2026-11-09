@@ -75,7 +75,9 @@ pub const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+    warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk: the family's `warm_quiet`
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
+    kv_parts: ?lanes.kv_parts.Source = null, // the family's KV parts (GLM's TF_GLM_KV_SHARD), for /health and /metrics
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
@@ -130,7 +132,8 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
+        h.host.kv_parts = h.kv_parts;
+        h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -406,7 +409,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
-    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
+    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null, .kv_parts = if (@hasField(L, "kv_parts")) loaded.kv_parts else null };
     h.readiness(F);
     const held = served.stream_bytes * (streams -| free);
     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
@@ -424,7 +427,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         const store = try gpa.create(pc.Store);
         errdefer gpa.destroy(store);
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
-        const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else if (comptime cuda_disk.keptDisk(F)) |K| &K.image else null;
+        const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else if (F == glm.native) &@import("cuda_glm_disk.zig").image else if (comptime cuda_disk.keptDisk(F)) |K| &K.image else null;
         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
         store.* = pc.Store.init(gpa, copies, snaps.passRules(F, @import("cuda_startup.zig").rows(F, loaded)), kept_budget);
         errdefer {
@@ -435,8 +438,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
         h.store = store;
+        if (@hasDecl(F, "warm_quiet")) h.warm_quiet = F.warm_quiet;
         if (o.learn_conversations) if (o.learn) |root| {
-            if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
+            if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store) else if (F == glm.native) try @import("cuda_glm_disk.zig").attach(a, io, &g.ctx, o, root, kernels, loaded, store);
             if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);
         };
     }

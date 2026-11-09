@@ -119,6 +119,14 @@ pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scrat
     try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
 }
 
+/// A shared window's chains (decode, three-kernel): every segment of `t` in one launch each (kda.chainSegs), the
+/// layer's own fields as chainRows passes them; each segment's rows, states and saves come with it.
+pub fn chainSegs(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, t: *const kda.Segs, n: usize) !void {
+    const fa = 3 * l.heads * kda.dk;
+    const c: kda.Chain = .{ .p = 0, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = 0, .a_stride = l.heads * kda.dk, .g = 0, .g_stride = l.heads * kda.dk, .conv_state = 0, .conv_w = l.conv_w, .state_in = 0, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+    try kda.chainSegs(ks, stream, c, t, n);
+}
+
 test {
     _ = @import("cuda_kda_tp3_test.zig");
 }

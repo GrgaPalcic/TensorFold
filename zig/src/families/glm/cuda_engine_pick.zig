@@ -13,23 +13,23 @@ pub fn greedyChance(e: *Engine, logits: u64) !chance.Pick {
     return pick(e, logits, true);
 }
 
-/// Greedy picks of a window's `rows` rows: a top-1 launch a row, then one gather of every rank's words, one sync and
-/// one read (rank order [world][rows]), each row picked as `greedy` picks it. A follower's verify rows
-/// (Engine.discard_draws) join the gather and stop there: rank 0 alone reads the tokens.
+/// Greedy picks of a window's `rows` rows (logits rows V apart): one top-1 launch of a block a row (tf_glm_top1_rows,
+/// tf_glm_top1's words for each), then one gather of every rank's words, one sync and one read (rank order
+/// [world][rows]), each row picked as `greedy` picks it. A follower's verify rows (Engine.discard_draws) join the
+/// gather and stop there: rank 0 alone reads the tokens.
 pub fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
     if (rows == 0) return;
     if (rows > @import("cuda_engine.zig").pick_rows) return error.WindowTooWide;
     const world = e.share.world;
     const V = e.share.vocab.len();
     const mine = e.pairs.ptr + e.share.rank * rows * pair_bytes;
-    for (0..rows) |r| {
-        var a: cuda.Args = .{};
-        a.add(logits + r * V * 2);
-        a.add(@as(i64, @intCast(V)));
-        a.add(@as(u32, @intCast(e.share.vocab.lo)));
-        a.add(mine + r * pair_bytes);
-        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
-    }
+    var a: cuda.Args = .{};
+    a.add(logits);
+    a.add(@as(i64, @intCast(V)));
+    a.add(@as(i64, @intCast(V))); // the rows' stride
+    a.add(@as(u32, @intCast(e.share.vocab.lo)));
+    a.add(mine);
+    try cuda.launch.launch(e.m.glue.top1_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
     const stamp = @import("cuda_prof.zig").span(e.profiling_prompt, e.stream, .token_gather);
     if (e.group) |g| try g.allGather(e.stream, mine, e.pairs.ptr, rows * pair_bytes) else try e.lib.check(e.lib.api.ncclAllGather(mine, e.pairs.ptr, rows * pair_bytes, .u8, e.comm, e.stream.handle), "ncclAllGather");
     stamp.end();

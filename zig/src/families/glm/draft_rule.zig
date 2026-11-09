@@ -175,9 +175,14 @@ pub const Knobs = struct {
     coupled: bool = false, // TF_GLM_DFLASH2_COUPLED=1: a sampled stream's drafts race under its target rows' keyed noise
     copy_skip: bool = true, // TF_GLM_DFLASH2_COPY_SKIP=0 turns it off: no block pass for a stream a copy drafts next
     force: ?[]const u8 = null, // TF_GLM_DFLASH2_FORCE: a window's rows in turn (diagnostic), e.g. "8,1,8,2,..."
-    verify_a: f64 = 9.4, // TF_GLM_VERIFY_MS=a,b,d: the cost seed (measured: sm_120 x8 400 W, 0005-0013, forced widths 1-8)
-    verify_b: f64 = 1.31,
-    draft_ms: f64 = 1.37,
+    // TF_GLM_VERIFY_MS=a,b,d: the cost seed. Measured on two GB10s at TP=2 (EXL3 4 bpw, q8 dense, bf16 head, fp8 KV
+    // on pages, DFlash2 at 4 bits) on 2026-11-03, from 587 trace records over forced widths 1-8: a verify forward is
+    // 38.73 + 5.68 ms a row past the first (r2 0.9983) and the drafter's pass is 5.92 ms. The earlier 9.4/1.31/1.37
+    // was sm_120 x8 400 W, where a row is 14% of a round -- on GB10 it is 15%, so the ratio carried over but the
+    // absolutes did not, and seeding a row at 1.31 ms would make TF_GLM_DRAFT_RULE=tpm offer windows far too deep.
+    verify_a: f64 = 38.73,
+    verify_b: f64 = 5.68,
+    draft_ms: f64 = 5.92,
     lambda: f64 = 0.15, // TF_GLM_DRAFT_LAMBDA: a new stream's tokens a ms before its first rounds
     step: f64 = 0.05, // TF_GLM_DRAFT_LEAN: a stream's logit step a draft
     decay: f64 = 0.998,

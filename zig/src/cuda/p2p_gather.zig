@@ -54,6 +54,9 @@ pub const Gather = struct {
     timeout_ns: u64,
     epoch: u32 = 1,
     gathers: u64 = 0,
+    // a dependent launch: the kernel waits for the grid before it (which wrote `mine`), then lets the next grid launch
+    // before it exchanges; that grid waits for the gather to complete before it reads `all` (the owner sets it)
+    pdl: bool = false,
 
     /// Both ranks call it; it returns a gather only when both wanted it and both mapped the other's region.
     pub fn open(gpa: std.mem.Allocator, d: *const Driver, g: *const tp_group.Group, s: Stream, f: Function, wanted: bool, cap: usize, timeout_ns: u64) !?*Gather {
@@ -124,7 +127,7 @@ pub const Gather = struct {
         a.add(x.epoch);
         a.add(x.timeout_ns);
         a.add(x.status_dev);
-        try launch.launch(x.f, .{ .grid = .{ .x = blocksFor(bytes) }, .block = .{ .x = threads } }, s, &a);
+        try launch.launch(x.f, .{ .grid = .{ .x = blocksFor(bytes) }, .block = .{ .x = threads }, .pdl = x.pdl }, s, &a);
         x.epoch = nextEpoch(x.epoch);
         x.gathers += 1;
     }

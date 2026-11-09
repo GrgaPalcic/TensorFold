@@ -18,7 +18,6 @@ using qmm_frag::mma0;
 
 constexpr int BN = 64, HALF = 32;             // keys a tile (the fold's unit), keys a staging slot
 constexpr float LOG2E = 1.4426950408889634f;
-constexpr int SMEM_MAX = 96 * 1024;
 
 using tf_common::cp_wait;
 

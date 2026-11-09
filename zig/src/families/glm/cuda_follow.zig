@@ -12,13 +12,13 @@ const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
-    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
+    depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
     flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
@@ -112,6 +112,14 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(ptr, ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
+    /// `bytes` after the header from rank `root` into every rank's buffer (a disk step's take: cuda_disk_ranks).
+    pub fn from(l: *Link, root: u32, bytes: usize) !void {
+        if (bytes == 0) return;
+        if (64 + bytes > l.buf.len) return error.TooManyIds;
+        try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr + 64, l.buf.ptr + 64, bytes, .u8, @intCast(root), l.comm, l.stream.handle), "ncclBroadcast");
+        try l.stream.synchronize();
+    }
+
     /// Other ranks: the next step and its ids (valid until the next receive): one host round trip for a step of up to
     /// `put_ids` ids, two for a longer one.
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
@@ -203,6 +211,9 @@ pub const Leader = struct {
         try x.flush();
         const c = sampler.check(s);
         var h: Header = .{ .kind = @backingInt(Kind.begin) };
+        if (x.e.settings.kv_shard.on) if (x.e.pages) |p| { // TF_GLM_KV_SHARD: the last ids are its twin's
+            h.depth = @intCast(p.twinCount(x.e.slot));
+        };
         if (c) |v| {
             h.flags = 1;
             h.seed = v.seed;
@@ -259,9 +270,22 @@ pub const Leader = struct {
         return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
     }
 
+    /// TF_GLM_KV_SHARD_CHECK: every that many decode rounds, rank 0's page layout digest before the round's step;
+    /// another rank whose own differs ends the pair (KvShardLayout). Nothing sent unsharded or at 0.
+    fn layoutCheck(x: Leader) !void {
+        if (!x.e.settings.kv_shard.on) return;
+        const p = x.e.pages orelse return;
+        const sh = p.shard orelse return;
+        sh.rounds += 1;
+        if (!sh.switches.digestAt(sh.rounds)) return;
+        try x.send(.{ .kind = @backingInt(Kind.layout), .a = p.digest() }, &.{});
+        sh.parts.counts.checks += 1;
+    }
+
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
     pub fn verify(x: Leader, ids: []const u32, out: []u32, bits: u64) !void {
         try x.flush();
+        try x.layoutCheck();
         try x.send(.{ .kind = @backingInt(Kind.verify), .flags = @intFromBool(x.e.structured) }, ids);
         try x.e.verify(ids, out, bits);
     }
@@ -270,6 +294,7 @@ pub const Leader = struct {
     pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
         if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
         try x.flush();
+        try x.layoutCheck();
         var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
         var n: usize = 2 * parts.len;
         for (parts, 0..) |p, i| {
@@ -335,6 +360,14 @@ pub const Leader = struct {
         if (only_ingest) try x.e.ingestBlock(reqs) else try x.e.draftBlock(reqs);
     }
 
+    /// A kept state's disk step (cuda_disk_ranks): its op and ids to every rank.
+    pub fn disk(x: Leader, h: Header, ids: []const u32) !void {
+        try x.flush();
+        var hh = h;
+        hh.kind = @backingInt(Kind.disk);
+        try x.send(hh, ids);
+    }
+
     /// The other ranks leave their loops.
     pub fn end(x: Leader) !void {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
@@ -385,12 +418,12 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
         try e.keep((h.flags >> 16) & 0xff);
         h.flags &= 0xffff;
     }
-    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
+    if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool and kind != .disk and kind != .layout) try e.bind(h.slot);
     e.prompt_logprobs = if (promptRows(h)) .{} else null;
     e.structured = structuredStep(h); // rank 0 alone masks them
     switch (kind) {
         .begin => {
-            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, ids_in);
+            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth);
             try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
         },
         .pool => {
@@ -467,12 +500,24 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
         },
         .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+        .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
+        .layout => try checkLayout(e, h.a),
         .drop => for (ids_in) |id| e.dropState(id),
         .release => e.release(h.slot),
         .idle => cuda.tp_watch.sleep(e.io),
         .end => return false, // rank 0 ends on purpose: its line closing from here is expected
     }
     return true;
+}
+
+/// Another rank: rank 0's layout digest against this rank's (TF_GLM_KV_SHARD_CHECK); a difference ends the pair.
+fn checkLayout(e: *Engine, digest: u64) !void {
+    const p = e.pages orelse return error.BadStep;
+    const sh = p.shard orelse return error.BadStep;
+    sh.parts.counts.checks += 1;
+    if (p.digest() == digest) return;
+    std.log.err("rank {d}: KV shard layout digest {x} differs from rank 0's {x}", .{ e.share.rank, p.digest(), digest });
+    return error.KvShardLayout;
 }
 
 test "a step's header is 64 bytes and keeps its fields" {

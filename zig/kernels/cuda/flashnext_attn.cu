@@ -443,6 +443,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
         }
         continue;
     }
+    if constexpr (!FUSE) {                                 // o / m / l beside OUT, as fn_attn_merge holds them when it does not fuse
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const int i = g + 8 * h;
@@ -457,6 +458,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
             PM[base] = m[h];
             PL[base] = l[h];
         }
+    }
     }
     }
     if constexpr (FUSE) {                                  // o / l, rounded once, as fn_attn_merge writes OUT

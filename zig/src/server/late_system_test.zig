@@ -549,3 +549,109 @@ test "tool visibility HTTP: whole replies retain an unoffered call" {
 test "tool visibility HTTP: streamed replies retain an unoffered call" {
     try unofferedVisible(true);
 }
+
+/// A reply's text, whether it carried tool_calls, and its finish_reason, whole or streamed, with TF_TOOL_CALL_GUARD on.
+fn guarded(a: std.mem.Allocator, reply: []const u8, streaming: bool) !struct { content: []const u8, calls: bool, finish: []const u8 } {
+    const tool_guard = @import("tool_guard.zig");
+    tool_guard.setForTest(true);
+    defer tool_guard.setForTest(null);
+    var text: DropLate = .{};
+    var backend: Capture = .{ .reply = reply };
+    defer std.testing.allocator.free(backend.prompt);
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    const got = try exchange(srv, "/v1/chat/completions", try std.mem.concat(a, u8, &.{ prose_chat, if (streaming) ",\"stream\":true}" else "}" }));
+    defer std.testing.allocator.free(got.body);
+    try std.testing.expectEqual(@as(u16, 200), got.status);
+    if (!streaming) {
+        const choice = (try json.parse(a, try a.dupe(u8, got.body))).ok.get("choices").?.array[0];
+        const message = choice.get("message").?;
+        const content = if (message.get("content")) |c| (if (c == .string) c.string else "") else "";
+        return .{ .content = content, .calls = message.get("tool_calls") != null, .finish = choice.get("finish_reason").?.string };
+    }
+    var content: std.ArrayList(u8) = .empty;
+    var calls = false;
+    var finish: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, got.body, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "data: ")) continue;
+        const data = std.mem.trim(u8, line[6..], "\r");
+        if (std.mem.eql(u8, data, "[DONE]")) continue;
+        const payload = (try json.parse(a, try a.dupe(u8, data))).ok;
+        for (payload.get("choices").?.array) |choice| {
+            const delta = choice.get("delta").?;
+            if (delta.get("content")) |part| if (part == .string) try content.appendSlice(a, part.string);
+            if (delta.get("tool_calls") != null) calls = true;
+            if (choice.get("finish_reason")) |reason| if (reason == .string) {
+                finish = reason.string;
+            };
+        }
+    }
+    return .{ .content = content.items, .calls = calls, .finish = finish };
+}
+
+test "tool visibility HTTP: guard on, tools offered: an unoffered call leaves prose, but never empties a reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unoffered = "<tool_call>drive_preview<arg_key>id</arg_key><arg_value>7</arg_value></tool_call>";
+    for ([_]bool{ false, true }) |streaming| {
+        const with_prose = try guarded(a, "Checking." ++ unoffered, streaming);
+        try std.testing.expectEqualStrings("Checking.", with_prose.content);
+        try std.testing.expect(!with_prose.calls);
+        // the call was all the reply held: it stays, so the client sees what the model wrote instead of nothing
+        const alone = try guarded(a, unoffered, streaming);
+        try std.testing.expectEqualStrings(unoffered, alone.content);
+        try std.testing.expectEqualStrings("stop", alone.finish);
+    }
+}
+
+test "tool visibility HTTP: guard on, tools offered: a malformed call stays as text, an offered call parses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const malformed = "<tool_call>{\"arguments\":{\"q\":\"a\"}}</tool_call>"; // no name: never a tool_calls entry
+    for ([_]bool{ false, true }) |streaming| {
+        const bad = try guarded(a, "Looking." ++ malformed, streaming);
+        try std.testing.expectEqualStrings("Looking." ++ malformed, bad.content);
+        try std.testing.expect(!bad.calls);
+        const good = try guarded(a, prose_reply, streaming);
+        try std.testing.expect(good.calls);
+        try std.testing.expectEqualStrings("tool_calls", good.finish);
+    }
+}
+
+test "a tool-call reply warms the tool turn's opening and a plain reply the user turn's" {
+    var text: DropLate = .{};
+    var backend: Capture = .{ .reply = prose_reply, .warm_turns = true };
+    defer std.testing.allocator.free(backend.prompt);
+    defer std.testing.allocator.free(backend.background_prompt);
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    const called = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
+    defer std.testing.allocator.free(called.body);
+    try std.testing.expectEqual(@as(u16, 200), called.status);
+    const after_call = try promptText(backend.background_prompt);
+    defer std.testing.allocator.free(after_call);
+    // the next message is a tool result: the pass ends at its opening, with the call in place
+    try std.testing.expect(std.mem.endsWith(u8, after_call, "[tool]"));
+    try std.testing.expect(std.mem.indexOf(u8, after_call, "[user]A") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_call, "\"name\":\"lookup\"") != null);
+    backend.reply = "plain words";
+    const answered = try exchange(srv, "/v1/chat/completions", prose_chat ++ "}");
+    defer std.testing.allocator.free(answered.body);
+    try std.testing.expectEqual(@as(u16, 200), answered.status);
+    const after_answer = try promptText(backend.background_prompt);
+    defer std.testing.allocator.free(after_answer);
+    try std.testing.expect(std.mem.endsWith(u8, after_answer, "[assistant]plain words\n[user]"));
+}

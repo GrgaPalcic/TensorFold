@@ -38,7 +38,10 @@ pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, g: *cuda.tp_group.Gro
         break :blk Settings{ .on = false };
     };
     try g.openP2p(gpa, d, s, f, set.on, set.cap, set.timeout_ns);
-    if (g.p2p) |p| std.log.info("p2p gather: the engine stream's all-gathers up to {d} KiB a rank by peer stores (TF_GLM_P2P_GATHER=0: NCCL)", .{p.cap >> 10}) else std.log.info("p2p gather: off ({s}); NCCL carries every all-gather", .{if (set.on) "a rank could not map the other's memory" else "TF_GLM_P2P_GATHER=0 on a rank"});
+    if (g.p2p) |p| {
+        p.pdl = @import("cuda_mm.zig").Chain.read().p2p; // TF_GLM_PDL_CHAIN's p2p: a rank's own launches, no agreement needed
+        std.log.info("p2p gather: the engine stream's all-gathers up to {d} KiB a rank by peer stores (TF_GLM_P2P_GATHER=0: NCCL){s}", .{ p.cap >> 10, if (p.pdl) "; dependent launch" else "" });
+    } else std.log.info("p2p gather: off ({s}); NCCL carries every all-gather", .{if (set.on) "a rank could not map the other's memory" else "TF_GLM_P2P_GATHER=0 on a rank"});
 }
 
 test "settings: on by default at 512 KiB, each knob checked" {

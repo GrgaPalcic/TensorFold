@@ -23,8 +23,22 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
 };
 
-// How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults.
-enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3 };
+// How a warp reads its k tiles: main's loop, or a tile ahead (sm_120 up); SKIP and STALE are the contract's faults;
+// SHFL every word once, a tile ahead (warp_tiles_shfl, sm_120 up); SHFL_SRC and SHFL_A its planted faults.
+enum Load : int { PLAIN = 0, AHEAD = 1, SKIP = 2, STALE = 3, SHFL = 4, SHFL_SRC = 5, SHFL_A = 6, SHFL_PDL = 7 };
+
+// Dependent launches (sm_90 up; a no-op in a kernel not launched as a dependent): wait for the grids before this one
+// (their outputs visible after it), and let the next dependent launch begin.
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT, int LOAD>
@@ -63,6 +77,107 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
         for (int j = 0; j < NT; ++j) {
             uint32_t b0[2], b1[2];
             decode_lane<K2, CB>(w[j], lane, b0, b1);
+            mma16816(acc[j][0], a, b0);
+            mma16816(acc[j][1], a, b1);
+        }
+    }
+}
+
+// lane_states<8>'s values (4-bit: windows at fixed nibble offsets): V = w0:w1 (w0 high), s[j] = (V >> (28 - 4 j)) & 0xffff.
+__device__ __forceinline__ void lane_states8(uint32_t w0, uint32_t w1, uint32_t (&s)[8]) {
+    s[0] = __funnelshift_r(w1, w0, 28) & 0xffffu;
+    s[1] = __funnelshift_r(w1, w0, 24) & 0xffffu;
+    s[2] = __funnelshift_r(w1, w0, 20) & 0xffffu;
+    s[3] = w1 >> 16;
+    s[4] = (w1 >> 12) & 0xffffu;
+    s[5] = __byte_perm(w1, 0u, 0x4421);
+    s[6] = (w1 >> 4) & 0xffffu;
+    s[7] = w1 & 0xffffu;
+}
+
+// decode2<CB_MCG> with its AND mask in a register `m` (0x8FFF8FFF): the same operations on the same values.
+__device__ __forceinline__ uint32_t decode2_mcg(uint32_t s0, uint32_t s1, uint32_t m) {
+    uint32_t x0 = s0 * 0xCBAC1FEDu, x1 = s1 * 0xCBAC1FEDu;
+    x0 = (x0 & m) ^ 0x3B603B60u;
+    x1 = (x1 & m) ^ 0x3B603B60u;
+    const uint32_t lo = __byte_perm(x0, x1, 0x5410);
+    const uint32_t hi = __byte_perm(x0, x1, 0x7632);
+    const half2 r = __hadd2(*reinterpret_cast<const half2*>(&lo), *reinterpret_cast<const half2*>(&hi));
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+// warp_tiles with every trellis word read once: lane l loads word l of each tile (one 128-byte warp load a 4-bit tile,
+// where the lane-window loads read each word twice) and the next tile's words and A fragment a tile ahead; each lane
+// takes its windows' words from their owners by shuffle. The same words, A values, decode and MMA chain as warp_tiles,
+// so the same bits. Planted faults (contract): SHFL_SRC takes the last tile's second word from the wrong lane, SHFL_A
+// gives the last tile the A fragment of the tile before.
+// 4-bit mcg decodes with lane_states8 and decode2_mcg; `opq` (any value below 256, the call's matrix count) builds the
+// mask so that ptxas keeps it in a register rather than rebuilding it for every LOP3 (26 MOVs a k step).
+template <int CB, int K2, int NT, int LOAD>
+__device__ __forceinline__ void warp_tiles_shfl(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
+                                                const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4],
+                                                int opq) {
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+    static_assert(TW <= 32, "a word a lane");
+    const size_t kstride = (size_t)ntiles * TW;
+    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
+    int word, offset;
+    lane_start<K2>(lane, word, offset);
+    const bool own = TW == 32 || lane < TW;
+    const uint32_t mask = 0x8FFF8FFFu | ((uint32_t)opq >> 8);  // exactly 0x8FFF8FFF (opq < 256), held in a register
+    uint32_t nx[NT], na[4];  // the next tile's word `lane` of each tile and its A fragment, in flight while this decodes
+    auto words = [&](int i) {  // the trellis: immutable, so it may stream in before a dependent launch's wait
+        const uint32_t* t0 = tb + (size_t)i * kstride;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) nx[j] = own ? ldg_stream_u32(t0 + j * TW + lane) : 0u;
+    };
+    auto rows = [&](int i) {  // the rows' inputs: the grid before this one's outputs
+        const int k = (kt0 + i) * 16;
+        na[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+        na[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
+        na[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+        na[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
+    };
+    auto load = [&](int i) {
+        words(i);
+        rows(i);
+    };
+    if (nkt > 0) words(0);
+    if constexpr (LOAD == SHFL_PDL) {  // a dependent launch: every input of this step and every write after the wait
+        pdl_wait();
+        pdl_trigger();
+    }
+    if (nkt > 0) rows(0);
+    for (int i = 0; i < nkt; ++i) {
+        uint32_t cur[NT], a[4];
+#pragma unroll
+        for (int j = 0; j < NT; ++j) cur[j] = nx[j];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) a[c] = na[c];
+        if (LOAD == SHFL_A && i == nkt - 1 && i > 0) {  // planted: the last tile keeps the tile before's A fragment
+            const int k = (kt0 + i - 1) * 16;
+            a[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+            a[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+        }
+        if (i + 1 < nkt) load(i + 1);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int l = 0; l < LW; ++l) {
+                const int src = (LOAD == SHFL_SRC && i == nkt - 1 && l == LW - 1 ? word + l + 1 : word + l) % TW;
+                w[l] = __shfl_sync(0xffffffffu, cur[j], src);
+            }
+            uint32_t b0[2], b1[2];
+            if constexpr (K2 == 8 && CB == CB_MCG) {
+                uint32_t st[8];
+                lane_states8(w[0], w[1], st);
+                b0[0] = decode2_mcg(st[0], st[1], mask);
+                b0[1] = decode2_mcg(st[2], st[3], mask);
+                b1[0] = decode2_mcg(st[4], st[5], mask);
+                b1[1] = decode2_mcg(st[6], st[7], mask);
+            } else
+                decode_lane<K2, CB>(w, lane, b0, b1);
             mma16816(acc[j][0], a, b0);
             mma16816(acc[j][1], a, b1);
         }
@@ -161,16 +276,26 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 
 // grouped_body at one trellis width K2F (no width switch: fewer registers) and RR reduction rows (a member tile of at
 // most RR rows: decode windows); every column keeps its k slices and warp-order sum, so the bits are grouped_body's.
+// SHFL_PDL (a dependent launch): before its wait a block reads only the plan (uids, count, members: from the router two
+// launches back, done before the grid before this one passed its own wait) and the immutable trellis pointers, widths
+// and first tile; every exit waits first, so every CTA waits.
 template <int CB, int NT, int W, int LOAD, int K2F, int RR>
 __device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int nblock, int zz) {
-    if (u >= a.ucount[0]) return;
+    constexpr bool PDLW = LOAD == SHFL_PDL;
+    if (u >= a.ucount[0]) {
+        if constexpr (PDLW) pdl_wait();
+        return;
+    }
     const int MT = (a.maxm + 15) / 16;
     const int mtile = zz % MT;
     const int split = (zz / MT) % a.sk;
     const int mat = zz / MT / a.sk;
     const half* X = mat ? a.x1 : a.x0;
     const int e = a.standard ? a.uids[3 * u] : a.uids[u];
-    if (a.standard && e == a.skip) return;
+    if (a.standard && e == a.skip) {
+        if constexpr (PDLW) pdl_wait();
+        return;
+    }
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
     const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -186,7 +311,10 @@ __device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int 
         rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
     }
     __syncthreads();
-    if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+    if (rows_sh[0] < 0) { // members come first, so this tile is empty
+        if constexpr (PDLW) pdl_wait();
+        return;
+    }
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
@@ -205,7 +333,10 @@ __device__ __forceinline__ void grouped_body_v2(const GroupedArgs a, int u, int 
     __shared__ __align__(16) float red[W][RR][NT * 16];
     if constexpr (K2F > 0) {
         if (k2 != K2F) __trap();  // the launcher picks it for a projection whose every expert is K2F wide
-        warp_tiles<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+        if constexpr (LOAD >= SHFL)
+            warp_tiles_shfl<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc, a.mats);
+        else
+            warp_tiles<CB, K2F, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
     } else {
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \

@@ -19,6 +19,9 @@ const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
 const prompt_pair = @import("cuda_prompt_pair.zig");
+const kv_shard = @import("cuda_kv_shard.zig");
+const kv_attn = @import("cuda_kv_shard_attn.zig");
+const kv_keep = @import("cuda_kv_shard_keep.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -90,6 +93,7 @@ pub const Engine = struct {
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    shared_profs: [shared_rows]?*prof_mod.Prof = @splat(null), // and shared windows' (several streams in one forward), by total rows
     checkpoint_digest: [32]u8,
     settings: ranks.Settings,
     m: fw.Modules,
@@ -117,6 +121,7 @@ pub const Engine = struct {
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
     snap_pages: ?snapshots.pages.Pool = null,
     snap_setup: ?snapshots.Setup = null,
+    link: ?*anyopaque = null, // rank 0 at TP: its follow.Link, for the disk steps (cuda_disk_ranks)
     next_snap: u64 = 1, // rank 0: the next id
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
@@ -129,6 +134,9 @@ pub const Engine = struct {
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     a8_buf: ?cuda.DeviceBuffer = null, // TF_GLM_W8A8=1: a prompt pass's int8 rows and scales (cuda_mm.A8)
+    kv_room: ?cuda.DeviceBuffer = null, // TF_GLM_KV_SHARD: owner-computed attention's peer queries and outputs
+    kv_stage: ?cuda.DeviceBuffer = null, // ...and a resume's carry pieces (cuda_kv_shard_keep.piece_bytes)
+    kv_ctx: kv_attn.Ctx = undefined, // ...their place for the forward (read only with settings.kv_shard.on)
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -166,6 +174,8 @@ pub const Engine = struct {
         fp.mtp += @intFromBool(o.drafter);
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
         try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
+        // TF_GLM_KV_SHARD's refusals, alike on every rank from the agreed fingerprint, before anything loads
+        try kv_shard.refuse(o.settings.kv_shard, .{ .world = world, .kv8 = o.settings.kv8, .pages = o.settings.pages, .mtp_drafts = heads(o.drafts, o.drafter, c.mtp).heads == .mtp });
         const share = try shard.Share.of(&c, rank, world);
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
@@ -210,6 +220,7 @@ pub const Engine = struct {
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (e.settings.pages and !pages_mod.pageable(e)) { // the same layers and heads on every rank: they all keep windows
+            if (e.settings.kv_shard.on) return error.KvShardNeedsPages; // a thin model of KDA layers alone: nothing to shard
             e.settings.pages = false;
             if (rank == 0) std.log.info("kv pages: the loaded layers keep no KV rows to page (no DSA layer, no target MTP head): each stream keeps its own window", .{});
         }
@@ -230,6 +241,8 @@ pub const Engine = struct {
         errdefer if (e.bm) |*b| b.deinit();
         if (e.drafts) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
+        if (o.settings.kv_shard.on) try e.initKvShard(); // before the room is read: its bytes are the rank's own
+        errdefer e.freeKvShard();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
         errdefer e.pairs.free();
         try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
@@ -237,6 +250,9 @@ pub const Engine = struct {
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
         if (prof_mod.Prof.wanted()) for (&e.profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+        };
+        if (prof_mod.Prof.wanted()) for (&e.shared_profs) |*p| {
             p.* = try prof_mod.Prof.init(d, io);
         };
         if (prof_mod.Prof.wanted()) for (&e.prompt_profs) |*p| {
@@ -276,6 +292,7 @@ pub const Engine = struct {
         if (e.pair) |*p| p.deinit();
         e.bp.deinit();
         if (e.a8_buf) |*b| b.free();
+        e.freeKvShard();
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
@@ -320,6 +337,40 @@ pub const Engine = struct {
         });
     }
 
+    /// TF_GLM_KV_SHARD: the exchange room for owner-computed attention (a prompt chunk's rows of this rank's heads,
+    /// twice: 256 MiB at TP2) and a carry's staging piece, made once at start.
+    fn initKvShard(e: *Engine) !void {
+        e.kv_room = null;
+        e.kv_stage = null;
+        errdefer e.freeKvShard();
+        const rows = @max(fw.prefill_rows, shared_rows);
+        const hl = e.share.mla.len();
+        const half = rows * hl * e.c.kv_lora * 2;
+        e.kv_room = try cuda.DeviceBuffer.alloc(e.d, kv_attn.roomBytes(rows, hl, e.c.kv_lora));
+        e.kv_stage = try cuda.DeviceBuffer.alloc(e.d, kv_keep.piece_bytes);
+        e.kv_ctx = .{ .rank = e.share.rank, .lib = e.lib, .comm = e.comm, .pq = e.kv_room.?.ptr, .po = e.kv_room.?.ptr + half, .rows = rows };
+    }
+
+    fn freeKvShard(e: *Engine) void {
+        if (!e.settings.kv_shard.on) return;
+        if (e.kv_room) |*b| b.free();
+        if (e.kv_stage) |*b| b.free();
+        e.kv_room = null;
+        e.kv_stage = null;
+    }
+
+    /// The forward's exchange room under TF_GLM_KV_SHARD (null off).
+    pub fn kvCtx(e: *Engine) ?*const kv_attn.Ctx {
+        return if (e.settings.kv_shard.on and e.kv_room != null) &e.kv_ctx else null;
+    }
+
+    /// TF_GLM_KV_SHARD: the bound stream's prompt twin goes back before its first decode round (every rank, at the
+    /// same step); no-op off or without one.
+    fn giveTwin(e: *Engine, slot: u32) !void {
+        if (!e.settings.kv_shard.on) return;
+        if (e.pages) |p| try p.giveTwin(slot);
+    }
+
     pub fn exchange(e: *const Engine) fw.Exchange {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
     }
@@ -328,7 +379,7 @@ pub const Engine = struct {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
         const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = if (b.prefill) null else e.side, .moe_fuse = e.moe_fuse, .ce = if (b == &e.bp) e.ce else null, .kv = e.kvCtx() }; // prompt buffers (the pair's twin too) keep the shared expert on their stream; the twin's exchanges stay on NCCL (its rows are not registered)
     }
 
     /// An on-by-default switch: off only when `name` is "0".
@@ -453,6 +504,11 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);
         f.index_split = split;
+        if (kv_attn.wanted(&f, one[0])) { // TF_GLM_KV_SHARD, no twin: its exchanges on the main stream, whole
+            f.pieces = null;
+            f.ce = null;
+            if (e.kv_ctx.counts) |c| c.owner_prompts += 1;
+        }
         if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
@@ -535,6 +591,8 @@ pub const Engine = struct {
     pub const unprepareSnapshots = snapshots.unprepare;
     pub const keepState = snapshots.keep;
     pub const keepAs = snapshots.keepAs;
+    pub const blankAs = snapshots.blankAs;
+    pub const sealState = snapshots.seal;
     pub const restoreState = snapshots.restore;
     pub const holds = snapshots.holds;
     pub const dropState = snapshots.drop;
@@ -587,6 +645,7 @@ pub const Engine = struct {
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
+        try e.giveTwin(e.slot);
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
@@ -600,6 +659,7 @@ pub const Engine = struct {
     }
 
     const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
+    const sharedLabel = @import("cuda_engine_prof.zig").sharedLabel;
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
@@ -612,14 +672,32 @@ pub const Engine = struct {
             if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
+            try e.giveTwin(p.slot);
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
             @memcpy(ids[rows..][0..p.ids.len], p.ids);
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse };
+        var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = e.side, .moe_fuse = e.moe_fuse, .kv = e.kvCtx() };
+        f.prof = e.shared_profs[rows - 1];
+        if (f.prof) |p| try p.begin(e.stream, sharedLabel(rows));
+        defer if (f.prof) |p| p.end();
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+        // every part greedy (no grammar, no sampled stream; the same on every rank): all rows in one pick, one launch,
+        // one gather, one sync and one read, each row's token as its part's own draw picks it
+        var all_greedy = !e.structured;
+        for (parts) |p| all_greedy = all_greedy and e.seqs.items[p.slot].?.sampling == null;
+        if (all_greedy) {
+            var outs: [shared_rows]u32 = undefined;
+            for (parts, segs[0..parts.len]) |p, g| {
+                try e.bind(p.slot);
+                e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+            }
+            try @import("cuda_engine_pick.zig").greedyRows(e, b.logits, rows, outs[0..rows]);
+            for (parts, segs[0..parts.len]) |p, g| @memcpy(p.out[0..g.rows], outs[g.row0..][0..g.rows]);
+            return;
+        }
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;

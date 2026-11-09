@@ -83,6 +83,8 @@ pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume
     if (e.pair == null or !e.settings.pair or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (len < minLen()) return false; // too short to gain from a pair
+    // TF_GLM_KV_SHARD: a stream one rank holds alone attends owner-computed, on the main stream: one chunk a step
+    if (e.settings.kv_shard.on) if (e.cur.st.hold) |h| if (!h.twin) return false;
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
     const rb = @min(len - start - fw.prefill_rows, fw.prefill_rows);
     if (!e.pair.?.own_room and !piecesSplit(fw.prefill_rows, rb, e.pieces.count, e.share.world)) return false;

@@ -39,6 +39,31 @@ extern "C" __global__ void tf_exl3_grouped_1_k8r8(tf_exl3::GroupedArgs a) {
     tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_LOAD, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// 4-bit mcg decode windows with every trellis word read once (warp_tiles_shfl, sm_120 up; main's loop below): the same
+// k slices, MMA chains and warp-order sums, so the bits of tf_exl3_grouped_1_k8r8 (<= 8 rows) and _nt4 (9 to 32 rows).
+#if __CUDA_ARCH__ >= 1200
+constexpr int GROUPED_SHFL = tf_exl3::SHFL;
+#else
+constexpr int GROUPED_SHFL = tf_exl3::PLAIN;
+#endif
+extern "C" __global__ void tf_exl3_grouped_1_k8r8s(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+extern "C" __global__ void tf_exl3_grouped_1_k8r16s(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+// The same as dependent launches (cuda/exl3_experts.zig core's decode chain): plan, trellis pointers and first tile before
+// griddepcontrol.wait, the rows' inputs and the partials after it; launched without the attribute they are k8r8s/k8r16s.
+// Every SM builds the waits (a kernel without them must never launch as a dependent; below sm_90 they compile out).
+constexpr int GROUPED_SHFL_PDL = tf_exl3::SHFL_PDL;
+extern "C" __global__ void tf_exl3_grouped_1_k8r8p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 8>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+extern "C" __global__ void tf_exl3_grouped_1_k8r16p(tf_exl3::GroupedArgs a) {
+    tf_exl3::grouped_body_v2<1, 4, 4, GROUPED_SHFL_PDL, 8, 16>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
@@ -75,6 +100,8 @@ struct RotInArgs {
 };
 
 extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
+    pdl_wait();  // a dependent launch on the decode chain: the picks are the grid before's; no-op otherwise
+    pdl_trigger();
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
@@ -117,6 +144,8 @@ struct GateUpArgs {
 };
 
 extern "C" __global__ void tf_exl3_gateup_epilogue(const GateUpArgs a) {
+    pdl_wait();  // a dependent launch on the decode chain: z is the grid before's; no-op otherwise
+    pdl_trigger();
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = a.pick[p];
     if (e < 0 || e >= a.experts) return;
@@ -345,16 +374,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_gu_k6(const 
     __syncthreads();                                                                                                     \
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 // Block (256 model-width columns, item): y[row][slot][:] = the down epilogue of the item's pairs (this rank's share).
-template <int K2>
-__device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
+template <int K2, int NBA>
+__device__ __forceinline__ void prompt_down_n(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
         float* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
         int lane) {
-    float acc[TMT][TNB][4];
-    tmain<1, TPM, K2>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    float acc[TMT][NBA][4];
+    tmain<1, TPM, K2, NBA, 4>(Xd, Xd, Td, Td, rows_sh, e, K, D >> 4, cb, 1, smem_raw, acc);
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
         if (hf) __syncthreads();
-        tspill(Ed, DN_ES, warp * TMT * 16, acc, hf);
+        tspill<NBA>(Ed, DN_ES, warp * TMT * 16, acc, hf);
         __syncthreads();
         for (int i = warp; i < TPH && hf * TPH + i < cnt; i += TNW) {
             const int p = rows_sh[hf * TPH + i];
@@ -364,15 +393,26 @@ __device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const u
                 float v[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
-                fwht128(v, lane);
+                fwht128f(v, lane);
                 // yrow 0: y [pairs][D]; else pair p = row * ys + slot lands in y [rows][yrow][D] (the MoE slot rows, no copy)
                 const size_t at = yrow ? (size_t)(p / ys) * yrow + p % ys : (size_t)p;
-                float* o = y + at * D + n;
+                float o[4];
 #pragma unroll
                 for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+                // one 16-byte store (y rows and n are 16-byte aligned: Kernels.run checks y)
+                *reinterpret_cast<float4*>(y + at * D + n) = make_float4(o[0], o[1], o[2], o[3]);
             }
         }
     }
+}
+// The item's main loop and epilogue compiled for its 8-member column blocks (exl3_prompt.cuh TF_EXL3_PROMPT_NBA).
+template <int K2>
+__device__ __forceinline__ void prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const half* __restrict__ svh_d,
+        float* __restrict__ y, int K, int D, int ys, int yrow, unsigned char* smem_raw, const int* rows_sh, int cb, int e, int cnt, int warp,
+        int lane) {
+#define TF_EXL3_PROMPT_DN(NBA) prompt_down_n<K2, NBA>(Xd, Td, svh_d, y, K, D, ys, yrow, smem_raw, rows_sh, cb, e, cnt, warp, lane)
+    TF_EXL3_PROMPT_NBA(cnt, TF_EXL3_PROMPT_DN)
+#undef TF_EXL3_PROMPT_DN
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const half* __restrict__ Xd, const uint64_t* __restrict__ Td,

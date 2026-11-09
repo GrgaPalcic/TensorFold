@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const latent = @import("cuda_latent.zig");
+const index_mod = @import("cuda_index.zig");
 
 /// sparse.POOL, TOPK_POOLS, SELECT_LIST, SCORE_LOOP_FROM, SCORE_LOOP; geometry.MLA_SELECT_ROWS.
 pub const pool = 4;
@@ -46,6 +47,12 @@ pub fn dselParse(text: ?[]const u8) !bool {
 pub fn dselRead() !bool {
     const v = std.c.getenv("TF_GLM_DSEL") orelse return true;
     return dselParse(std.mem.span(v));
+}
+
+/// TF_GLM_DSCORES: unset or 1 (decode windows' scores on glm_index_scores), 0 (tf_glm_scores); a typo is refused.
+pub fn dscoresRead() !bool {
+    const v = std.c.getenv("TF_GLM_DSCORES") orelse return true;
+    return dselParse(std.mem.span(v)) catch error.BadDscoresSetting;
 }
 
 /// The bytes of a decode select's gt and eq bit words for `rows` rows at `np` pools (Scratch.ls, its bits_rows).
@@ -148,8 +155,10 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
         inline for (.{ qi + a * heads * d * 2, wts + a * w_stride * 2, @as(i64, @intCast(w_stride)), pk, s.scores, at, @as(i64, @intCast(np_max)), @as(i64, @intCast(nb)), scale, headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), t.pt, @as(i64, @intCast(t.ps)) }) |v| sa.add(v);
         if (d != 128 or heads > 32) return error.IndexShape;
         const quick = if (set.index) |k| if (k.takes(rows, np_max, pk, t.ps)) k else null else null;
+        // a decode window's rows: the same scores from glm_index_scores (8 rows a CTA, key tiles staged once)
+        const dec = if (set.dscore) |k| if (k.takesDecode(rows, np_max, nb, pk, t.ps)) k else null else null;
         var stamp = prof.span(profile, stream, .index_score);
-        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else if (dec) |k| try k.scoresTiles(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps, index_mod.decodeLoop(nb)) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
         stamp.end();
         stamp = prof.span(profile, stream, .index_select);
         if (quick) |k| if (k.select) {

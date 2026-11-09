@@ -20,9 +20,13 @@ pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
 
-/// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
-const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
+/// With DFlash2: a verify forward's ms by rows on two GB10s, fitted on this pair from 587 TF_GLM_DFLASH2_TRACE
+/// records over forced widths 1..8 (lone: 38.73 + 5.68 a row, r2 0.9983; shared forwards by total rows:
+/// 47.38 + 5.05, r2 0.9934). The earlier 52.0/6.8 and 76.0/4.1 over-priced a forward by 34% and 60% at one row,
+/// which starved depth.zig's overhead learner (ms - forward, clamped at zero): of 139 measured two-lane forwards
+/// only 4 could have fired it, against 133 at these prices, where it learns 3 to 8 ms.
+const gb10_window_costs = costTable(max_rows, 38.73, 5.68);
+const gb10_shared_costs = costTable(engine.shared_rows, 47.38, 5.05);
 
 fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
@@ -206,8 +210,11 @@ pub const Lanes = struct {
         return false;
     }
 
+    /// Read at every chunk gate (on every rank, rank 0's word): the stream was cancelled, or it is a background
+    /// prompt pass (a warm turn, server/warm.zig) and real work waits; the states kept so far stay kept either way.
     fn cancelled(ptr: ?*anyopaque) bool {
-        return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
+        const s: *lanes.Stream = @ptrCast(@alignCast(ptr.?));
+        return s.isCancelled() or s.yields();
     }
 
     // -- the vtable ---------------------------------------------------------------------------------------------
@@ -329,17 +336,27 @@ pub const Lanes = struct {
             if (self.x.e.pages) |p| p.close(l.slot);
             _ = self.lanes.remove(s);
         }
-        const pages = try self.pagesFor(l.slot, prompt, max_new);
+        const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
+        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null);
         try self.x.bind(l.slot);
         return pages;
     }
 
-    /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now.
-    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize) ![]const u32 {
+    /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now. Sharded
+    /// (TF_GLM_KV_SHARD), in its kept state's home part when that has the room (`home`).
+    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, home: ?u8) ![]const u32 {
         const p = self.x.e.pages orelse return &.{};
         if (!p.paged(slot)) return error.LaneMemory; // every paged sequence is taken
         p.close(slot); // a stream that opens again gives its earlier pages back first
-        return p.open(slot, prompt, max_new);
+        return p.openFor(slot, prompt, max_new, home);
+    }
+
+    /// The home part of the kept state a stream may resume (TF_GLM_KV_SHARD; null: none, or unsharded).
+    fn homeOf(self: *const Lanes, s: *const lanes.Stream) ?u8 {
+        const saved = s.reuse.saved orelse return null;
+        const k: *const engine.Kept = @ptrCast(@alignCast(saved));
+        const snap = self.x.e.snaps.get(k.id) orelse return null;
+        return snap.home;
     }
 
     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
@@ -375,8 +392,26 @@ pub const Lanes = struct {
             s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
             return null;
         }
+        if (!self.resumesHere(k.id)) { // sharded: the stream lies outside the state's home part and carries are off
+            s.reuse_failed = true;
+            s.reuse_error = error.KvShardNotHome;
+            return null;
+        }
         s.cached = k.at;
         return .{ .id = k.id, .at = k.at };
+    }
+
+    /// Whether the bound stream can resume kept state `id` (TF_GLM_KV_SHARD): in the state's home part, or with
+    /// TF_GLM_KV_SHARD_CARRY its rows carried there; unsharded always.
+    pub fn resumesHere(self: *Lanes, id: u64) bool {
+        if (!self.x.e.settings.kv_shard.on) return true;
+        const p = self.x.e.pages orelse return true;
+        const sh = p.shard orelse return true;
+        const home = (self.x.e.snaps.get(id) orelse return true).home orelse return true;
+        const hold = self.x.e.cur.st.hold orelse return true;
+        if (hold.owner == home or sh.switches.carry) return true;
+        sh.parts.counts.resumes_dropped += 1;
+        return false;
     }
 
     /// The prompt pass stands at a mark: the lane host keeps the state there (cuda_native's snap_save).

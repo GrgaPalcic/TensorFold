@@ -92,6 +92,7 @@ pub const Kernels = struct {
     pub fn run(k: Kernels, e: *const ex.Experts, router: grouped.Router, s: Stream, l: ex.Layer, x: u64, stride: usize, picks: u64, rows: usize, sc: Scratch, p: grouped.Plan) !void {
         if (!eligible(l) or rows == 0 or rows > sc.rows or stride < l.dims or stride > std.math.maxInt(i32)) return error.Exl3Shape;
         if (sc.y == 0 or (sc.yrow != 0 and sc.yrow < sc.slots)) return error.Exl3Shape;
+        if (sc.y % 16 != 0 or sc.xd % 8 != 0) return error.Exl3Shape; // the kernels' vector stores: 16-byte y, 8-byte xd rows
         _ = try bytes(l, rows, sc.slots);
         const pairs = rows * sc.slots;
         const w = widths(l);

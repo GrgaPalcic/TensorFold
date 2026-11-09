@@ -113,6 +113,10 @@ pub const Experts = struct {
     grouped: [3]Function, // one per codebook
     grouped_nt4: Function, // mcg at 4 tiles a block (the same bits as grouped[1])
     grouped_r8: [2]Function, // mcg at one width (3-bit, 4-bit), 4 tiles, 8 reduction rows: windows of up to 8 rows
+    grouped_s: [2]Function = undefined, // 4-bit mcg, every trellis word read once: 8 and 16 reduction rows (k8r8s, k8r16s)
+    grouped_p: [2]Function = undefined, // the same as dependent launches (k8r8p, k8r16p: waits, triggers)
+    shfl: bool = true, // TF_EXL3_SHFL=0: 4-bit windows keep the lane-window loads (k8r8, nt4); the same bits either way
+    pdl: bool = true, // TF_EXL3_PDL=0: the read-once chain launches as ordinary launches; the same bits either way
     gateup: Function,
     down_combine: Function,
     prompt: prompt.Kernels = undefined,
@@ -145,6 +149,10 @@ pub const Experts = struct {
         };
         e.grouped_nt4 = try e.mod.function("tf_exl3_grouped_1_nt4");
         e.grouped_r8 = .{ try e.mod.function("tf_exl3_grouped_1_k6r8"), try e.mod.function("tf_exl3_grouped_1_k8r8") };
+        e.grouped_s = .{ try e.mod.function("tf_exl3_grouped_1_k8r8s"), try e.mod.function("tf_exl3_grouped_1_k8r16s") };
+        e.grouped_p = .{ try e.mod.function("tf_exl3_grouped_1_k8r8p"), try e.mod.function("tf_exl3_grouped_1_k8r16p") };
+        e.shfl = envOn("TF_EXL3_SHFL");
+        e.pdl = envOn("TF_EXL3_PDL");
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
         return e;
@@ -185,6 +193,11 @@ pub const Experts = struct {
     /// (`group`, or a caller's fused grouping with tf_exl3_group's own code, as GLM's decode router does).
     pub fn core(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, rows: usize, sc: Scratch) !void {
         const g = try Geometry.of(l, rows, sc);
+        const gt = e.tilesFor(l, rows, .gate_up);
+        const dt = e.tilesFor(l, rows, .down);
+        // dependent launches when both projections take the kernels that wait (k8r8p/k8r16p): rot_in and the epilogue
+        // wait first and trigger; the grouped kernels read the plan, trellis pointers and first tile before their wait
+        const chain = gt.pdl and dt.pdl;
         var r: launch_.Args = .{};
         r.add(x);
         r.add(i32d(x_stride));
@@ -197,7 +210,7 @@ pub const Experts = struct {
         r.add(i32d(g.d));
         r.add(i32d(g.slots));
         r.add(i32d(l.experts));
-        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
+        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &r);
 
         var gu: launch_.Args = .{};
         gu.add(sc.xg);
@@ -221,8 +234,7 @@ pub const Experts = struct {
         gu.add(i32d(l.gu_stride));
         gu.add(@as(i32, 0));
         gu.add(@as(i32, -1));
-        const gt = e.tilesFor(l, rows, .gate_up);
-        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &gu);
+        try launch_.launch(gt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.w / (gt.nt * 16)), .z = @intCast(2 * g.g_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &gu);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -237,7 +249,7 @@ pub const Experts = struct {
         ep.add(i32d(l.experts));
         ep.add(l.limit);
         ep.add(l.act_mode);
-        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &ep);
+        try launch_.launch(e.gateup, .{ .grid = .{ .x = @intCast(g.p), .y = @intCast(g.w / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 }, .pdl = chain }, s, &ep);
 
         var dn: launch_.Args = .{};
         dn.add(sc.xd);
@@ -261,8 +273,7 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        const dt = e.tilesFor(l, rows, .down);
-        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        try launch_.launch(dt.f, .{ .grid = .{ .x = @intCast(g.maxu), .y = @intCast(g.d / (dt.nt * 16)), .z = @intCast(g.d_sk * g.mt) }, .block = .{ .x = 128, .y = 1, .z = 1 }, .pdl = chain }, s, &dn);
     }
 
     /// The grouped kernel for a projection of `rows` rows and its tiles a block. Only the block's column span, the width
@@ -270,10 +281,14 @@ pub const Experts = struct {
     /// gives the same bits. Chosen where each measured faster on sm_120 (decode2_bench/results_exl3_*.txt, cold weights):
     /// windows of up to 8 rows on a projection whose every expert is 3- or 4-bit take the one-width, 8-row form; wider
     /// windows to 32 rows 4 tiles where it led (down at 1 or 8+ rows, gate/up from 3); else, and other codebooks, 8 tiles.
-    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize } {
+    /// A projection the loader verified 4-bit takes the read-once loads at every window to 32 rows (exl3r's cold-weight
+    /// bench, sm_120, 400 W: gate/up -1, -5, -3, -10, -12% and down -2, -1, -7, -6, -14% at 1, 2, 4, 8, 16 rows).
+    /// `pdl`: the kernel waits before it reads the grid before's outputs, so it may launch as a dependent.
+    fn tilesFor(e: *const Experts, l: Layer, rows: usize, which: enum { gate_up, down }) struct { f: Function, nt: usize, pdl: bool = false } {
         const n = if (which == .gate_up) l.width else l.dims;
         if (l.codebook != .mcg or rows > 32 or n % 64 != 0) return .{ .f = e.grouped[@backingInt(l.codebook)], .nt = 8 };
         const k2 = if (which == .gate_up) l.uniform_k2_gu else l.uniform_k2_d;
+        if (e.shfl and k2 == 8) return .{ .f = (if (e.pdl) e.grouped_p else e.grouped_s)[@intFromBool(rows > 8)], .nt = 4, .pdl = e.pdl };
         if (rows <= 8 and (k2 == 6 or k2 == 8)) return .{ .f = e.grouped_r8[@intFromBool(k2 == 8)], .nt = 4 };
         const four = switch (which) {
             .gate_up => rows >= 3,
@@ -328,6 +343,11 @@ const Geometry = struct {
 
 fn i32d(v: usize) i32 {
     return @intCast(v);
+}
+
+fn envOn(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 test "the plan matches experts.py's for known shapes" {

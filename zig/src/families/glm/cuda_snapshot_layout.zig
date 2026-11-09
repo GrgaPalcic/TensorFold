@@ -6,30 +6,45 @@ const Config = @import("config.zig").Config;
 const cache = @import("cuda_dsa_block.zig");
 const sparse = @import("cuda_sparse.zig");
 
-/// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart.
-pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0 };
+/// `len` bytes from `live`, or on a paged sequence's pages `span` bytes a page, the pages `page` bytes apart; `lat`: a
+/// sharded sequence's latent rows (TF_GLM_KV_SHARD), whose pages are its latent table's (`Plan.lids`).
+pub const Part = struct { live: u64, len: usize, span: usize = 0, page: u64 = 0, lat: bool = false };
 pub const Plan = struct {
-    parts: [5 * (@import("config.zig").max_layers + 1) + 3]Part = undefined, // and one outside the arena (`outside`)
+    pub const max_parts = 5 * (@import("config.zig").max_layers + 1) + 3;
+    parts: [max_parts]Part = undefined, // and one outside the arena (`outside`)
     count: usize = 0,
     len: usize = 0,
     ids: []const u32 = &.{}, // a paged sequence's pages in row order
+    lids: []const u32 = &.{}, // sharded: its latent pages in row order (this rank's, cuda_kv_shard.latentIds)
     sizing: bool = false, // `size`: the rows counted, not read, so no page need be mapped
+    latent: bool = true, // the latent codes and scales are parts (sharded: only where this rank keeps them)
 
     pub fn init(st: *const State, c: *const Config, at: usize, head: ?usize) !Plan {
-        return make(st, c, at, head, false);
+        return make(st, c, at, head, false, true);
+    }
+
+    /// `init` with or without the DSA caches' latent codes and scales (`latent`: a sharded state off its home rank
+    /// holds every other part; cuda_snapshots).
+    pub fn initFor(st: *const State, c: *const Config, at: usize, head: ?usize, latent: bool) !Plan {
+        return make(st, c, at, head, false, latent);
     }
 
     /// A prefix's bytes at `at`, rows to `capacity` counted held or not (a paged sequence holds its request's alone).
     pub fn size(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize) !usize {
-        var whole = st.*;
-        whole.capacity = capacity;
-        return (try make(&whole, c, at, head, true)).len;
+        return sizeFor(st, c, capacity, at, head, true);
     }
 
-    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, sizing: bool) !Plan {
+    /// `size` with or without the latent codes and scales (`initFor`'s `latent`).
+    pub fn sizeFor(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize, latent: bool) !usize {
+        var whole = st.*;
+        whole.capacity = capacity;
+        return (try make(&whole, c, at, head, true, latent)).len;
+    }
+
+    fn make(st: *const State, c: *const Config, at: usize, head: ?usize, sizing: bool, latent: bool) !Plan {
         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;
-        var p: Plan = .{ .ids = st.pages, .sizing = sizing };
+        var p: Plan = .{ .ids = st.pages, .lids = st.lpages, .sizing = sizing, .latent = latent };
         // a paged sequence's caches are its pages: its fields up to them end at its first ring
         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
         if (first < st.arena.buf.ptr) return error.SnapshotShape;
@@ -52,9 +67,11 @@ pub const Plan = struct {
         const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
         const latent_row = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1);
-        try p.addCache(st, x, x.lc, latent, page_rows * latent_row);
-        // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
-        if (x.ls != 0) try p.addCache(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
+        if (p.latent) {
+            try p.addLatent(st, x, x.lc, latent, page_rows * latent_row);
+            // E4M3 scales: beside the codes in the arena, or on pages a part's 512 after its codes
+            if (x.ls != 0) try p.addLatent(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
+        }
         try p.add(st, st.rings[2 * j], ring);
         try p.add(st, st.rings[2 * j + 1], ring);
         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);
@@ -67,6 +84,16 @@ pub const Plan = struct {
         if ((!p.sizing and (len - 1) / span >= p.ids.len) or p.count == p.parts.len) return error.SnapshotShape;
         p.len = try std.math.add(usize, p.len, len);
         p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.ps };
+        p.count += 1;
+    }
+
+    /// A cache's latent codes or scales: `addCache`, and sharded (a latent table of its own) on its latent pages.
+    fn addLatent(p: *Plan, st: *const State, x: cache.Caches, live: u64, len: usize, span: usize) !void {
+        if (x.lpt == 0) return p.addCache(st, x, live, len, span);
+        if (len == 0) return;
+        if ((!p.sizing and (len - 1) / span >= p.lids.len) or p.count == p.parts.len) return error.SnapshotShape;
+        p.len = try std.math.add(usize, p.len, len);
+        p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.lps, .lat = true };
         p.count += 1;
     }
 
@@ -83,7 +110,8 @@ pub const Plan = struct {
     pub fn piece(p: *const Plan, part: Part, done: usize) Part {
         if (part.span == 0) return .{ .live = part.live + done, .len = part.len - done };
         const off = done % part.span;
-        return .{ .live = part.live + @as(u64, p.ids[done / part.span]) * part.page + off, .len = @min(part.span - off, part.len - done) };
+        const ids = if (part.lat) p.lids else p.ids;
+        return .{ .live = part.live + @as(u64, ids[done / part.span]) * part.page + off, .len = @min(part.span - off, part.len - done) };
     }
 
     fn add(p: *Plan, st: *const State, live: u64, len: usize) !void {

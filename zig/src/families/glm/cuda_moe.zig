@@ -7,6 +7,7 @@ const experts = @import("cuda_experts.zig");
 const exl3 = @import("cuda_exl3.zig");
 const prof_mod = @import("cuda_prof.zig");
 const projection = @import("cuda_proj.zig");
+const mm_mod = @import("cuda_mm.zig");
 
 /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
 pub const Layer = struct {
@@ -47,7 +48,8 @@ pub const Side = struct { s: cuda.Stream, fork: cuda.Event, join: cuda.Event };
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
 /// `side`: a decode window's shared expert on its own stream (null: on the block's stream, as before).
 /// `fuse`: a decode window's EXL3 experts take the grouped path (TF_GLM_MOE_FUSE=0: off), the same bits.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, side: ?Side = null, fuse: bool = false };
+/// `sum`: and that path's select sums the router's slices itself (TF_GLM_TOPK_SUM=0: off), the same bits.
+pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, side: ?Side = null, fuse: bool = false, sum: bool = false };
 
 /// Whether a decode window's EXL3 experts take the grouped path: the fused select writes their compact picks and
 /// grouping (tf_glm_topk_group: no copy, no group launch) and fill sums the routed slots with the shared expert's row
@@ -79,15 +81,29 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         const sd = k.side.?;
         try sd.fork.record(stream);
         try sd.s.wait(sd.fork);
-        try sharedRows(k, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
+        // the side stream keeps glm_mm's own dependent launches only: none of TF_GLM_PDL_CHAIN's there
+        var ks = k;
+        var side_mm: mm_mod.Kernels = undefined;
+        if (k.set.mm) |m| {
+            side_mm = m.*;
+            side_mm.chain = .{};
+            ks.set.mm = &side_mm;
+        }
+        try sharedRows(ks, sd.s, l, s, x, x_stride, 0, rows, prompt, !grouped(k, l, rows, prompt));
         try sd.join.record(sd.s);
     }
     var stamp = prof_mod.span(k.prof, stream, .router);
-    try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
     const g = grouped(k, l, rows, prompt);
+    // the grouped path's select sums the router's slices itself (tf_glm_topk_group_sum): no slice-sum launch
+    const summed = g and k.sum and glue.selectGroupSumShared(rows, l.count) <= glue.select_group_sum_shared;
+    if (summed) try glue.routerSlices(k.set, stream, x, x_stride, l.router, s.router_part, rows, d, l.count) else try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
     if (g) {
         const sc = (try exl3.decodeScratch(l.exl3.?, s.x3, rows, l.count, d, l.routed.width, l.routed.limit)) orelse return error.BadWindow;
-        try glue.selectGroup(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm, s.x3.picks, sc.ids, sc.count, sc.members);
+        const done = if (summed) try glue.selectGroupSum(k.set, stream, s.router_part, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm, s.x3.picks, sc.ids, sc.count, sc.members) else false;
+        if (!done) {
+            if (summed) try glue.sliceSum(k.set, stream, s.router_part, s.mlog, rows * l.count, glue.router_ks, true); // the slices not yet summed
+            try glue.selectGroup(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm, s.x3.picks, sc.ids, sc.count, sc.members);
+        }
     } else try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
     stamp.end();
     stamp = prof_mod.span(k.prof, stream, .experts);

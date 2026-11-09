@@ -201,8 +201,43 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        if (status.kv_parts) |k| try kvShard(w, k);
     }
 };
+
+/// A sharded KV pool's families (GLM's TF_GLM_KV_SHARD): `kv_shard_*` gauges and counters, then each part's pages.
+pub fn kvShard(w: *std.Io.Writer, k: api.Status.KvParts) !void {
+    const S = api.Status.KvParts;
+    inline for (@typeInfo(S).@"struct".field_names) |n| {
+        if (comptime std.mem.eql(u8, n, "part")) continue;
+        const kind = comptime for (S.gauges) |g| {
+            if (std.mem.eql(u8, g, n)) break "gauge";
+        } else "counter";
+        try gauge(w, "kv_shard_" ++ n ++ if (comptime std.mem.eql(u8, kind, "counter")) "_total" else "", kind, @field(S.help, n), @field(k, n));
+    }
+    const P = @TypeOf(k.part[0]);
+    inline for (@typeInfo(P).@"struct".field_names) |n| {
+        try family(w, "kv_shard_part_" ++ n, "gauge", @field(P.help, n));
+        for (k.part[0..@min(k.parts, k.part.len)], 0..) |x, i| try w.print("{s}kv_shard_part_{s}{{part=\"{d}\"}} {d}\n", .{ prefix, n, i, @field(x, n) });
+    }
+}
+
+test "a sharded pool's kv_shard families: gauges, counters with _total, a part label each" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var k: api.Status.KvParts = .{ .parts = 2, .part_pages = 900, .page_tokens = 512, .owner_layers = 33, .twins_made = 4 };
+    k.part[1] = .{ .free = 12, .live_pages = 400, .twin_pages = 8, .live = 3 };
+    try kvShard(&out.writer, k);
+    const text = out.written();
+    for ([_][]const u8{
+        "# TYPE tensorfold:kv_shard_parts gauge\ntensorfold:kv_shard_parts 2\n",
+        "tensorfold:kv_shard_part_pages 900\n",
+        "# TYPE tensorfold:kv_shard_owner_layers_total counter\ntensorfold:kv_shard_owner_layers_total 33\n",
+        "tensorfold:kv_shard_twins_made_total 4\n",
+        "tensorfold:kv_shard_part_live_pages{part=\"1\"} 400\n",
+        "tensorfold:kv_shard_part_free{part=\"0\"} 0\n",
+    }) |want| try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
+}
 
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });

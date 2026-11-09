@@ -25,6 +25,7 @@ const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
+const kv_attn = @import("cuda_kv_shard_attn.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -43,6 +44,7 @@ pub const Modules = struct {
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
     dsel: bool, // TF_GLM_DSEL (default on): a decode window's DSA select on many CTAs (cuda_sparse.decodeSelect)
+    dscore: ?index_mod.Kernels, // TF_GLM_DSCORES (default on): a decode window's index scores on glm_index_scores
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     copy_rows: cuda.Function,
@@ -50,6 +52,11 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    topk_sum: bool = true, // TF_GLM_TOPK_SUM=0: a decode window's grouped select reads the summed logits (the same bits)
+    shared_segs: bool = true, // TF_GLM_SHARED_SEGS=0: a shared window's segments take their own launches (the same bits)
+    hc_split: bool = true, // TF_GLM_HC_SPLIT=0: hc_pre's finish on the one-warp schedule (the same bits)
+    shared_writes: bool = true, // TF_GLM_SHARED_WRITES=0: a batched shared window's cache writes and KDA row copies per segment (the same bits)
+    hc_part: glue.PartTable = .{}, // TF_GLM_HC_PART: hc_pre's decode-dot blocks by rows (default 2:16); 0: tf_glm_hc_partial8's 16 a row (the same bits)
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -85,8 +92,21 @@ pub const Modules = struct {
         };
         m.dsel = sparse.dselRead() catch return error.BadDselSetting;
         if (!m.dsel) std.log.warn("TF_GLM_DSEL=0: a decode window's DSA select keeps one 1,024-thread CTA a row", .{});
+        m.dscore = null;
+        errdefer if (m.dscore) |*x| x.unload();
+        if (sparse.dscoresRead() catch return error.BadDscoresSetting) {
+            m.dscore = index_mod.Kernels.load(d, k.glm_index, .scores) catch |err| blk: {
+                std.log.warn("TF_GLM_DSCORES: glm_index is not loaded ({t}); decode windows keep tf_glm_scores", .{err});
+                break :blk null;
+            };
+        } else std.log.warn("TF_GLM_DSCORES=0: a decode window's index scores keep tf_glm_scores", .{});
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.topk_sum = if (std.c.getenv("TF_GLM_TOPK_SUM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.shared_segs = if (std.c.getenv("TF_GLM_SHARED_SEGS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.hc_split = if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.shared_writes = if (std.c.getenv("TF_GLM_SHARED_WRITES")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        m.hc_part = try glue.PartTable.parse(if (std.c.getenv("TF_GLM_HC_PART")) |v| std.mem.span(v) else null);
         return m;
     }
 
@@ -101,6 +121,7 @@ pub const Modules = struct {
 
     pub fn deinit(m: *Modules) void {
         if (m.index) |*x| x.unload();
+        if (m.dscore) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
@@ -214,9 +235,10 @@ pub const Forward = struct {
     side: ?moe.Side = null, // a decode window's MoE shared expert on a second stream (TF_GLM_SHARED_SIDE, default on)
     moe_fuse: bool = false, // a decode window's EXL3 MoE glue fused (TF_GLM_MOE_FUSE, default on in the engine)
     absorb_mma: bool = false, // TF_GLM_ABSORB_MMA=1: a prompt pass's absorb_q and expand_v on tensor cores
+    kv: ?*const kv_attn.Ctx = null, // TF_GLM_KV_SHARD: owner-computed attention's exchange room (null: unsharded)
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel };
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .absorb_mma = f.absorb_mma and f.ranks[0].b.prefill, .dsel = f.m.dsel, .pdl_hc = f.m.mm.chain.hc and !f.ranks[0].b.prefill, .pdl_moe = f.m.mm.chain.moe and !f.ranks[0].b.prefill, .hc_split = f.m.hc_split, .hc_part = f.m.hc_part, .dscore = if (f.m.dscore) |*x| x else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
@@ -284,7 +306,9 @@ pub const Forward = struct {
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                try dsa_block.body(.{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) }, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
+                // TF_GLM_KV_SHARD: one rank holds this sequence's latent rows, so it attends for both ranks' heads
+                if (kv_attn.wanted(f, r)) try kv_attn.single(f, r, a, di, rows, nch, k) else try dsa_block.body(k, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -322,7 +346,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side, .fuse = f.moe_fuse };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .side = if (f.ranks[0].b.prefill) null else f.side, .fuse = f.moe_fuse, .sum = f.m.topk_sum };
     }
 
     pub const Site = enum { mixer, ffn };

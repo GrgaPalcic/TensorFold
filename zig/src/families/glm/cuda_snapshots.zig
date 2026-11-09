@@ -8,6 +8,13 @@ const dflash = @import("dflash.zig");
 pub const pages = @import("cuda_snapshot_pages.zig");
 pub const layout = @import("cuda_snapshot_layout.zig");
 pub const host_tier = @import("cuda_snapshot_host.zig");
+const kv_keep = @import("cuda_kv_shard_keep.zig");
+const kvs = @import("cuda_kv_shard.zig");
+
+/// TF_GLM_KV_SHARD: which ranks hold the bound stream's latent rows (null: unsharded, or the switch off).
+fn holdOf(e: anytype) ?kvs.Hold {
+    return if (e.settings.kv_shard.on) e.cur.st.hold else null;
+}
 
 pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
 
@@ -123,9 +130,14 @@ pub fn keepAs(e: anytype, id: u64) !void {
     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
         return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    var plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);
+    const hold = holdOf(e);
+    const head = if (e.mtp) e.cur.st.mtp_len else null;
+    // TF_GLM_KV_SHARD: the latent rows on their owner's copy alone; every rank leases the whole state's bytes
+    const own = kv_keep.keepsLatent(hold, e.share.rank);
+    var plan = try layout.Plan.initFor(&e.cur.st, &e.c, e.cur.st.pos, head, own);
+    const latent_bytes = if (own) 0 else (try layout.Plan.initFor(&e.cur.st, &e.c, e.cur.st.pos, head, true)).len - plan.len;
     const ring = try drafterPart(e, &plan, e.cur.st.pos);
-    var lease = try pool.take(plan.len);
+    var lease = try pool.take(plan.len + latent_bytes);
     errdefer {
         cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
         pool.give(&lease);
@@ -135,26 +147,142 @@ pub fn keepAs(e: anytype, id: u64) !void {
     const t0 = now();
     try pool.move(e.stream, &lease, &plan, true);
     try e.stream.synchronize();
-    const s: types.Snap = .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .ring_from = ring };
+    const s: types.Snap = .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .ring_from = ring, .home = if (hold) |h| h.owner else null };
     note(e, "kept", &s, t0);
     e.snaps.putAssumeCapacityNoClobber(id, s);
 }
 
+/// A disk read's state: `at`'s pages leased under rank 0's id on each rank, refused by `restore` until `seal`.
+/// `home`: TF_GLM_KV_SHARD's home part, recorded on every rank as a keep records it (null: unsharded); every rank
+/// leases the whole size, as a keep does.
+pub fn blankAs(e: anytype, id: u64, at: usize, home: ?u8) !void {
+    if (e.snaps.contains(id)) return error.StateKept;
+    const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+    var lease = try pool.take(bytes(e, at));
+    errdefer pool.give(&lease);
+    const cur = try e.gpa.alloc(u1, e.cur.st.cur.len);
+    @memset(cur, 0);
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = 0, .pos = at, .mtp_len = 0, .cur = cur, .bases = .{ 0, 0 }, .home = home });
+}
+
+/// Whether an index ring of `rows` rows based at `base` holds every row up to `len`, as the image's ring bytes do.
+fn ringHolds(base: usize, len: usize, rows: usize) bool {
+    return base <= len and len - base <= rows;
+}
+
+/// A blank state made whole from its image's words (its bytes are in or follow): a restore takes it from here.
+pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !void {
+    const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+    if (s.len != 0) return error.StateKept;
+    if (s.cur.len > 64 or (s.cur.len < 64 and cur >> @intCast(s.cur.len) != 0)) return error.DiskWords;
+    const head = if (e.mtp) @min(e.capacity, s.pos + @import("cuda_state.zig").window_rows) else 0;
+    if (mtp_len > head) return error.DiskWords;
+    const rows = e.cur.st.ring_rows;
+    if (!ringHolds(bases[0], s.pos, rows) or !ringHolds(bases[1], mtp_len, rows)) return error.DiskWords;
+    // TF_GLM_KV_SHARD: off its home rank the copy packs every part but the latent rows, as keepAs leaves it
+    const own = if (s.home) |h| h == e.share.rank else true;
+    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own);
+    if (n == 0 or n > s.lease.count() * pages.page) return error.SnapshotSize;
+    for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
+    s.len = n;
+    s.mtp_len = mtp_len;
+    s.bases = bases;
+}
+
 pub fn restore(e: anytype, id: u64) !void {
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+    if (s.len == 0) return error.UnsealedState;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    var plan = try layout.Plan.init(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null);
+    const hold = holdOf(e);
+    const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
+    const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
+    var plan = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, own);
     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
     if (plan.len != s.len) return error.SnapshotSize;
     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
     const t0 = now();
-    try pool.move(e.stream, &s.lease, &plan, false);
+    try pool.moveParts(e.stream, &s.lease, &plan, false, !own or kv_keep.restoresLatent(home, hold, e.share.rank));
+    // TF_GLM_KV_SHARD: the latent rows to the rank that holds the new stream's rows but not the state's copy of them
+    switch (kv_keep.carry(home, hold, e.share.rank)) {
+        .none => {},
+        .send => try carrySend(e, s, &plan),
+        .recv => try carryRecv(e, s),
+    }
     try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur, s.bases);
     e.cur.in_head = 0;
     try e.stream.synchronize();
     // DFlash2 drafts on from the kept context rows, as a fresh pass would; without them from the mark (never tapped)
     if (e.drafter) |dr| if (s.ring_from) |from| try dr.resumeAt(e.slot, from, s.pos) else try dr.restart(e.slot, s.pos);
     note(e, "restored", s, t0);
+}
+
+/// The latent parts' lengths of `plan`, in order (a carry's pieces are cut from them alike on both ranks).
+fn latentLens(plan: *const layout.Plan, out: []usize) []usize {
+    var n: usize = 0;
+    for (plan.parts[0..plan.count]) |part| if (part.lat) {
+        out[n] = part.len;
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// The home rank's side of a carry: each latent part of its copy, a piece at a time, into the staging buffer and to
+/// the peer (`plan`: its copy's whole layout, the parts at their offsets in the lease).
+fn carrySend(e: anytype, s: *const types.Snap, plan: *const layout.Plan) !void {
+    const stage = (e.kv_stage orelse return error.KvShardRoom).ptr;
+    var offs: [layout.Plan.max_parts]usize = undefined;
+    var lens: [layout.Plan.max_parts]usize = undefined;
+    var off: usize = 0;
+    var n: usize = 0;
+    for (plan.parts[0..plan.count]) |part| {
+        if (part.lat) {
+            offs[n] = off;
+            lens[n] = part.len;
+            n += 1;
+        }
+        off += part.len;
+    }
+    const cut = try kv_keep.pieces(e.gpa, lens[0..n], kv_keep.piece_bytes);
+    defer e.gpa.free(cut);
+    const peer: c_int = @intCast(1 - e.share.rank);
+    var sent: u64 = 0;
+    for (cut) |x| {
+        try e.snap_pages.?.copyOut(e.stream, &s.lease, offs[x[0]] + x[1], stage, x[2]);
+        try e.lib.check(e.lib.api.ncclSend(stage, x[2], .u8, peer, e.comm, e.stream.handle), "ncclSend");
+        sent += x[2];
+    }
+    if (e.kv_ctx.counts) |c| {
+        c.carries += 1;
+        c.carry_bytes += sent;
+    }
+}
+
+/// The other rank's side: its live sequence's latent parts at the state's position (its own pages or a twin's), a
+/// piece at a time from the peer into the staging buffer and on into the rows.
+fn carryRecv(e: anytype, s: *const types.Snap) !void {
+    const stage = (e.kv_stage orelse return error.KvShardRoom).ptr;
+    const live = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, true);
+    var buf: [layout.Plan.max_parts]usize = undefined;
+    const lens = latentLens(&live, &buf);
+    var parts: [layout.Plan.max_parts]layout.Part = undefined;
+    var n: usize = 0;
+    for (live.parts[0..live.count]) |part| if (part.lat) {
+        parts[n] = part;
+        n += 1;
+    };
+    const cut = try kv_keep.pieces(e.gpa, lens, kv_keep.piece_bytes);
+    defer e.gpa.free(cut);
+    const peer: c_int = @intCast(1 - e.share.rank);
+    for (cut) |x| {
+        try e.lib.check(e.lib.api.ncclRecv(stage, x[2], .u8, peer, e.comm, e.stream.handle), "ncclRecv");
+        var done: usize = 0;
+        while (done < x[2]) {
+            const at = live.piece(parts[x[0]], x[1] + done);
+            const len = @min(at.len, x[2] - done);
+            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(at.live, stage + done, len, e.stream.handle), "cuMemcpyDtoDAsync");
+            done += len;
+        }
+    }
 }
 
 pub fn holds(e: anytype, id: u64) bool {

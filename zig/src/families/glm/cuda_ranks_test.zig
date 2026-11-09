@@ -349,3 +349,48 @@ test "the opt-in prompt numerics: off by default, read by name, in the fingerpri
 fn typo_free(_: [:0]const u8) ?[]const u8 {
     return null;
 }
+
+fn sharded(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD")) return "1";
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD_TWINS")) return "0";
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD_CHECK")) return "64";
+    return null;
+}
+
+fn shardTypo(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD")) return "1";
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD_CHECK")) return "often";
+    return null;
+}
+
+fn knobsOff(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD_CARRY")) return "maybe"; // off: the knobs are never read
+    return null;
+}
+
+test "TF_GLM_KV_SHARD: read with its knobs, refused by name on a typo, and in the fingerprint only when on" {
+    var problem: []const u8 = "";
+    const s = try Settings.read(&sharded, &problem);
+    try std.testing.expect(s.kv_shard.on and s.kv_shard.carry and !s.kv_shard.twins and s.kv_shard.check == 64);
+    try std.testing.expectError(error.BadSetting, Settings.read(&shardTypo, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "TF_GLM_KV_SHARD_CHECK") != null);
+    const off = try Settings.read(&knobsOff, &problem);
+    try std.testing.expect(!off.kv_shard.on);
+    const h0: [32]u8 = @splat(1);
+    const f0 = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, hashBytes("/c"));
+    try std.testing.expectEqual(@as(u32, 0), f0.kv_shard);
+    try std.testing.expectEqual(@as(u32, 0), f0.kv_shard_check);
+    try std.testing.expectEqual(@as(u32, 15), f0.layout);
+    var all = [_]Fingerprint{ f0, Fingerprint.of(2, 1, s, 8192, true, h0, h0, hashBytes("/c")) };
+    try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?); // on one rank only
+    all[0] = Fingerprint.of(2, 0, s, 8192, true, h0, h0, hashBytes("/c"));
+    try std.testing.expect(mismatch(&all) == null);
+    var other = s;
+    other.kv_shard.check = 1024;
+    all[1] = Fingerprint.of(2, 1, other, 8192, true, h0, h0, hashBytes("/c"));
+    try std.testing.expectEqual(Mismatch{ .field = .kv_shard_check, .rank = 1 }, mismatch(&all).?);
+    other = s;
+    other.kv_shard.twins = true;
+    all[1] = Fingerprint.of(2, 1, other, 8192, true, h0, h0, hashBytes("/c"));
+    try std.testing.expectEqual(Mismatch{ .field = .kv_shard, .rank = 1 }, mismatch(&all).?);
+}

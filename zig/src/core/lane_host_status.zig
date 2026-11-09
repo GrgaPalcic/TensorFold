@@ -29,6 +29,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .streams = n,
         .generation_tokens = h.live_generated,
         .prompt_cache = h.cache_status,
+        .kv_parts = h.kv_status,
     };
     fillTotals(h, out);
 }
@@ -76,10 +77,17 @@ pub fn noteDecoded(h: *LaneHost, n: usize) void {
     h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
 }
 
-/// Each started stream's context and generated tokens, for the next status read.
+/// Each started stream's context and generated tokens, and a sharded backend's KV parts (read here, on the engine
+/// thread, before the lock), for the next status read.
 pub fn noteLive(h: *LaneHost) void {
+    var parts: ?api.Status.KvParts = null;
+    if (h.kv_parts) |src| {
+        parts = .{};
+        src.read(src.ctx, &parts.?);
+    }
     h.mutex.lockUncancelable(h.io);
     defer h.mutex.unlock(h.io);
+    if (parts) |x| h.kv_status = x;
     h.live_tokens.clearRetainingCapacity();
     h.live_generated = 0;
     h.cache_status = if (h.cache) |s| .{ .states = s.entries.items.len, .bytes = s.held + s.spare() } else null;

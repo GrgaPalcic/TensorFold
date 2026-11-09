@@ -43,6 +43,8 @@ pub const Streamer = struct {
     current: []const u8 = "",
     value_schema: tool_params.Schema = .{ .value = .null, .root = .null },
     typed: bool = false,
+    untyped: bool = false, // the schema names no kinds (tool_params.decode's untyped rule): the value's first byte decides
+    pending_open: ?[]const u8 = null, // an untyped parameter's key, held until its value's first non-blank byte says JSON or text
     buffer: std.ArrayList(u8) = .empty,
     pos: usize = 0,
     state: enum { outside, call, buffered, function, value, closing, abort } = .outside,
@@ -241,10 +243,14 @@ pub const Streamer = struct {
                     if (opening(rest, "<parameter=")) |m| {
                         const key = reply_text.pyStrip(m.name);
                         s.value_schema = try tool_params.schemaOf(&s.schemas, s.current, key, s.a);
+                        s.untyped = try tool_params.schemaUntyped(s.a, s.value_schema);
                         s.typed = try typedSchema(s.a, s.value_schema);
                         s.buffer.clearRetainingCapacity();
                         const quoted = try json.quote(s.a, key, .{ .ascii = false });
-                        try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted, if (s.typed) ":" else ":\"" })));
+                        const prefix = try std.mem.concat(s.a, u8, &.{ if (s.args_open) "," else "{", quoted });
+                        // an untyped value streams as text unless it begins as a JSON object or array, which is then
+                        // buffered and decoded at its close (tool_params.decode): the key waits for the first byte
+                        if (s.untyped) s.pending_open = prefix else try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
                         s.args_open = true;
                         s.pos += m.len;
                         s.state = .value;
@@ -277,6 +283,22 @@ pub const Streamer = struct {
                     } else {
                         keep = reply_text.pyRstrip(piece); // its last newline may be the framing one
                         s.held = piece[keep.len..];
+                    }
+                    if (s.pending_open) |prefix| {
+                        const first: ?u8 = for (keep) |ch| {
+                            if (ch != ' ' and ch != '\n' and ch != '\t' and ch != '\r') break ch;
+                        } else null;
+                        if (first) |ch| {
+                            s.typed = ch == '{' or ch == '[';
+                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, if (s.typed) ":" else ":\"" })));
+                            s.pending_open = null;
+                        } else if (end != null) { // closed before any byte: an empty string
+                            try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, ":\"\"" })));
+                            s.pending_open = null;
+                            s.pos += tail.len;
+                            s.state = .function;
+                            continue;
+                        } else return;
                     }
                     if (s.typed) {
                         try s.buffer.appendSlice(s.a, keep);
@@ -314,6 +336,11 @@ pub const Streamer = struct {
         s.pos = text.len;
         s.held = "";
         s.buffer.clearRetainingCapacity();
+        if (s.pending_open) |prefix| { // an untyped value whose first byte never came through feed: text, whole
+            s.pending_open = null;
+            if (cut.len > 0) try out.append(s.a, try s.args(try std.mem.concat(s.a, u8, &.{ prefix, ":", try json.quote(s.a, cut, .{ .ascii = false }) })));
+            return;
+        }
         if (cut.len > 0) try out.append(s.a, try s.args(if (s.typed) cut else try s.esc(cut)));
     }
 };
@@ -378,6 +405,7 @@ fn nameLike(s: []const u8) bool {
 pub const TextFilter = struct {
     pending: std.ArrayList(u8) = .empty,
     hidden: ?[]const u8 = null,
+    hid: bool = false, // an envelope was hidden (TF_TOOL_CALL_GUARD logs it)
 
     pub fn feed(f: *TextFilter, a: Allocator, text: []const u8) Allocator.Error![]const u8 {
         try f.pending.appendSlice(a, text);
@@ -420,6 +448,7 @@ pub const TextFilter = struct {
             const name = rest[1..end];
             if (callTag(name)) {
                 f.hidden = try std.ascii.allocLowerString(a, name);
+                f.hid = true;
             } else try out.appendSlice(a, rest[0 .. end + 1]);
             try f.reset(a, rest[end + 1 ..]);
         }
@@ -446,10 +475,17 @@ fn callTag(name: []const u8) bool {
     return nameLike(name[0..colon]) and std.ascii.eqlIgnoreCase(name[colon + 1 ..], "tool_call");
 }
 
-/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose.
+/// ``parallel_tool_calls: false`` keeps one call and hides call markup from streamed prose; ``guard``
+/// (TF_TOOL_CALL_GUARD, tool_guard.zig) hides it from a reply to a request that offers no tools.
 pub const Policy = struct {
     single: bool = false,
+    guard: bool = false,
+    drop_rejected: bool = false, // TF_TOOL_CALL_GUARD with tools offered: well-formed calls to unoffered tools leave the reply (tool_parse.Options)
     filter: TextFilter = .{},
+
+    pub fn filtering(p: *const Policy) bool {
+        return p.single or p.guard;
+    }
 
     pub fn maxCalls(p: *const Policy) ?usize {
         return if (p.single) 1 else null;
@@ -457,15 +493,15 @@ pub const Policy = struct {
 
     /// Filters a str delta's text (dict deltas lose tool_calls and filter content), or passes it through.
     pub fn text(p: *Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        return if (p.single) p.filter.feed(a, s) else s;
+        return if (p.filtering()) p.filter.feed(a, s) else s;
     }
 
     pub fn flush(p: *Policy) []const u8 {
-        return if (p.single) p.filter.finish() else "";
+        return if (p.filtering()) p.filter.finish() else "";
     }
 
     pub fn content(p: *const Policy, a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-        if (!p.single) return s;
+        if (!p.filtering()) return s;
         var f: TextFilter = .{};
         const head = try f.feed(a, s);
         return std.mem.concat(a, u8, &.{ head, f.finish() });
@@ -494,6 +530,13 @@ pub const Policy = struct {
     }
 };
 
+/// ``s`` without its call envelopes (whole ones, and an unclosed one to the end).
+pub fn hideCalls(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var f: TextFilter = .{};
+    const head = try f.feed(a, s);
+    return std.mem.concat(a, u8, &.{ head, f.finish() });
+}
+
 /// The first whole envelope from ``from`` (``<((?:NAME:)?tool_call)>.*?</\1>``, any case).
 fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?struct { start: usize, end: usize } {
     var at = from;
@@ -509,4 +552,5 @@ fn wholeEnvelope(a: Allocator, s: []const u8, from: usize) Allocator.Error!?stru
 
 test {
     _ = @import("tool_stream_test.zig");
+    _ = @import("tool_guard.zig");
 }

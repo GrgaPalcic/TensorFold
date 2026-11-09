@@ -30,5 +30,10 @@ pub const Status = struct {
     /// Changes whenever the filling set does: a reader pairs its drain samples with one fill.
     fill_run: u64 = 0,
 
+    /// A backend whose KV pool is sharded over its ranks (GLM's TF_GLM_KV_SHARD): its parts' pages and counters,
+    /// /health's `kv_shard` and /metrics' `tensorfold:kv_shard_*`; null: none.
+    kv_parts: ?KvParts = null,
+
     pub const PromptCache = struct { states: u64 = 0, bytes: u64 = 0 };
+    pub const KvParts = @import("lanes").kv_parts.Stats;
 };

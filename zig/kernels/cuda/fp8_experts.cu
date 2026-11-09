@@ -146,7 +146,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
                              const int* __restrict__ items, const int* __restrict__ counts,
                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
-  constexpr int RW = PromptCfg<M, RT, CW>::RW;
   __shared__ uint4 sw[PSTAGES][CW][M * BLOCK4];
   __shared__ uint4 sx[PSTAGES][64][4];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;

@@ -400,3 +400,43 @@ test "fill_run changes when a cancelled fill is replaced by the queued request" 
     try std.testing.expect(status.fill_prompt_tokens == null and status.fill_tokens_left == null);
     try std.testing.expect(status.fill_run == 0);
 }
+
+test "a sharded backend's KV parts: read at noteLive on the engine thread, published to status; absent without one" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 2 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    const status = @import("lane_host_status.zig");
+    const Src = struct {
+        reads: std.atomic.Value(usize) = .init(0),
+        fn read(ctx: *anyopaque, out: *lanes.kv_parts.Stats) void {
+            const x: *@This() = @ptrCast(@alignCast(ctx));
+            out.* = .{ .parts = 2, .part_pages = 64, .twins_made = x.reads.fetchAdd(1, .monotonic) + 1 };
+        }
+    };
+    var src: Src = .{};
+    for ([_]bool{ false, true }) |sharded| {
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        if (sharded) host.kv_parts = .{ .ctx = &src, .read = Src.read };
+        try host.start();
+        defer host.stop();
+        status.noteLive(&host);
+        status.noteLive(&host);
+        var s: api.Status = .{};
+        host.engine().status(&s, &.{});
+        if (!sharded) {
+            try std.testing.expect(s.kv_parts == null);
+            try std.testing.expectEqual(@as(usize, 0), src.reads.load(.monotonic));
+            continue;
+        }
+        const before = src.reads.load(.monotonic);
+        host.engine().status(&s, &.{});
+        try std.testing.expectEqual(@as(u64, 2), s.kv_parts.?.parts);
+        try std.testing.expect(s.kv_parts.?.twins_made >= 2); // the latest of at least two reads
+        try std.testing.expect(src.reads.load(.monotonic) >= before); // status reads publish, never call the backend
+    }
+}

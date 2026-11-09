@@ -114,6 +114,12 @@ pub const Pool = struct {
     /// The plan's bytes into the lease's pages (`into`) or back out of them, on `stream`: device pages copy device to
     /// device, host pages over the link (pinned, so the copies stay asynchronous on the stream).
     pub fn move(p: *const Pool, stream: cuda.Stream, lease: *const Lease, plan: *const Plan, into: bool) !void {
+        return p.moveParts(stream, lease, plan, into, true);
+    }
+
+    /// `move`, its latent parts too or not (`latent` false: TF_GLM_KV_SHARD's home rank restoring a state into a
+    /// stream whose latent rows it does not hold; those parts keep their place in the lease, untouched).
+    pub fn moveParts(p: *const Pool, stream: cuda.Stream, lease: *const Lease, plan: *const Plan, into: bool, latent: bool) !void {
         if (plan.len > lease.count() * page) return error.SnapshotSize;
         const nd = lease.dev.ids.items.len;
         const dev_base: u64 = if (nd > 0) (p.arena orelse return error.NoSnapshotRoom).ptr else 0;
@@ -121,6 +127,10 @@ pub const Pool = struct {
         const d = if (p.arena) |a| a.d else (p.host orelse return error.NoSnapshotRoom).d;
         var off: usize = 0;
         for (plan.parts[0..plan.count]) |part| {
+            if (part.lat and !latent) {
+                off += part.len;
+                continue;
+            }
             var done: usize = 0;
             while (done < part.len) {
                 const at = off + done;
@@ -140,6 +150,28 @@ pub const Pool = struct {
                 done += n;
             }
             off += part.len;
+        }
+    }
+
+    /// `n` bytes of the lease from byte `at` into device memory at `dst` (a carry's staging), from device or host
+    /// pages, on `stream`.
+    pub fn copyOut(p: *const Pool, stream: cuda.Stream, lease: *const Lease, at: usize, dst: u64, n: usize) !void {
+        if (at + n > lease.count() * page) return error.SnapshotSize;
+        const nd = lease.dev.ids.items.len;
+        const d = if (p.arena) |a| a.d else (p.host orelse return error.NoSnapshotRoom).d;
+        var done: usize = 0;
+        while (done < n) {
+            const x = at + done;
+            const k = x / page;
+            const len = @min(n - done, page - x % page);
+            if (k < nd) {
+                const src = (p.arena orelse return error.NoSnapshotRoom).ptr + @as(u64, lease.dev.ids.items[k]) * page + x % page;
+                try d.check(d.api.cuMemcpyDtoDAsync_v2(dst + done, src, len, stream.handle), "cuMemcpyDtoDAsync");
+            } else {
+                const src = (p.host orelse return error.NoSnapshotRoom).bytes.ptr + @as(usize, lease.host.ids.items[k - nd]) * page + x % page;
+                try d.check(d.api.cuMemcpyHtoDAsync_v2(dst + done, src, len, stream.handle), "cuMemcpyHtoDAsync");
+            }
+            done += len;
         }
     }
 };

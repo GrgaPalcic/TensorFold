@@ -33,12 +33,15 @@ pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const prompt_pair = @import("cuda_prompt_pair.zig");
 pub const pages = @import("cuda_pages.zig");
+pub const kv_shard = @import("cuda_kv_shard.zig");
 pub const open_owner = @import("cuda_open_owner.zig");
 pub const images = @import("cuda_images.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
 pub const snapshots = @import("cuda_snapshots.zig");
+pub const disk_image = @import("cuda_disk_image.zig");
+pub const disk_ranks = @import("cuda_disk_ranks.zig");
 
 test {
     _ = @import("cuda_tile.zig");
@@ -48,11 +51,19 @@ test {
     _ = @import("cuda_load_owner.zig");
     _ = @import("cuda_images_interleave_test.zig");
     _ = @import("cuda_pages_test.zig");
+    _ = kv_shard;
+    _ = @import("cuda_kv_shard_pages_test.zig");
+    _ = @import("cuda_kv_shard_attn.zig");
+    _ = @import("cuda_kv_shard_attn_test.zig");
+    _ = @import("cuda_kv_shard_keep.zig");
+    _ = @import("cuda_kv_shard_keep_test.zig");
+    _ = @import("cuda_disk_shard_test.zig");
     _ = @import("cuda_ranks_test.zig");
     _ = @import("cuda_p2p.zig");
     _ = @import("cuda_ce.zig");
     _ = @import("cuda_lanes_test.zig");
     _ = prompt_pair;
+    _ = @import("cuda_disk_image.zig");
     _ = experts;
     _ = exl3;
     _ = vision;

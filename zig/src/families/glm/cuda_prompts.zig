@@ -41,6 +41,14 @@ pub fn pass(e: anytype, parts: []const engine.Prompt, firsts: []u32, comptime Fo
     var f: Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .absorb_mma = e.settings.numerics.absorb_mma, .taps = if (e.drafter) |dr| dr.taps(true) else null };
     // TF_GLM_CE_EXCHANGE=1: the batched pass's split exchanges by copy engines too (the same prompt buffers and pieces)
     if (comptime @hasField(Forward, "ce") and @hasField(@TypeOf(e.*), "ce")) f.ce = e.ce;
+    // TF_GLM_KV_SHARD: a prompt one rank holds alone attends owner-computed, unpieced (an engine without it: none)
+    if (comptime @hasField(@TypeOf(e.settings), "kv_shard") and @hasDecl(@TypeOf(e.*), "kvCtx")) if (e.settings.kv_shard.on) {
+        f.kv = e.kvCtx();
+        if (@import("cuda_kv_shard_attn.zig").wanted(&f, one[0])) {
+            f.pieces = null;
+            f.ce = null;
+        }
+    };
     try f.run(@ptrCast(ids[0..rows]));
     if (e.drafter) |dr| for (parts, segs[0..parts.len]) |p, g|
         try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);

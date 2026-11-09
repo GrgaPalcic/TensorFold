@@ -24,6 +24,11 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
+/// Warm turns (server/warm.zig): after a reply, the next turn's prompt is prefilled in the background, so a user
+/// message after an agent loop resumes past the loop's turns, which GLM's template renders without their reasoning
+/// once that message comes. The pass waits this long for other work before its first chunk, and steps aside at any
+/// chunk gate once real work waits (cuda_lanes.zig `cancelled`), keeping the states it reached.
+pub const warm_quiet: u64 = 150 * std.time.ns_per_ms;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 
@@ -65,14 +70,18 @@ pub const Loaded = struct {
     vision: ?*images_mod.Images = null, // rank 0's tower for the server's image offer
     layout: ?kv.Layout = null, // every stream's memory as one pool of KV pages (null: a window each, by TF_KV_PAGES)
     engine_paged: bool = false, // with a layout, the engine's own sequence takes pages too: the plan sets a window aside
+    kv_parts: ?lanes.kv_parts.Source = null, // TF_GLM_KV_SHARD: the pool's parts and counters for /health and /metrics
 };
 
 /// The pool behind every stream: the engine's own sequence and `streams` more on `pages` KV pages, on every rank.
 pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
     const own: *Owned = @ptrCast(@alignCast(p));
     const l = own.layout orelse return error.NoPages;
+    // TF_GLM_KV_SHARD: rank 0 refuses one stream (a part would stay idle) and a part too short, before the step
+    try @import("cuda_kv_shard.zig").refusePool(own.e.settings.kv_shard, streams + 1, @import("cuda_kv_shard.zig").Geometry.half(pages), own.e.capacity);
     try own.lanes.x.pool(streams + 1, pages, l.pageBytes());
     own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, pages, true);
+    if (own.e.kvCtx() != null) own.e.kv_ctx.counts = &own.e.pages.?.shard.?.parts.counts; // rank 0's counters
 }
 
 /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
@@ -129,18 +138,24 @@ const Owned = struct {
 
 const env = @import("sys").env;
 
-/// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
-fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
+/// The send/recv the prompt exchange will use, connected now, before the weights fill memory (connected on first use,
+/// ibv_reg_mr can fail): direct split (TF_GLM_PREFILL_REDUCE=split) reaches every peer; ring sends to the next rank
+/// and takes from the previous, as cuda_relay does; gather posts no point-to-point exchange at all, so on a fabric where
+/// some ranks reach only their neighbours (a ring of four without a switch) nothing is connected across it.
+fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group, set: ranks.Settings) !void {
+    if (!set.split) return; // gather: all-gathers only, which NCCL's rings connect at the first collective
     const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
     var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
     defer buf.free();
     var s = try cuda.Stream.init(d, false);
     defer s.deinit();
+    const next = (g.rank + 1) % g.world;
+    const prev = (g.rank + g.world - 1) % g.world;
     try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart");
     const posted: anyerror!void = post: {
         for (0..g.world) |peer| if (peer != g.rank) {
-            g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
-            g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == next) g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
+            if (!set.ring or peer == prev) g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
         };
         break :post {};
     };
@@ -217,7 +232,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
-    if (p.world > 1) try warmPeers(ctx.d, &own.group);
+    if (p.world > 1) try warmPeers(ctx.d, &own.group, set);
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
@@ -280,6 +295,7 @@ fn finishRank(a: OpenArgs) !Loaded {
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
+    if (p.rank == 0 and p.world > 1) own.e.link = &own.link; // its disk steps (cuda_disk_ranks) cross on the link
     own.e.snap_setup = .{ .ptr = own, .run = readySnapshots };
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
@@ -330,7 +346,15 @@ fn finishRank(a: OpenArgs) !Loaded {
         .vision = own.e.images,
         .layout = own.layout,
         .engine_paged = set.pages,
+        .kv_parts = if (set.kv_shard.on) .{ .ctx = own, .read = readKvParts } else null,
     };
+}
+
+/// /health and /metrics' KV parts (TF_GLM_KV_SHARD): rank 0's pool, on its engine thread (none before the attach).
+fn readKvParts(ctx: *anyopaque, out: *lanes.kv_parts.Stats) void {
+    const own: *Owned = @ptrCast(@alignCast(ctx));
+    const p = own.e.pages orelse return;
+    pages_mod.Pages.readStats(p, out);
 }
 
 // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).
@@ -448,7 +472,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, MIXED_PRECISION and EXL3 mcg checkpoints (the log names what config.json has)",
         error.UnreadableExl3 => "an EXL3 routed expert is not an mcg trellis of 1 to 8 bits with its marker and fp16 scales (the log names the tensor)",
         error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
-        else => null,
+        else => @import("cuda_kv_shard.zig").why(err),
     };
 }
 

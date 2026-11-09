@@ -21,6 +21,20 @@ fn set(e: anytype) glue.Set {
 fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
     switch (w) {
         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide, false),
+        .q4g32 => |q| {
+            if (wide) return error.WideFromFourBits;
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(@as(i32, @intCast(q.k)));
+            a.add(@as(i32, @intCast(q.k)));
+            a.add(dr.gs);
+            try go(dr.k.gsum32, .{ .x = @intCast(m) }, 128, e, &a);
+            var r0: usize = 0;
+            while (r0 < m) : (r0 += 16) {
+                const rows = @min(16, m - r0);
+                try q4.matmulG32(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 32) * 4, q, out + r0 * q.n * 2, rows);
+            }
+        },
         .q4 => |q| {
             if (wide) return error.WideFromFourBits;
             var a: cuda.Args = .{};

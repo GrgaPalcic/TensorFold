@@ -20,7 +20,26 @@ const Error = tool_dsml.Error;
 const Call = tool_dsml.Call;
 const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
 
-pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0 };
+pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0, rejections: []const Rejection = &.{} };
+
+/// Why a whole envelope did not become a call: it names a tool the request did not offer (it parses as a call), or it
+/// is not a call in any spelling the parser reads (a missing key, a stray tag, an empty name, broken JSON).
+pub const Reason = enum {
+    unknown_tool_name,
+    malformed,
+
+    pub fn label(r: Reason) []const u8 {
+        return @tagName(r);
+    }
+};
+
+/// One rejected envelope: why, the tool name it carries (empty when none can be read), its text, and whether
+/// ``Options.hide_unoffered`` left it out of the content.
+pub const Rejection = struct { reason: Reason, name: []const u8, envelope: []const u8, hidden: bool = false };
+
+/// ``hide_unoffered`` (TF_TOOL_CALL_GUARD with tools offered): a well-formed call to a tool the request did not offer
+/// leaves the content; a malformed envelope always stays, so the client and the log can see what the model wrote.
+pub const Options = struct { hide_unoffered: bool = false };
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -99,6 +118,11 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
 
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
+    return parseWith(a, text, tools, max_calls, .{});
+}
+
+/// ``parse`` with its ``Options``.
+pub fn parseWith(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, opts: Options) Allocator.Error!Parsed {
     if (tools.len == 0) return .{ .content = text, .calls = null };
     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (tools) |tool| {
@@ -113,6 +137,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     var residue: std.ArrayList(u8) = .empty;
     var cursor: usize = 0;
     var rejected: usize = 0;
+    var rejections: std.ArrayList(Rejection) = .empty;
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
@@ -121,38 +146,121 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
-        const parsed: ?[]Call = blk: {
-            if (tool_dsml.whole(env.payload)) |b| {
-                break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Invalid => null,
-                };
+        var start = env.start;
+        var parsed = try offeredCalls(a, env.payload, &schemas, &known, max_calls != null);
+        // Prose that quotes the opener ("Qwen's <tool_call>{}") ahead of a call begins the envelope, so the call does
+        // not parse as its payload: the call is the last opener inside it (or one before that, when a value quotes
+        // the opener too), and the quoting prose stays content.
+        // An opener inside an unclosed value of the text before it (a JSON object still open, an <arg_value> or
+        // <parameter=> not yet closed) is a quoted call inside a call the first closer cut: never the call.
+        if (parsed == null and std.ascii.startsWithIgnoreCase(text[env.start..], "<tool_call>")) {
+            const closer = env.end - "</tool_call>".len;
+            var inner = lastOpener(text, env.start + "<tool_call>".len, closer);
+            var tries: usize = 0;
+            while (inner) |s| : (inner = lastOpener(text, env.start + "<tool_call>".len, s)) {
+                tries += 1;
+                if (tries > inner_tries) break;
+                if (insideValue(text[env.start + "<tool_call>".len .. s])) continue;
+                parsed = try offeredCalls(a, strip(text[s + "<tool_call>".len .. closer]), &schemas, &known, max_calls != null);
+                if (parsed != null) {
+                    start = s;
+                    break;
+                }
             }
-            const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Invalid => break :blk null,
-            };
-            if (one) |c| {
-                const list = try a.alloc(Call, 1);
-                list[0] = c;
-                break :blk list;
-            }
-            break :blk null;
-        };
-        const good = if (parsed) |list| list.len > 0 and for (list) |c| {
-            if ((try callName(a, c, &known)) == null) break false;
-        } else true else false;
-        if (!good) {
-            try residue.appendSlice(a, text[env.start..env.end]);
+        }
+        const list = parsed orelse {
+            const why = try rejection(a, env.payload, &schemas, &known, max_calls != null);
+            const hide = opts.hide_unoffered and why.reason == .unknown_tool_name;
+            if (!hide) try residue.appendSlice(a, text[env.start..env.end]);
+            try rejections.append(a, .{ .reason = why.reason, .name = why.name, .envelope = text[env.start..env.end], .hidden = hide });
             rejected += 1;
             continue;
-        }
-        for (parsed.?) |c| {
+        };
+        try residue.appendSlice(a, text[env.start..start]);
+        for (list) |c| {
             if (max_calls == null or calls.items.len < max_calls.?) try calls.append(a, try openaiCall(a, (try callName(a, c, &known)).?, c.arguments));
         }
     }
     try residue.appendSlice(a, text[cursor..]);
-    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected };
+    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected, .rejections = rejections.items };
+}
+
+/// Why ``offeredCalls`` refused ``block``: the calls it holds when it parses, read without the offered set, name a tool
+/// the request did not offer; otherwise it is malformed, under the name its GLM spelling begins with when there is one.
+fn rejection(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!struct { reason: Reason, name: []const u8 } {
+    if (try anyCalls(a, block, schemas, complete)) |list| {
+        for (list) |c| if ((try callName(a, c, known)) == null) return .{ .reason = .unknown_tool_name, .name = strip(c.name) };
+    }
+    return .{ .reason = .malformed, .name = leadName(block) };
+}
+
+/// The one-line name a GLM payload starts with (``NAME<arg_key>...``), or "" when it starts with none.
+pub fn leadName(block: []const u8) []const u8 {
+    const cut = std.mem.indexOfAny(u8, block, "<{[\n\r") orelse block.len;
+    const name = strip(block[0..cut]);
+    return if (name.len <= 64) name else "";
+}
+
+/// Openers inside a rejected envelope tried, from the last: a bound keeps a reply of quoted openers linear.
+const inner_tries = 4;
+
+/// Whether an opener after `before` would lie inside a value still open in `before`: a JSON object with more `{`
+/// than `}`, an <arg_value> without its </arg_value>, or a <parameter=...> without its </parameter>.
+fn insideValue(before: []const u8) bool {
+    var depth: isize = 0;
+    for (before) |ch| {
+        if (ch == '{') depth += 1 else if (ch == '}') depth -= 1;
+    }
+    if (depth > 0) return true;
+    const open_value = std.mem.lastIndexOf(u8, before, "<arg_value>");
+    if (open_value) |o| if (std.mem.lastIndexOf(u8, before, "</arg_value>")) |c| {
+        if (c < o) return true;
+    } else return true;
+    const open_param = std.mem.lastIndexOf(u8, before, "<parameter=");
+    if (open_param) |o| if (std.mem.lastIndexOf(u8, before, "</parameter>")) |c| {
+        if (c < o) return true;
+    } else return true;
+    return false;
+}
+
+/// The last ``<tool_call>`` that starts at or after ``from`` and ends by ``before``.
+fn lastOpener(text: []const u8, from: usize, before: usize) ?usize {
+    var last: ?usize = null;
+    var pos = from;
+    while (findCI(text[0..before], "<tool_call>", pos)) |s| : (pos = s + 1) last = s;
+    return last;
+}
+
+/// A payload's calls when it parses whole and each names an offered tool; null when it is not such a call.
+fn offeredCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, known: *const std.StringArrayHashMapUnmanaged([]const u8), complete: bool) Allocator.Error!?[]Call {
+    const list = try anyCalls(a, block, schemas, complete) orelse return null;
+    for (list) |c| if ((try callName(a, c, known)) == null) return null;
+    return list;
+}
+
+/// A payload's calls when it parses whole, whatever tools they name; null when it is not a call.
+fn anyCalls(a: Allocator, block: []const u8, schemas: *const tool_params.Schemas, complete: bool) Allocator.Error!?[]Call {
+    const parsed: ?[]Call = blk: {
+        if (tool_dsml.whole(block)) |b| {
+            break :blk tool_dsml.calls(a, b.inner, b.spelling) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => null,
+            };
+        }
+        const one = payload(a, block, schemas, complete) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => break :blk null,
+        };
+        if (one) |c| {
+            const list = try a.alloc(Call, 1);
+            list[0] = c;
+            break :blk list;
+        }
+        break :blk null;
+    };
+    const list = parsed orelse return null;
+    if (list.len == 0) return null;
+    return list;
 }
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``

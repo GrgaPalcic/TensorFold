@@ -54,6 +54,7 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
     }
     try o.put(a, "memory", .{ .object = memory });
     try o.put(a, "live", try live.snapshot(a, status));
+    if (status.kv_parts) |k| try o.put(a, "kv_shard", try kvShardValue(a, k));
     const ident = srv.config.identity;
     for ([_][2][]const u8{
         .{ "version", ident.version },
@@ -61,6 +62,23 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         .{ "device", ident.device },
     }) |field|
         if (field[1].len > 0) try o.put(a, field[0], .{ .string = field[1] });
+    return .{ .object = o };
+}
+
+/// /health's `kv_shard` (GLM's TF_GLM_KV_SHARD): every gauge and counter by name, and `per_part` (each part's pages).
+pub fn kvShardValue(a: Allocator, k: api.Status.KvParts) !Value {
+    const o = try json.newObject(a);
+    inline for (@typeInfo(api.Status.KvParts).@"struct".field_names) |n| {
+        if (comptime std.mem.eql(u8, n, "part")) continue;
+        try o.put(a, n, try json.intValue(a, @field(k, n)));
+    }
+    const parts = try a.alloc(Value, @min(k.parts, k.part.len));
+    for (parts, k.part[0..parts.len]) |*slot, x| {
+        const p = try json.newObject(a);
+        inline for (@typeInfo(@TypeOf(x)).@"struct".field_names) |n| try p.put(a, n, try json.intValue(a, @field(x, n)));
+        slot.* = .{ .object = p };
+    }
+    try o.put(a, "per_part", .{ .array = parts });
     return .{ .object = o };
 }
 
@@ -329,4 +347,20 @@ test "stats snapshot's memory carries a configured limit and omits none" {
     const without = try statsSnapshot(arena.allocator(), .{}, .{ .active = 5, .peak = 9 }, 0, 0, 0, 0, 0);
     // no limit configured: the key stays out
     try std.testing.expect(without.object.get("memory").?.object.get("limit") == null);
+}
+
+test "health's kv_shard: every gauge and counter by name and each part's pages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var k: api.Status.KvParts = .{ .parts = 2, .part_pages = 900, .page_tokens = 512, .owner_bytes = 1 << 20, .carries = 3 };
+    k.part[0] = .{ .free = 10, .live_pages = 800, .twin_pages = 90, .live = 4 };
+    const v = try kvShardValue(arena.allocator(), k);
+    try std.testing.expectEqual(@as(i64, 900), v.object.get("part_pages").?.int64().?);
+    try std.testing.expectEqual(@as(i64, 3), v.object.get("carries").?.int64().?);
+    try std.testing.expectEqual(@as(i64, 1 << 20), v.object.get("owner_bytes").?.int64().?);
+    const parts = v.object.get("per_part").?.array;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqual(@as(i64, 800), parts[0].object.get("live_pages").?.int64().?);
+    try std.testing.expectEqual(@as(i64, 0), parts[1].object.get("live").?.int64().?);
+    try std.testing.expect(v.object.get("part") == null);
 }

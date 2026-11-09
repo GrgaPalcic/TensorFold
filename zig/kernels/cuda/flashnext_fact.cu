@@ -171,6 +171,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) fact_kernel(
                 slice_end(it * GPS + gi);
                 continue;
             }
+            if constexpr (!BLOCKED) {                  // the tile's k16 MMAs, then its scales and rows (BLOCKED took its own path above)
 #pragma unroll
             for (int kt = 0; kt < GS / 16; ++kt) {
                 uint32_t a[T::MT][4];
@@ -214,6 +215,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) fact_kernel(
             } else {
                 epilogue(b);
                 slice_end(gl);
+            }
             }
         }
     }

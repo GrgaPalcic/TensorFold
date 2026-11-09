@@ -56,6 +56,9 @@ pub const Budget = struct {
     window: u64 = 0,
     /// The engine's own rows are pages too: a window of them first, then the cache after the windows the room holds.
     engine_paged: bool = false,
+    /// The cache is set aside before the room is counted in windows (TF_PROMPT_CACHE_FIRST=1): the other streams
+    /// share the pages left, at least the engine's own window, instead of the cache taking what whole windows leave.
+    cache_first: bool = false,
 };
 
 /// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams; `skipped`: cache bytes
@@ -104,7 +107,8 @@ fn held(l: Layout, b: Budget, fit: u64) u64 {
 fn windows(l: Layout, b: Budget) u64 {
     if (!b.engine_paged or b.window == 0) return 1;
     const own = ownPages(l, b);
-    return @min(b.lanes, 1 + (b.room - own) / (own + l.fixed_bytes));
+    const room = if (b.cache_first) b.room -| b.cache else b.room;
+    return @min(b.lanes, 1 + (room -| own) / (own + l.fixed_bytes));
 }
 
 /// The bytes of the engine's own window as pages, set aside first when its rows are pages (0 when it has a window).
@@ -383,6 +387,30 @@ pub const Pool = struct {
         l.* = .{};
     }
 };
+
+test "kv plan: cache_first sets the cache aside before the windows, the pool keeping the engine's own window" {
+    // GLM on a 2-Spark pair at a 1M window: 2,049 pages a window, 378 MiB fixed a stream, 19 GiB of room.
+    const l: Layout = .{ .fixed_bytes = 378 << 20, .token_bytes = 6380, .page_tokens = 512, .snap_bytes = 0 };
+    const b: Budget = .{ .room = 19 << 30, .engine = 0, .lanes = 8, .cache = 16 << 30, .window = 1 << 20, .engine_paged = true };
+    const window_pages = l.pages(1 << 20);
+    const late = try plan(l, b);
+    var first_b = b;
+    first_b.cache_first = true;
+    const first = try plan(l, first_b);
+    try std.testing.expectEqual(@as(u32, 8), late.lanes);
+    try std.testing.expectEqual(@as(u32, 8), first.lanes);
+    try std.testing.expect(late.pages >= 2 * window_pages); // two whole windows first, the cache what they leave
+    try std.testing.expect(first.pages >= window_pages and first.pages < 2 * window_pages);
+    try std.testing.expect(first.copied > late.copied + (5 << 30));
+    try std.testing.expect(first.copied <= b.cache);
+    try std.testing.expect(holds(l, .{ .room = 19 << 30, .engine = 0, .lanes = 8, .cache = 8 << 30, .window = 1 << 20, .engine_paged = true, .cache_first = true }));
+    // A cache under what one window leaves changes nothing.
+    var small = b;
+    small.cache = 1 << 30;
+    var small_first = small;
+    small_first.cache_first = true;
+    try std.testing.expectEqual(try plan(l, small), try plan(l, small_first));
+}
 
 test {
     _ = @import("kv_pool_test.zig");
