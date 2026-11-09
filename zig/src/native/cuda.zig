@@ -388,7 +388,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             .min_state = if (comptime @hasDecl(F, "snap_min_bytes")) F.snap_min_bytes(loaded.target) else 0,
         };
         if (share and l.snap_bytes > 0 and !host_cache) slots = try @import("core").kv_prompts.sharing(); // GLM: a slot a state
-        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts, if (share) 1_000_000 else 0, slots) orelse return null;
+        // TF_KV_SHARE's cache as pool pages: all of it unless the family keeps its states' rest elsewhere (GLM, ppm 0)
+        const kept_ppm: u32 = if (!share) 0 else if (comptime @hasDecl(F, "share_kept_ppm")) F.share_kept_ppm else 1_000_000;
+        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts, kept_ppm, slots) orelse return null;
         break :blk paged.?.lanes;
     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -431,7 +433,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         cache_text, if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    const kept_budget: u64 = if (comptime @hasDecl(F, "snap_save")) try kv_pages.storeBudget(F, loaded.target, kept) else 0; // card and host tier
+    const kept_budget: u64 = try kv_pages.keptBudget(F, loaded.target, kept, share); // card and host tier; under a share what the shared snapshots hold
     if (cache_capacity) |*c| c.budget_bytes = kept_budget; // the startup warning and metrics read what the store keeps in
     if (@hasDecl(F, "snap_save") and kept_budget > 0 and !share) {
         const pc = api.prompt_cache;

@@ -181,6 +181,15 @@ pub fn storeBudget(comptime F: type, target: anytype, k: Kept) !u64 {
     return if (comptime @hasDecl(F, "snap_slots")) k.copied else @import("cuda_snaps.zig").cacheBudget(F, target, k.copied);
 }
 
+/// The startup warning's and metrics' budget bytes. Under a share the family's snapshots are made already
+/// (`share_states`), so what they hold is the answer and the flat store's budget path (`snap_ready` a second
+/// time, error.SnapshotCacheMade) stays off; otherwise the store's budget, `snap_ready` and all.
+pub fn keptBudget(comptime F: type, target: anytype, k: Kept, share: bool) !u64 {
+    if (comptime !@hasDecl(F, "snap_save")) return 0;
+    if (!share) return storeBudget(F, target, k);
+    return k.snaps * k.snap_bytes + (if (comptime @hasDecl(F, "snap_host_tier")) F.snap_host_tier(target) else 0);
+}
+
 /// The store keeps a state a slot, the slots made now in one device buffer; a family without them, its own budget.
 pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: Kept) !void {
     if (comptime !@hasDecl(F, "snap_slots")) return;
@@ -519,4 +528,36 @@ test "kv merge: a refused --parallel names what would fit: the streams the room 
     _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve }, 0, null);
     try std.testing.expect(std.mem.endsWith(u8, problem, "(now 4.00)"));
     try std.testing.expectEqual(@as(?u32, 1), (try fitOf(problem)).parallel);
+}
+
+test "cache capacity: under a share the made snapshots are the budget, and snap_ready runs once" {
+    const Share = struct {
+        var makes: usize = 0;
+        fn make() !void {
+            makes += 1;
+            if (makes > 1) return error.SnapshotCacheMade; // a second make refuses, as GLM's prepareTiers does
+        }
+        pub const share_kept_ppm: u32 = 0;
+        pub const snap_save = 1;
+        pub fn snap_ready(_: *u8, _: u64) !u64 {
+            try make();
+            return 0; // the store accounts both held and spare pages through its vtable, as GLM's does
+        }
+        pub fn snap_host_tier(_: *u8) u64 {
+            return 2 << 30; // TF_GLM_HOST_CACHE_GIB's pages over the device ones
+        }
+    };
+    var target: u8 = 0;
+    const slot: u64 = 180 << 20;
+    const k: Kept = .{ .snaps = 3, .copied = 0, .snap_bytes = slot };
+    try Share.make(); // the share's readySnapshots (share_states) makes the slots' pages
+    try std.testing.expectEqual(3 * slot + (2 << 30), try keptBudget(Share, &target, k, true)); // what the shared snapshots hold: snap_ready not asked again
+    try std.testing.expectEqual(@as(usize, 1), Share.makes);
+    try std.testing.expectEqual((2 << 30), try keptBudget(Share, &target, .{ .snaps = 0, .copied = 0, .snap_bytes = 0 }, true)); // no slots: the host tier alone
+    const copies: Kept = .{ .snaps = 3, .copied = 2 * slot, .snap_bytes = slot };
+    try std.testing.expectError(error.SnapshotCacheMade, keptBudget(Share, &target, copies, false)); // the flat store's budget path: the GPU's crash
+    Share.makes = 0; // a start without the share: the store's budget makes the snapshots itself, once
+    try std.testing.expectEqual(2 * slot + (2 << 30), try keptBudget(Share, &target, copies, false));
+    try std.testing.expectEqual(@as(usize, 1), Share.makes);
+    try std.testing.expectError(error.SnapshotCacheMade, keptBudget(Share, &target, copies, false)); // and a second make refuses, as before
 }

@@ -508,3 +508,17 @@ test "TF_KV_SHARE's slots with the cache first (TF_PROMPT_CACHE_FIRST): the slot
     try expectEqual(@as(usize, 0), s.snaps);
     try expectEqual(@as(u64, 0), s.copied);
 }
+
+test "TF_KV_SHARE's slots (share_kept_ppm 0): the slots and the pool's pages never overcommit the room, cache first or not" {
+    const g: u64 = 1 << 30;
+    const glm: kv.Layout = .{ .fixed_bytes = 180 * mib, .token_bytes = 13_056, .page_tokens = 512, .snap_bytes = 180 * mib };
+    const page = glm.pageBytes();
+    for ([_]bool{ false, true }) |first| { // TF_PROMPT_CACHE_FIRST unset and =1: the plan holds either way
+        const b: kv.Budget = .{ .room = 80 * g, .engine = 0, .lanes = 8, .cache = g, .snaps = 32, .window = 262_144 + 8, .engine_paged = true, .kept_ppm = 0, .slots_only = true, .cache_first = first };
+        const p = try kv.plan(glm, b);
+        try expect(p.snaps > 0 and p.snaps < 32); // the GiB's cache holds fewer than the named 32: clamped, not overcommitted
+        try expect(p.copied == 0 and p.kept == b.cache - p.snaps * glm.snap_bytes); // the cache's rest is the pool's pages
+        try expectEqual(b.cache, p.snaps * glm.snap_bytes + p.kept); // the whole cache is placed, the slots before the pages
+        try expect(p.snaps * glm.snap_bytes + (p.lanes - 1) * glm.fixed_bytes + p.pages * page <= b.room); // all of it takes the room
+    }
+}
