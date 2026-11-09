@@ -48,7 +48,7 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
     for ([_]u32{ 2048, 34816, 266240 }) |at| {
         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
     }
-    const short = glm.native.snap_bytes(&e, 2048);
+    const short = glm.native.snap_bytes(&e, 4096); // the first chunk's mark: 4,096 rows here (recipe 0094)
     try t.expectEqual(short, glm.native.snap_min_bytes(&e));
     const longer = glm.native.snap_bytes(&e, 34816);
     try t.expect(short < 4 * @as(u64, 1 << 30));
@@ -115,23 +115,24 @@ test "GLM snapshots: actual store charges held plus spare pages, evicts and prot
     var f: Fixture = undefined;
     try f.init(&d, 0, 1, false);
     defer f.deinit();
-    const budget = 2 * f.e.stateBytes(2048) + 31;
+    const grid = glm.native.snap_grid; // keeps and lookups sit on the family's chunk grid (4,096 rows here)
+    const budget = 2 * f.e.stateBytes(grid) + 31;
     _ = try glm.native.snap_ready(&f.e, budget);
     const family: pc.Snapshots = .{ .ptr = &f.e, .vtable = &adapter.Snaps(glm.native, null).vtable };
     var store = pc.Store.init(t.allocator, family, adapter.cacheRules(glm.native), budget);
     defer store.deinit();
     const allocs = rec.allocs;
-    var prompt: [2049]u32 = @splat(1);
+    var prompt: [grid + 1]u32 = @splat(1);
     for (0..9) |i| {
         prompt[0] = @intCast(i);
-        try f.mark(2048, 2048, @intCast(i));
-        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
+        try f.mark(grid, grid, @intCast(i));
+        try t.expect(store.keep(&prompt, grid, null, &.{}, &.{}));
         try t.expect(store.held + glm.native.snap_spare(&f.e) <= budget);
         try t.expectEqual(allocs, rec.allocs);
         try t.expect(store.entries.items.len <= 2);
     }
     try t.expect(store.counts.evicted > 0);
-    const found = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
+    const found = try store.lookup(t.allocator, &prompt, grid, &.{}, &.{}, &.{});
     defer t.allocator.free(found.marks);
     const borrowed = found.entry orelse return error.ExpectedHit;
     defer store.release(borrowed);
@@ -139,8 +140,8 @@ test "GLM snapshots: actual store charges held plus spare pages, evicts and prot
     const id = kept.id;
     for (10..15) |i| {
         prompt[0] = @intCast(i);
-        try f.mark(2048, 2048, @intCast(i));
-        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
+        try f.mark(grid, grid, @intCast(i));
+        try t.expect(store.keep(&prompt, grid, null, &.{}, &.{}));
         try t.expect(f.e.holds(id));
         try t.expect(store.held + glm.native.snap_spare(&f.e) <= budget);
     }
@@ -448,8 +449,9 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
     e.capacity = seq.st.capacity;
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;
-    // 203,423,744 at 8-row windows; W16's 16-row windows double the KDA layers' window saves a state carries (+18 MiB)
-    try t.expectEqual(@as(u64, if (glm.forward.window_rows == 16) 222298112 else 203423744), minimum);
+    // 203,423,744 at 8-row windows on the 2,048 grid; W16's 16-row windows double the KDA layers' window saves
+    // (+18 MiB) and the 4,096-row chunk grid (recipe 0094) adds the extra 2,048 rows' caches (+36 MiB)
+    try t.expectEqual(@as(u64, if (glm.forward.window_rows == 16) 260046848 else 203423744), minimum);
     try t.expect(minimum <= budget);
     try t.expect(glm.native.snap_bytes(&e, 34816) > budget);
 }
@@ -708,7 +710,7 @@ test "GLM snapshots: the actual store's budget spans the host tier, keeps past t
     var f: Fixture = undefined;
     try f.init(&d, 0, 1, false);
     defer f.deinit();
-    const one = f.e.stateBytes(2048);
+    const one = f.e.stateBytes(glm.native.snap_grid);
     const Ready = struct {
         var host: u64 = 0;
         fn run(p: *anyopaque, budget: u64) anyerror!void {
@@ -723,11 +725,11 @@ test "GLM snapshots: the actual store's budget spans the host tier, keeps past t
     const family: pc.Snapshots = .{ .ptr = &f.e, .vtable = &adapter.Snaps(glm.native, null).vtable };
     var store = pc.Store.init(t.allocator, family, adapter.cacheRules(glm.native), budget);
     defer store.deinit();
-    var prompt: [2049]u32 = @splat(1);
+    var prompt: [glm.native.snap_grid + 1]u32 = @splat(1);
     for (0..9) |i| {
         prompt[0] = @intCast(i);
-        try f.mark(2048, 0, @intCast(i));
-        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
+        try f.mark(glm.native.snap_grid, 0, @intCast(i));
+        try t.expect(store.keep(&prompt, glm.native.snap_grid, null, &.{}, &.{}));
         try t.expectEqual(budget - 31, store.held + glm.native.snap_spare(&f.e)); // whole pages: every one held or spare
         try t.expect(store.entries.items.len <= 4);
     }
@@ -737,13 +739,13 @@ test "GLM snapshots: the actual store's budget spans the host tier, keeps past t
     // the oldest kept is the first to go: the newest four still resume their own rows
     for (5..9) |i| {
         prompt[0] = @intCast(i);
-        const found = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
+        const found = try store.lookup(t.allocator, &prompt, glm.native.snap_grid, &.{}, &.{}, &.{});
         defer t.allocator.free(found.marks);
         const e = found.entry orelse return error.ExpectedHit;
         defer store.release(e);
         const kept: *glm.engine.Kept = @ptrCast(@alignCast(e.saved));
         try f.e.restoreState(kept.id);
-        try t.expectEqual(@as(usize, 2048), f.seq.st.pos);
+        try t.expectEqual(@as(usize, glm.native.snap_grid), f.seq.st.pos);
     }
 }
 

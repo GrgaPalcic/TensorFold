@@ -724,9 +724,10 @@ test "GLM FP8 pages: the prompt cache's store keeps paged E4M3 states past the c
             try e.prepareTiers(budget, host);
         }
     };
-    const ids_a = [_]u32{ 2, 0, 3, 1, 8 }; // 2,048 rows and a page past them
-    const ids_b = [_]u32{ 6, 4, 7, 5, 9 };
-    var kv_buf = try cuda.DeviceBuffer.alloc(&d, 10 * page);
+    // 4,096 rows (the chunk grid) and a page past them
+    const ids_a = [_]u32{ 2, 0, 3, 1, 8, 10, 11, 12, 13 };
+    const ids_b = [_]u32{ 6, 4, 7, 5, 9, 14, 15, 16, 17 };
+    var kv_buf = try cuda.DeviceBuffer.alloc(&d, 20 * page);
     defer kv_buf.free();
     var a = f.seq;
     a.st = try paged8(&d, &f, kv_buf.ptr, &ids_a, false);
@@ -736,7 +737,7 @@ test "GLM FP8 pages: the prompt cache's store keeps paged E4M3 states past the c
     defer b.st.deinit();
     f.e.cur = &a;
     defer f.e.cur = &f.seq;
-    const one = f.e.stateBytes(2048);
+    const one = f.e.stateBytes(glm.native.snap_grid);
     Ready.host = 3 * one;
     f.e.snap_setup = .{ .ptr = &f.e, .run = Ready.run };
     const budget = try adapter.cacheBudget(glm.native, &f.e, one + 31);
@@ -744,18 +745,18 @@ test "GLM FP8 pages: the prompt cache's store keeps paged E4M3 states past the c
     const family: pc.Snapshots = .{ .ptr = &f.e, .vtable = &adapter.Snaps(glm.native, null).vtable };
     var store = pc.Store.init(t.allocator, family, adapter.cacheRules(glm.native), budget);
     defer store.deinit();
-    var prompt: [2049]u32 = @splat(1);
+    var prompt: [glm.native.snap_grid + 1]u32 = @splat(1);
     for (0..7) |i| {
         prompt[0] = @intCast(i);
-        try markPaged(&f, &a.st, kv_buf.ptr, page, 2048, 0, @intCast(i));
-        try t.expect(store.keep(&prompt, 2048, null, &.{}, &.{}));
+        try markPaged(&f, &a.st, kv_buf.ptr, page, glm.native.snap_grid, 0, @intCast(i));
+        try t.expect(store.keep(&prompt, glm.native.snap_grid, null, &.{}, &.{}));
         try t.expect(store.entries.items.len <= 4);
     }
     try t.expectEqual(@as(usize, 4), store.entries.items.len); // one on the card, three in host memory
     try t.expectEqual(@as(u64, 3), store.counts.evicted);
     // the last kept (salt 6) resumes onto b's pages as a's pages held it
     prompt[0] = 6;
-    const found = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
+    const found = try store.lookup(t.allocator, &prompt, glm.native.snap_grid, &.{}, &.{}, &.{});
     defer t.allocator.free(found.marks);
     const e = found.entry orelse return error.ExpectedHit;
     defer store.release(e);
@@ -763,9 +764,9 @@ test "GLM FP8 pages: the prompt cache's store keeps paged E4M3 states past the c
     clobber(&b.st, kv_buf.ptr, page, 0xFF);
     f.e.cur = &b;
     try f.e.restoreState(kept.id);
-    try samePrefix8(c, &a.st, &b.st, 2048, null);
+    try samePrefix8(c, &a.st, &b.st, glm.native.snap_grid, null);
     prompt[0] = 0; // the oldest went first
-    const gone = try store.lookup(t.allocator, &prompt, 2048, &.{}, &.{}, &.{});
+    const gone = try store.lookup(t.allocator, &prompt, glm.native.snap_grid, &.{}, &.{}, &.{});
     defer t.allocator.free(gone.marks);
     try t.expect(gone.entry == null);
 }
