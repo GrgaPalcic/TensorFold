@@ -84,10 +84,10 @@ pub const Facts = struct { reserve: ?Reserve = null, min_state: u64 = 0 };
 /// The pool beside the engine's own sequence (in `model`: a window, or on pages its fixed part); null: see `problem`.
 /// A family that keeps states past the card (`snap_host_tier`) gives the pages a device share under one state
 /// (`facts.min_state`): it would hold none of its own, and the states go to the host tier (Plan.skipped says how much).
-pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts, kept_ppm: u32) !?Plan {
+pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, facts: Facts, kept_ppm: u32, slots: ?usize) !?Plan {
     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
-    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = engine_paged, .kept_ppm = if (host_mode) 0 else kept_ppm, .cache_first = cacheFirst() };
+    var b: kv_pool.Budget = .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = slots orelse named(o), .window = window + rows, .engine_paged = engine_paged, .kept_ppm = if (host_mode) 0 else kept_ppm, .slots_only = slots != null, .cache_first = cacheFirst() };
     var p = kv_pool.plan(l, b) catch |e| {
         problem.* = try refusal(a, l, b, e, window, rows, facts.reserve);
         return null;
@@ -152,6 +152,10 @@ pub fn attach(comptime F: type, a: Allocator, ctx: *anyopaque, paged: ?Plan, pro
         problem.* = try std.fmt.allocPrint(a, "the CUDA engine could not make its {d} streams' pages ({s})", .{ p.lanes - 1, @errorName(e) });
         return false;
     };
+    if (comptime @hasDecl(F, "share_states")) F.share_states(ctx, p.snaps, p.lanes) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the CUDA engine could not make its {d} kept states' slots ({s})", .{ p.snaps, @errorName(e) });
+        return false;
+    };
     return true;
 }
 
@@ -193,6 +197,16 @@ pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layou
     return .{ shape, cache };
 }
 
+/// The startup line's cache: the `asked` TF_KV_SHARE slots (GLM), those that fit, or over the pool's pages, or `cache`.
+pub fn cacheText(a: Allocator, over_pages: bool, asked: ?usize, paged: ?Plan, l: ?kv_pool.Layout, cache: []const u8) ![]const u8 {
+    const n = asked orelse return if (over_pages) ", the prompt cache over the pool's pages" else cache;
+    const snaps = paged.?.snaps;
+    const slot = l.?.snap_bytes;
+    if (snaps == 0) return std.fmt.allocPrint(a, ", no prompt cache (none of TF_KV_SHARE={d} kept states' slots fit; --prompt-cache-gib {d} holds all {d})", .{ n, kv_pool.holdingGib(n, slot), n });
+    if (snaps < n) return std.fmt.allocPrint(a, ", {d} of TF_KV_SHARE={d} kept states' slots ({d:.1} GiB; --prompt-cache-gib {d} holds all {d}) and the prompt cache over the pool's pages", .{ snaps, n, toGib(snaps * slot), kv_pool.holdingGib(n, slot), n });
+    return std.fmt.allocPrint(a, ", {d} kept states' slots ({d:.1} GiB) and the prompt cache over the pool's pages", .{ snaps, toGib(snaps * slot) });
+}
+
 /// TF_PROMPT_CACHE_FIRST=1: the prompt cache (--prompt-cache-gib) is set aside before the room is counted in whole
 /// windows, so the streams share what is left (the engine's own window at least). Unset or 0: windows first, as before.
 fn cacheFirst() bool {
@@ -220,6 +234,22 @@ pub fn host(comptime F: type, loaded: anytype) bool {
 pub fn stagingBytes(comptime F: type, loaded: anytype, host_budget: u64) u64 {
     if (comptime !@hasDecl(F, "snap_slots")) return 0;
     return if (host(F, loaded) and host_budget > 0) loaded.snap_bytes else 0;
+}
+
+test "the startup line names TF_KV_SHARE's slots, and when the cache holds fewer, how many of how many and the cache for all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const l: kv_pool.Layout = .{ .fixed_bytes = 0, .token_bytes = 1, .page_tokens = 64, .snap_bytes = 180 << 20 };
+    const p: Plan = .{ .lanes = 2, .snaps = 16, .copied = 0, .pages = 100 };
+    try std.testing.expectEqualStrings(", 16 kept states' slots (2.8 GiB) and the prompt cache over the pool's pages", try cacheText(a, true, 16, p, l, ", own"));
+    var some = p;
+    some.snaps = 13; // a 2.4 GiB cache: 13 of the 16 slots, 16 x 180 MiB rounding up to 3 GiB
+    try std.testing.expectEqualStrings(", 13 of TF_KV_SHARE=16 kept states' slots (2.3 GiB; --prompt-cache-gib 3 holds all 16) and the prompt cache over the pool's pages", try cacheText(a, true, 16, some, l, ", own"));
+    some.snaps = 0;
+    try std.testing.expectEqualStrings(", no prompt cache (none of TF_KV_SHARE=16 kept states' slots fit; --prompt-cache-gib 3 holds all 16)", try cacheText(a, true, 16, some, l, ", own"));
+    try std.testing.expectEqualStrings(", the prompt cache over the pool's pages", try cacheText(a, true, null, p, l, ", own"));
+    try std.testing.expectEqualStrings(", own", try cacheText(a, false, null, null, null, ", own"));
 }
 
 const Fixture = struct {
@@ -283,11 +313,11 @@ test "kv pages: an engine whose own rows are pages plans a window of them first,
     const l: kv_pool.Layout = .{ .fixed_bytes = 180 << 20, .token_bytes = 13_056, .page_tokens = 512, .snap_bytes = 0 };
     const o: api.Open = .{ .dir = "", .model_type = "g", .lanes = 4, .prompt_cache_gib = 4 };
     try std.testing.expect(enginePaged(.{ .layout = @as(?kv_pool.Layout, l), .engine_paged = true }) and !enginePaged(.{ .layout = @as(?kv_pool.Layout, l) }));
-    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true, .{}, 0)).?;
+    const p = (try plan(Owned, a, l, 40 << 30, o, 8192, &problem, false, true, .{}, 0, null)).?;
     try std.testing.expectEqual(@as(u32, 4), p.lanes);
     try std.testing.expectEqual(@as(usize, 4 * 17), p.pages); // every stream at most 8,192 rows and a verify window: 17 pages
     const floor = 17 * l.pageBytes();
-    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true, .{}, 0));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Owned, a, l, floor - 1, o, 8192, &problem, false, true, .{}, 0, null));
     try std.testing.expect(std.mem.indexOf(u8, problem, "8192-token window") != null);
     const shown = (try text(Owned, a, 180 << 20, l, p, true, 8192, .{ .snaps = 0, .copied = 4 << 30, .snap_bytes = 0 }, false))[0];
     try std.testing.expectEqualStrings("the engine's own and 3 more taking 68 pages of 512 rows (0.42 GiB) as they need them (enough for one at a 8192-token window), 180 MiB fixed each", shown);
@@ -347,7 +377,7 @@ test "KV admission: a refusal prices the running states beside the fixed part an
     var problem: []const u8 = "";
     const l: kv_pool.Layout = .{ .fixed_bytes = 1 << 30, .token_bytes = 1 << 28, .page_tokens = 4, .snap_bytes = 1, .run_bytes = 1 << 30 };
     const o: api.Open = .{ .dir = "", .model_type = "n", .lanes = 2, .lanes_fixed = true, .prompt_cache_gib = 0 };
-    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false, .{}, 0));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(struct {}, arena.allocator(), l, 2 << 30, o, 8, &problem, false, false, .{}, 0, null));
     try std.testing.expect(std.mem.indexOf(u8, problem, "needs 3.00 GiB") != null);
     try std.testing.expect(std.mem.indexOf(u8, problem, "state runs") != null);
 }
@@ -377,10 +407,10 @@ test "kv merge: beside a host tier, a device share under one state goes to the K
     const own = l.pages(864_256 + 8) * page; // the engine's own 864,256-token window: 1,689 pages
     const share: u64 = 188_753_152; // the 0.176 GiB production's room left the device cache
     const room = own + 3 * l.fixed_bytes + 3 * page + share;
-    const before = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{}, 0)).?; // no state size: as before
+    const before = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{}, 0, null)).?; // no state size: as before
     try std.testing.expectEqual(share, before.copied);
     try std.testing.expectEqual(@as(usize, 1692), before.pages); // production's pool: 866,304 tokens
-    const p = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+    const p = (try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0, null)).?;
     try std.testing.expectEqual(@as(u64, 0), p.copied);
     try std.testing.expectEqual(share, p.skipped);
     try std.testing.expectEqual(@as(usize, 1692 + share / page), p.pages); // 57 pages more: 895,488 tokens
@@ -411,17 +441,17 @@ test "kv merge: beside a host tier, a device share under one state goes to the K
     try std.testing.expectEqual(@as(usize, 1), Quiet.warned);
     // a share that holds one state stays on the card, as does any share of a family without a host tier
     const roomy = room - share + glm_min_state;
-    const held = (try plan(Glm, a, l, roomy, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+    const held = (try plan(Glm, a, l, roomy, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0, null)).?;
     try std.testing.expectEqual(glm_min_state, held.copied);
     try std.testing.expectEqual(@as(u64, 0), held.skipped);
     const NoHost = struct {
         pub const snap_save = 1;
         pub const window_rows = 8;
     };
-    try std.testing.expectEqual(share, (try plan(NoHost, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?.copied);
+    try std.testing.expectEqual(share, (try plan(NoHost, a, l, room, o, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0, null)).?.copied);
     // a cache turned off (--prompt-cache-gib 0) skips nothing
     const off: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true, .prompt_cache_gib = 0 };
-    const none = (try plan(Glm, a, l, room, off, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0)).?;
+    const none = (try plan(Glm, a, l, room, off, 864_256, &problem, false, true, .{ .min_state = glm_min_state }, 0, null)).?;
     try std.testing.expectEqual(@as(u64, 0), none.copied + none.skipped);
 }
 
@@ -455,7 +485,7 @@ test "kv merge: a refused --parallel names what would fit: the streams the room 
     const o: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = 4, .lanes_fixed = true };
     const reserve: Reserve = .{ .bytes = 4 * gib, .least = gib / 2 };
     const room: u64 = 6359 << 20; // 6.21 GiB, production's at reserve 4: three streams' fixed parts are 0.05 GiB short
-    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0));
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0, null));
     // the old words stay (start.sh greps them), the engine's own window is named, then the clause
     try std.testing.expect(std.mem.indexOf(u8, problem, "--parallel 4 needs 1.12 GiB for its other streams' fixed parts") != null);
     try std.testing.expect(std.mem.indexOf(u8, problem, "beside the engine's own 864256-token window (5.14 GiB of KV pages)") != null);
@@ -465,28 +495,28 @@ test "kv merge: a refused --parallel names what would fit: the streams the room 
     try std.testing.expectEqual(@as(?u32, 3), fit.parallel);
     // each named value, set alone, serves all four streams (and not a byte past the reserve's hundredth)
     const lower: u64 = @intFromFloat(fit.reserve.? * @as(f64, @floatFromInt(gib)));
-    try std.testing.expect((try plan(Glm, a, l, room + reserve.bytes - lower, o, 864_256, &problem, false, true, .{}, 0)) != null);
+    try std.testing.expect((try plan(Glm, a, l, room + reserve.bytes - lower, o, 864_256, &problem, false, true, .{}, 0, null)) != null);
     try std.testing.expect(lower + (gib / 100) > reserve.bytes - (l.pages(864_264) * l.pageBytes() + 3 * (l.fixed_bytes + l.pageBytes()) - room));
-    try std.testing.expect((try plan(Glm, a, l, room, o, fit.context.?, &problem, false, true, .{}, 0)) != null);
-    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, fit.context.? + 512, &problem, false, true, .{}, 0));
+    try std.testing.expect((try plan(Glm, a, l, room, o, fit.context.?, &problem, false, true, .{}, 0, null)) != null);
+    try std.testing.expectEqual(@as(?Plan, null), try plan(Glm, a, l, room, o, fit.context.? + 512, &problem, false, true, .{}, 0, null));
     const three: api.Open = .{ .dir = "", .model_type = "glm5_next", .lanes = fit.parallel.?, .lanes_fixed = true };
-    try std.testing.expect((try plan(Glm, a, l, room, three, 864_256, &problem, false, true, .{}, 0)) != null);
+    try std.testing.expect((try plan(Glm, a, l, room, three, 864_256, &problem, false, true, .{}, 0, null)) != null);
     // a reserve at the engine's floor that still falls short, or a memory limit, names none
-    _ = try plan(Glm, a, l, room - 4 * gib, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = gib / 2 + gib / 4, .least = gib / 2 } }, 0);
+    _ = try plan(Glm, a, l, room - 4 * gib, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = gib / 2 + gib / 4, .least = gib / 2 } }, 0, null);
     try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
-    _ = try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = 4 * gib, .least = gib / 2, .limited = true } }, 0);
+    _ = try plan(Glm, a, l, room, o, 864_256, &problem, false, true, .{ .reserve = .{ .bytes = 4 * gib, .least = gib / 2, .limited = true } }, 0, null);
     try std.testing.expectEqual(@as(?f64, null), (try fitOf(problem)).reserve);
     // a room under the engine's own window: no stream fits, so --parallel names none; the reserve and --context do
-    _ = try plan(Glm, a, l, 5 * gib, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0);
+    _ = try plan(Glm, a, l, 5 * gib, o, 864_256, &problem, false, true, .{ .reserve = reserve }, 0, null);
     try std.testing.expect(std.mem.indexOf(u8, problem, "one at a 864256-token window takes 5.14 GiB of KV pages, and the budget leaves 5.00 GiB") != null);
     const none = try fitOf(problem);
     try std.testing.expectEqual(@as(?u32, null), none.parallel);
-    try std.testing.expect((try plan(Glm, a, l, 5 * gib, o, none.context.?, &problem, false, true, .{}, 0)) != null);
+    try std.testing.expect((try plan(Glm, a, l, 5 * gib, o, none.context.?, &problem, false, true, .{}, 0, null)) != null);
     const lifted = 5 * gib + reserve.bytes - @as(u64, @intFromFloat(none.reserve.? * @as(f64, @floatFromInt(gib))));
-    try std.testing.expect((try plan(Glm, a, l, lifted, o, 864_256, &problem, false, true, .{}, 0)) != null);
+    try std.testing.expect((try plan(Glm, a, l, lifted, o, 864_256, &problem, false, true, .{}, 0, null)) != null);
     // a family whose own window is in the model's bytes: no --context in its clause
     const NotPaged = struct {};
-    _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve }, 0);
+    _ = try plan(NotPaged, a, l, l.fixed_bytes, o, 8192, &problem, false, false, .{ .reserve = reserve }, 0, null);
     try std.testing.expect(std.mem.endsWith(u8, problem, "(now 4.00)"));
     try std.testing.expectEqual(@as(?u32, 1), (try fitOf(problem)).parallel);
 }

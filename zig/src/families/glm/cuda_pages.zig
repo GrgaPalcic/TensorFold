@@ -29,6 +29,11 @@ pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
     return .{ .fixed_bytes = fixed + extra, .token_bytes = token, .page_tokens = state.page_rows, .snap_bytes = 0 };
 }
 
+/// TF_KV_SHARE: a kept state's slot (`e.share_pages`: its prefix's pages left to the store), at the window's last mark.
+pub fn shareSlot(e: *const Engine) u64 {
+    return e.stateBytes(e.capacity - e.capacity % @import("cuda_native.zig").snap_grid);
+}
+
 /// The sharded page's parts for engine `e`: its DSA layers' latent rows and pooled keys (the MTP head is refused).
 pub fn geometry(e: *const Engine) kvs.Geometry {
     return kvs.Geometry.of(&e.w.config, state.mlaLayers(&e.w));
