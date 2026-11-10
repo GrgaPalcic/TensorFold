@@ -446,12 +446,17 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
     try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null), 1 }); // 1: the pages layout
     try facts.appendSlice(a, prefixes);
     const was = e.share_pages;
-    e.share_pages = false; // the probe keeps a whole copy, as without the share (the store is not attached yet)
+    const held = if (e.pages) |pg| pg.prompts else null;
+    // the probe keeps a whole copy through its own mark hook, as without the share: the store stands aside for it
+    e.share_pages = false;
+    if (e.pages) |pg| pg.prompts = null;
     const p = probe(a, io, loaded.backend, e) catch |err| {
         e.share_pages = was;
+        if (e.pages) |pg| pg.prompts = held;
         return err;
     };
     e.share_pages = was;
+    if (e.pages) |pg| pg.prompts = held;
     pages_mode = true;
     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
     const gibs = struct {
