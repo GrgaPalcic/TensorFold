@@ -11,6 +11,7 @@ pub const Saved = tree_mod.Saved;
 pub const Snapshots = tree_mod.Snapshots;
 pub const Pages = tree_mod.Pages;
 pub const LeafFilter = tree_mod.LeafFilter;
+pub const Parting = tree_mod.Parting;
 pub const Counts = tree_mod.Counts;
 pub const Node = tree_mod.Node;
 pub const Tree = tree_mod.Tree;
@@ -54,6 +55,9 @@ pub const Store = struct {
     tree: Tree,
     rules: Rules,
     limits: Limits = .{},
+    /// The parts a sharded pool's pages lie in (TF_GLM_KV_SHARD's, cuda_prompt_pages): a kept state's path never
+    /// spans them; null elsewhere (one pool holds every page).
+    parts: ?tree_mod.Parting = null,
     /// The tokens of recently planned shared cuts, hashed (at most SHARED_KEYS).
     shared_keys: std.ArrayList(u64) = .empty,
     /// --learn-conversations: every kept state written behind to disk, read back where it pays (prompt_cache.Store's).
@@ -254,6 +258,18 @@ pub const Store = struct {
                 e.shared = e.shared or flagged;
                 t.touch(last.?);
                 return .{ .held = true, .shared = mine.len };
+            }
+            if (s.parts) |g| { // TF_GLM_KV_SHARD: a kept state's path never spans the parts
+                @memcpy(path[got..], mine[got..]); // the pages the tree lacks: the path's tail
+                if (!g.one(g.ctx, path[0..mine.len])) {
+                    if (got < mine.len) if (last) |n| if (t.alone(n)) {
+                        t.dropChain(n); // the older prefix chain goes: the new state is longer and replaces it whole
+                        continue;
+                    };
+                    g.refused(g.ctx);
+                    std.log.debug("kv shard: keeping {d} tokens refused: the kept pages and the new ones would span two parts (TF_GLM_KV_SHARD)", .{at});
+                    return .{ .held = false, .shared = got };
+                }
             }
             if (t.held_pages + (mine.len - got) <= s.limits.pages and t.snaps + 1 <= s.limits.snaps) break;
             const v = s.victim(prompt, null) orelse {

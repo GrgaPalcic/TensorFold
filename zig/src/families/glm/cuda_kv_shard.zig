@@ -479,6 +479,7 @@ pub const Counts = struct {
     carry_bytes: u64 = 0,
     resumes_dropped: u64 = 0, // resumes that started from 0: the stream could not go home and carries are off
     resumes_skipped: u64 = 0, // share resumes skipped: the kept prefix would not pay its untwinned tail, the pass ran cold
+    keeps_refused: u64 = 0, // share keeps refused: the kept pages and the new ones would span two parts, nothing kept
     checks: u64 = 0, // layout digests sent (rank 0) or compared
 
     pub fn into(c: Counts, out: *kv_parts.Stats) void {

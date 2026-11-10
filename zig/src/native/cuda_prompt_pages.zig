@@ -55,9 +55,12 @@ pub const Adapter = struct {
         x.store = try radix.Store.init(gpa, copies, x.pages(), rules);
         switch (src) {
             .one => |pool| pool.reclaim = .{ .ctx = x, .call = reclaim }, // a promise or a hold evicts the tree's idle pages before it fails
-            .parts => |s| for (0..s.count) |i| { // a part's promise evicts its own leaves first (its hook below)
-                x.part[i] = .{ .x = x, .at = i };
-                s.setReclaim(s.ctx, i, .{ .ctx = &x.part[i], .call = reclaimPart });
+            .parts => |s| {
+                x.store.parts = .{ .ctx = x, .one = Parting.one, .refused = Parting.refused }; // a kept state's path stays in one part
+                for (0..s.count) |i| { // a part's promise evicts its own leaves first (its hook below)
+                    x.part[i] = .{ .x = x, .at = i };
+                    s.setReclaim(s.ctx, i, .{ .ctx = &x.part[i], .call = reclaimPart });
+                }
             },
         }
         x.store.limit(.{ .pages = switch (src) {
@@ -162,6 +165,23 @@ pub const Adapter = struct {
         return s.free(s.ctx, h.at);
     }
 
+    /// The parts as the store's keep sees them (radix.Parting, TF_GLM_KV_SHARD): through the family's own calls.
+    const Parting = struct {
+        fn adapter(ptr: *anyopaque) *Adapter {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn one(ptr: *anyopaque, ids: []const u32) bool {
+            const x = adapter(ptr);
+            const s = x.src.parts;
+            return s.onePart(s.ctx, ids);
+        }
+        fn refused(ptr: *anyopaque) void {
+            const x = adapter(ptr);
+            const s = x.src.parts;
+            s.refused(s.ctx);
+        }
+    };
+
     fn begin(ctx: *anyopaque, prompt: []const u32, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!hooks.Plan {
         const x = of(ctx);
         const p = try x.store.begin(x.gpa, prompt, history_len, shared, owner, adopt);
@@ -176,11 +196,15 @@ pub const Adapter = struct {
         of(ctx).store.report(prompt, from, kept);
     }
 
+    fn forget(ctx: *anyopaque, prompt: []const u32, at: u32) void {
+        of(ctx).store.forget(prompt, at);
+    }
+
     fn free(ctx: *anyopaque, marks: []const u32) void {
         of(ctx).gpa.free(marks);
     }
 
-    const vtable: hooks.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .free = free };
+    const vtable: hooks.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free };
 };
 
 const testing = std.testing;
@@ -257,6 +281,7 @@ const Sharded = struct {
     prompts: ?hooks.Prompts = null,
     saved: u8 = 0,
     restored: ?*anyopaque = null,
+    keeps_refused: u64 = 0,
 
     fn of(p: *anyopaque) *Sharded {
         return @ptrCast(@alignCast(p));
@@ -274,6 +299,7 @@ const Sharded = struct {
             .inPart = partIn,
             .onePart = partOne,
             .setReclaim = partSet,
+            .refused = shRefused,
             .ctx = p,
         } };
     }
@@ -339,6 +365,9 @@ const Sharded = struct {
     fn partSet(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
         of(ctx).pools[part].reclaim = hook;
     }
+    fn shRefused(ctx: *anyopaque) void {
+        of(ctx).keeps_refused += 1;
+    }
 };
 
 test "TF_KV_SHARE's adapter over a sharded pool: the parts are the store's pages, a keep and its resume cross them" {
@@ -366,4 +395,87 @@ test "TF_KV_SHARE's adapter over a sharded pool: the parts are the store's pages
     for (adopt.items) |id| f.release(id);
     x.close(); // the tree's holds go, each part's pool idle again
     try testing.expect(f.prompts == null and f.pools[0].idle() and f.pools[1].idle());
+}
+
+test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's prefix would span replaces it whole" {
+    var f: Sharded = .{ .h = 8, .pools = .{ try kv.Pool.init(testing.allocator, 8, 1), try kv.Pool.init(testing.allocator, 8, 1) } };
+    defer for (&f.pools) |*p| p.deinit();
+    const x = (try Adapter.open(Sharded, testing.allocator, &f, 4, 4)).?;
+    const p = f.prompts.?;
+    const base = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var owner: u8 = 0;
+    // the older state: a part-1 stream's first two pages kept at 8 tokens
+    var a: kv.Lease = .{};
+    try f.pools[1].promise(&a, 2);
+    try f.pools[1].cover(&a, 2, null);
+    const mine_a = [_]u32{ a.ids.items[0] + 8, a.ids.items[1] + 8 };
+    var path_a: [2]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), p.keep(&base, 8, &owner, &mine_a, &path_a));
+    f.pools[1].finish(&a);
+    // a part-0 pass over the same prefix, longer: its pages would span the parts under the part-1 node
+    const longer = base ++ [_]u32{ 21, 22, 23, 24 };
+    var b: kv.Lease = .{};
+    try f.pools[0].promise(&b, 4);
+    try f.pools[0].cover(&b, 4, null);
+    var path_b: [4]u32 = undefined;
+    try testing.expectEqual(@as(usize, 4), p.keep(&longer, 16, &owner, b.ids.items, &path_b)); // whole, its own pages
+    f.pools[0].finish(&b);
+    try testing.expectEqual(@as(u64, 0), f.keeps_refused);
+    for (mine_a) |id| try testing.expectEqual(@as(u32, 0), f.holders(id)); // the replaced chain's pages went back
+    for (path_b) |id| try testing.expectEqual(@as(u32, 1), f.holders(id)); // the new state's, all part 0
+    var adopt: std.ArrayList(u32) = .empty;
+    defer adopt.deinit(testing.allocator);
+    const plan = try p.begin(&longer, longer.len, &.{}, &owner, &adopt);
+    defer p.free(plan.marks);
+    try testing.expectEqual(@as(u32, 16), plan.from);
+    try testing.expectEqualSlices(u32, &path_b, adopt.items); // the resume adopts the one-part path
+    for (adopt.items) |id| f.release(id);
+    x.close();
+    try testing.expect(f.pools[0].idle() and f.pools[1].idle());
+}
+
+test "TF_KV_SHARE's adapter over a sharded pool: a keep the other part's branched prefix would span is refused" {
+    var f: Sharded = .{ .h = 16, .pools = .{ try kv.Pool.init(testing.allocator, 16, 1), try kv.Pool.init(testing.allocator, 16, 1) } };
+    defer for (&f.pools) |*p| p.deinit();
+    const x = (try Adapter.open(Sharded, testing.allocator, &f, 4, 4)).?;
+    const p = f.prompts.?;
+    const base = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var owner: u8 = 0;
+    // a part-1 state at 8 tokens, a longer one below it: the prefix node has another child
+    var a: kv.Lease = .{};
+    try f.pools[1].promise(&a, 2);
+    try f.pools[1].cover(&a, 2, null);
+    const mine_a = [_]u32{ a.ids.items[0] + 16, a.ids.items[1] + 16 };
+    var path_a: [2]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), p.keep(&base, 8, &owner, &mine_a, &path_a));
+    f.pools[1].finish(&a);
+    var b: kv.Lease = .{};
+    try f.pools[1].promise(&b, 4);
+    try f.pools[1].cover(&b, 4, null);
+    const mine_b = [_]u32{ b.ids.items[0] + 16, b.ids.items[1] + 16, b.ids.items[2] + 16, b.ids.items[3] + 16 };
+    const longer = base ++ [_]u32{ 21, 22, 23, 24 };
+    var path_b: [4]u32 = undefined;
+    try testing.expectEqual(@as(usize, 4), p.keep(&longer, 16, &owner, &mine_b, &path_b));
+    f.pools[1].finish(&b);
+    // a part-0 pass over the shared prefix, parting from the part-1 tail at its first page: the prefix node's
+    // other child stands, so the keep is refused and the tree unchanged
+    const branch = base[0..8].* ++ [_]u32{ 41, 42, 43, 44 } ++ base[12..16].*;
+    var d: kv.Lease = .{};
+    try f.pools[0].promise(&d, 4);
+    try f.pools[0].cover(&d, 4, null);
+    var path_d: [4]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), p.keep(&branch, 16, &owner, d.ids.items, &path_d)); // the two matched pages
+    f.pools[0].finish(&d);
+    try testing.expectEqual(@as(u64, 1), f.keeps_refused);
+    for (path_a) |id| try testing.expectEqual(@as(u32, 1), f.holders(id)); // the tree unchanged
+    for (path_b[2..]) |id| try testing.expectEqual(@as(u32, 1), f.holders(id));
+    var adopt: std.ArrayList(u32) = .empty;
+    defer adopt.deinit(testing.allocator);
+    const plan = try p.begin(&longer, longer.len, &.{}, &owner, &adopt);
+    defer p.free(plan.marks);
+    try testing.expectEqual(@as(u32, 16), plan.from); // the kept states still resume
+    try testing.expectEqualSlices(u32, path_a ++ path_b[2..], adopt.items);
+    for (adopt.items) |id| f.release(id);
+    x.close();
+    try testing.expect(f.pools[0].idle() and f.pools[1].idle());
 }

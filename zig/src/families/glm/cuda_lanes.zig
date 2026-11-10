@@ -321,10 +321,10 @@ pub const Lanes = struct {
         defer adopt.deinit(gpa);
         // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
         const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
-        if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len); // sharded: a resume adopts only when its untwinned tail pays
+        const cold: ?u8 = if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len) else null; // a skipped resume's cold pass: the kept prefix's part
         var held = true;
         errdefer if (held) gpa.free(marks);
-        const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
+        const pages = try self.seatCold(s, ids.len, s.max_new, adopt.items, cold);
         errdefer {
             self.x.e.release(self.lanes.get(s).?.slot);
             _ = self.lanes.remove(s);
@@ -360,6 +360,12 @@ pub const Lanes = struct {
     /// past the paged ones waits before binding makes a window. Sharded (TF_GLM_KV_SHARD), in its kept state's home
     /// part when that has the room (`home`).
     pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize, adopted: []const u32) ![]const u32 {
+        return self.seatCold(s, prompt, max_new, adopted, null);
+    }
+
+    /// `seat`, with `cold` the part a skipped share resume's cold pass takes (cuda_share.gate): the kept prefix's
+    /// part when it has room for the whole pass (as a kept state's home is today), else wherever the parts choose.
+    pub fn seatCold(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize, adopted: []const u32, cold: ?u8) ![]const u32 {
         const l = self.claim(s) catch |err| {
             if (self.x.e.pages) |p| p.give(adopted);
             return err;
@@ -373,8 +379,9 @@ pub const Lanes = struct {
             _ = self.lanes.remove(s);
         }
         const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
-        // sharded: the stream's home is the kept state's part, or a share resume's its adopted pages' (TF_KV_SHARE)
-        const home: ?u8 = if (!sharded) null else if (adopted.len > 0) self.x.e.pages.?.partOf(adopted[0]) else self.homeOf(s);
+        // sharded: the stream's home is the kept state's part, a share resume's its adopted pages' (TF_KV_SHARE),
+        // a skipped resume's the part its cold pass was given (the kept prefix's)
+        const home: ?u8 = if (!sharded) null else if (adopted.len > 0) self.x.e.pages.?.partOf(adopted[0]) else (cold orelse self.homeOf(s));
         const pages = try self.pagesFor(l.slot, prompt, max_new, home, adopted);
         try self.x.bind(l.slot);
         return pages;

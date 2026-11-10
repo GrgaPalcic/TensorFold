@@ -434,10 +434,13 @@ const Store = struct {
         return of(ctx).store.keep(prompt, at, owner, mine, path).shared;
     }
     fn report(_: *anyopaque, _: usize, _: u32, _: u64) void {}
+    fn forget(ctx: *anyopaque, prompt: []const u32, at: u32) void {
+        of(ctx).store.forget(prompt, at);
+    }
     fn free(ctx: *anyopaque, marks: []const u32) void {
         of(ctx).gpa.free(marks);
     }
-    const vtable: kp.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .free = free };
+    const vtable: kp.Prompts.VTable = .{ .begin = begin, .keep = keep, .report = report, .forget = forget, .free = free };
 };
 
 test "TF_KV_SHARE: a pass's pages below its mark go to the shared store, and a later pass resumes on those pages" {
