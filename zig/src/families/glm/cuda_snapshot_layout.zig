@@ -136,10 +136,11 @@ pub const Plan = struct {
     /// A cache's latent codes or scales: `addCache`, and sharded (a latent table of its own) on its latent pages.
     fn addLatent(p: *Plan, st: *const State, x: cache.Caches, live: u64, len: usize, span: usize) !void {
         if (x.lpt == 0) return p.addCache(st, x, live, len, span);
-        if (len == 0) return;
+        const from = @min(len, p.shared * span); // the store's pages keep their latent rows too (a part's pages)
+        if (len == from) return;
         if ((!p.sizing and (len - 1) / span >= p.lids.len) or p.count == p.parts.len) return error.SnapshotShape;
-        p.len = try std.math.add(usize, p.len, len);
-        p.parts[p.count] = .{ .live = live, .len = len, .span = span, .page = x.lps, .lat = true };
+        p.len = try std.math.add(usize, p.len, len - from);
+        p.parts[p.count] = .{ .live = live, .len = len - from, .span = span, .page = x.lps, .lat = true, .from = from };
         p.count += 1;
     }
 

@@ -72,7 +72,7 @@ const World = struct {
 
     fn reclaim(ctx: *anyopaque, want: usize) bool {
         const s: *radix.Store = @ptrCast(@alignCast(ctx));
-        return s.reclaim(want);
+        return s.reclaim(want, null);
     }
 
     /// A request as the backend admits it: resume, promise the rest of its need, cover it, keep at its marks.
@@ -181,7 +181,7 @@ fn run(w: *World, seed: u64, pages: usize) !void {
             },
             5...7 => if (w.streams.items.len > 0) w.end(rnd.uintLessThan(usize, w.streams.items.len)), // finish or cancel
             8 => w.store.limit(.{ .pages = rnd.uintLessThan(usize, pages), .snaps = rnd.uintLessThan(usize, 6) }),
-            else => _ = w.store.reclaim(rnd.uintLessThan(usize, pages)),
+            else => _ = w.store.reclaim(rnd.uintLessThan(usize, pages), null),
         }
         try w.check();
     }

@@ -238,7 +238,7 @@ pub const Hip = struct {
         h.matched.clearRetainingCapacity();
         // pages for the whole request are promised now, so no round runs out of them
         const need = pages.pagesFor(lane.caches.total) - adopted;
-        if (!h.prefix.store.reclaim(need)) return error.OutOfPages;
+        if (!h.prefix.store.reclaim(need, null)) return error.OutOfPages;
         lane.caches.promised = need;
         h.e.pool.ids.reserved += need;
         _ = try lane.caches.grow(h.gpa, prompt.len);

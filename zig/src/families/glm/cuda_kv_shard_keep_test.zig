@@ -91,7 +91,7 @@ test "kv shard parts: random admissions, twins and ends on two ranks: every page
                 const home: ?u8 = if (rnd.boolean()) rnd.uintLessThan(u8, 2) else null;
                 const part = lead.choose(n, home) orelse continue;
                 if (home) |hp| if (lead.pools[hp].fits(n)) try expectEqual(hp, part);
-                try lead.open(slot, part, n, if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, n) else 0);
+                try lead.open(slot, part, n, if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, n) else 0, &.{});
                 try other.map(slot, s.ids.items, s.twin.items);
             },
             2 => if (s.used) {

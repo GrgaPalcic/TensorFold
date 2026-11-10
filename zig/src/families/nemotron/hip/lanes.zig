@@ -275,7 +275,7 @@ pub const Hip = struct {
         // pages for the whole request are promised now, so no round runs out of them
         const total = prompt.len + s.max_new + max_window + 1;
         const need = pages.pagesFor(total);
-        if (!h.prefix.store.reclaim(need)) return error.OutOfPages;
+        if (!h.prefix.store.reclaim(need, null)) return error.OutOfPages;
         l.s.promised = need;
         e.pool.ids.reserved += need;
         // a request resumes from the deepest state the prompt cache holds and keeps its own marks

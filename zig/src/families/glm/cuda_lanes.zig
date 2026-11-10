@@ -372,7 +372,9 @@ pub const Lanes = struct {
             _ = self.lanes.remove(s);
         }
         const sharded = self.x.e.settings.kv_shard.on and if (self.x.e.pages) |p| p.shard != null else false; // only then is a kept state's part read
-        const pages = try self.pagesFor(l.slot, prompt, max_new, if (sharded) self.homeOf(s) else null, adopted);
+        // sharded: the stream's home is the kept state's part, or a share resume's its adopted pages' (TF_KV_SHARE)
+        const home: ?u8 = if (!sharded) null else if (adopted.len > 0) self.x.e.pages.?.partOf(adopted[0]) else self.homeOf(s);
+        const pages = try self.pagesFor(l.slot, prompt, max_new, home, adopted);
         try self.x.bind(l.slot);
         return pages;
     }
