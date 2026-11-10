@@ -298,8 +298,18 @@ pub const Store = struct {
     fn writeBehind(s: *Store, r: *rows.Rows, node: *Node, saved: pc.Saved) void {
         const t = &s.tree;
         const e = &node.entry.?;
-        const pages = t.gpa.dupe(u32, node.pages) catch return;
+        // the state's pages from its first token: every node's on the path to this one, in token order
+        var count: usize = 0;
+        var up: ?*Node = node;
+        while (up) |x| : (up = x.parent) count += x.pages.len;
+        const pages = t.gpa.alloc(u32, count) catch return;
         errdefer t.gpa.free(pages);
+        var at = count;
+        up = node;
+        while (up) |x| : (up = x.parent) {
+            at -= x.pages.len;
+            @memcpy(pages[at..][0..x.pages.len], x.pages);
+        }
         const tokens = t.gpa.dupe(u32, e.last[0..@min(e.last.len, node.end + t.ahead)]) catch return;
         errdefer t.gpa.free(tokens);
         for (pages) |id| t.pages.vtable.retain(t.pages.ptr, id);
