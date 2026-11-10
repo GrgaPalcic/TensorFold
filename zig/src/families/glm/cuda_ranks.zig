@@ -26,6 +26,7 @@ pub const Settings = struct {
     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+    disk_fault: u32 = 0, // TF_GLM_DISK_FAULT=n: a fault drill, the nth disk write a rank other than 0 takes fails once (0: none)
     share_untwinned_pct: u32 = share_mod.untwinned_pct_default, // TF_GLM_KV_SHARE_UNTWINNED_PCT: a sharded share resume adopts only when its untwinned tail pays
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
@@ -123,6 +124,10 @@ pub const Settings = struct {
         };
         s.share_untwinned_pct = share_mod.untwinnedPct(get("TF_GLM_KV_SHARE_UNTWINNED_PCT")) catch {
             problem.* = "TF_GLM_KV_SHARE_UNTWINNED_PCT: 1 to 100 (an untwinned prefill's rate as a percentage of the twinned; 75 the default, 100 always adopts a kept prefix)";
+            return error.BadSetting;
+        };
+        if (get("TF_GLM_DISK_FAULT")) |v| s.disk_fault = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch {
+            problem.* = "TF_GLM_DISK_FAULT: a count (a fault drill: the nth disk write a rank other than 0 takes fails once; 0 none)";
             return error.BadSetting;
         };
         if (get("TF_GLM_KV_LIVE_HALF")) |v| {
