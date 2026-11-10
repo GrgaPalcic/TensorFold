@@ -10,7 +10,7 @@ const t = std.testing;
 
 const page_tokens = 4; // tokens a page holds (rules.page)
 const page_bytes = 8; // bytes of row data a page holds: its 4 tokens, 2 bytes a row
-const page_count = 16; // pages the pool has
+const page_count = 264; // pages the pool has (a 256-token state's block piece and its own file are two reads)
 const words_bytes = 16; // the image's words: the position and the running sum
 const fixed_bytes = 8; // the image's fixed part past the rows: the slot's own
 
@@ -61,6 +61,9 @@ const Fake = struct {
     mem: []u8, // the pages' bytes: a page's rows at [0, page_bytes), as the paged caches sit on a page
     live: usize = 0,
     blanks: usize = 0,
+    scatters: usize = 0, // the scatter calls so far (a recall's pieces: its block, then its own file)
+    fail_scatter_nth: usize = 0, // the Nth scatter call fails (1-based; the first carries the words, where GLM's seal runs)
+    fail_blank_pages: bool = false, // blank_pages holds its pages and fails, as a rank's recall blank that loses its state does
 
     fn of(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
@@ -186,22 +189,33 @@ const Fake = struct {
 
     fn blankPagesFn(ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved {
         const f = of(ptr);
+        if (f.fail_blank_pages) {
+            const held = try f.gpa.alloc(u32, at / page_tokens);
+            defer f.gpa.free(held);
+            if (f.pool.hold(held)) for (held) |id| f.pool.release(id); // its pages go back, as the image's cleanup does
+            return error.LaneMemory;
+        }
         if (at % page_tokens != 0) return error.BadKeptRange;
         const k = try f.gpa.create(Kept);
         errdefer f.gpa.destroy(k);
         const slot = try f.gpa.alloc(u8, words_bytes + fixed_bytes);
         errdefer f.gpa.free(slot);
         @memset(slot, 0);
-        out.resize(f.gpa, at / page_tokens) catch return error.LaneMemory;
-        if (!f.pool.hold(out.items)) return error.LaneMemory; // the pages held for the caller's tree
+        var ids: [page_count]u32 = undefined;
+        const n = at / page_tokens;
+        if (!f.pool.hold(ids[0..n])) return error.LaneMemory; // the pages held for the caller's tree
+        errdefer for (ids[0..n]) |id| f.pool.release(id); // the caller's list sees them once they are all held
         k.* = .{ .at = at, .slot = slot };
         f.live += 1;
         f.blanks += 1;
+        try out.appendSlice(f.gpa, ids[0..n]);
         return k;
     }
 
     fn scatterFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
         const f = of(ptr);
+        f.scatters += 1;
+        if (f.fail_scatter_nth == f.scatters) return error.ScatterFailed;
         const k: *Kept = @ptrCast(@alignCast(saved));
         var o: usize = 0;
         for (ranges) |g| {
@@ -274,7 +288,7 @@ const Rig = struct {
         const np = prompt.len / page_tokens;
         var mine: [page_count]u32 = undefined;
         try t.expect(x.pool.hold(mine[0..np]));
-        x.f.fill(mine[0..np], @intCast(prompt.len));
+        x.f.fill(mine[0..np], @intCast(np * page_tokens)); // the whole pages' rows (a pass's partial last page sits in its stream)
         for (marks) |m| {
             var path: [page_count]u32 = undefined;
             const kept = x.s.keep(prompt, m, null, mine[0 .. m / page_tokens], path[0 .. m / page_tokens]);
@@ -400,4 +414,93 @@ test "TF_KV_SHARE's disk tier: two identities over one root keep their own direc
     x.drain();
     try t.expectEqual(@as(usize, 1), x.r.states.items.len);
     try t.expectEqual(@as(usize, 0), y.r.states.items.len); // the other identity's store holds none of it
+}
+
+/// A restart whose first recall fails at the fake's injected point: the pass runs cold, rank 0's pieces back.
+fn failedRecall(gpa: Allocator, root: []const u8, identity: u64, inject: anytype) !void {
+    const build = struct {
+        fn prompt(comptime n: usize) [n]u32 {
+            var out: [n]u32 = undefined;
+            for (&out, 0..) |*x, i| x.* = @intCast(1 + i % 7);
+            return out;
+        }
+    }.prompt;
+    {
+        const w = try Rig.open(gpa, root, identity);
+        defer w.close();
+        const prompt = build(259); // a state at 256 has a block piece and its own file: two reads
+        try w.pass(&prompt, &.{256});
+        w.drain();
+        try t.expectEqual(@as(usize, 1), w.r.states.items.len);
+    }
+    const x = try Rig.open(gpa, root, identity);
+    defer x.close();
+    inject(x);
+    const longer = build(264);
+    x.f.prompt = &longer;
+    var adopt: std.ArrayList(u32) = .empty;
+    defer {
+        for (adopt.items) |id| x.pool.release(id);
+        adopt.deinit(gpa);
+    }
+    const plan = try x.s.begin(gpa, &longer, 12, &.{}, null, &adopt);
+    defer gpa.free(plan.marks);
+    try t.expectEqual(@as(u32, 0), plan.from); // the pass runs cold: nothing adopted
+    try t.expectEqual(@as(usize, 0), adopt.items.len);
+    try t.expectEqual(@as(usize, page_count), x.pool.available()); // the recall's pages given back
+    try t.expectEqual(@as(usize, 0), x.s.tree.snaps); // the tree unchanged
+    try t.expectEqual(@as(usize, 0), x.s.tree.held_pages);
+    try t.expectEqual(@as(usize, 0), x.f.live); // the blank state dropped (the existing drop path)
+    try t.expectEqual(@as(u64, 1), x.s.tree.counts.disk_recalls_failed); // counted beside the store's others
+    try t.expect(x.r.states.items[0].unreadable); // the state marked: not read again in this process
+    // a second begin for the same prompt does not read the disk again
+    const scatters = x.f.scatters;
+    const blanks = x.f.blanks;
+    const reads = x.r.counts.reads;
+    var adopt2: std.ArrayList(u32) = .empty;
+    defer adopt2.deinit(gpa);
+    const again = try x.s.begin(gpa, &longer, 12, &.{}, null, &adopt2);
+    defer gpa.free(again.marks);
+    try t.expectEqual(@as(u32, 0), again.from);
+    try t.expectEqual(@as(usize, 0), adopt2.items.len);
+    try t.expectEqual(scatters, x.f.scatters);
+    try t.expectEqual(blanks, x.f.blanks);
+    try t.expectEqual(reads, x.r.counts.reads);
+    try t.expectEqual(@as(u64, 1), x.s.tree.counts.disk_recalls_failed); // still the one failure
+}
+
+test "TF_KV_SHARE's disk tier: a recall whose scatter fails midway costs a cold pass, its pages and blank back" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try failedRecall(t.allocator, root, 14, struct {
+        fn go(x: *Rig) void {
+            x.f.fail_scatter_nth = 1; // the block piece fails midway through the read
+        }
+    }.go);
+}
+
+test "TF_KV_SHARE's disk tier: a recall whose seal fails costs a cold pass, its pages and blank back" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try failedRecall(t.allocator, root, 15, struct {
+        fn go(x: *Rig) void {
+            x.f.fail_scatter_nth = 2; // the state's own file fails: it carries the words, where GLM's seal runs
+        }
+    }.go);
+}
+
+test "TF_KV_SHARE's disk tier: a failing blank_pages costs a cold pass, its pages back" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try failedRecall(t.allocator, root, 16, struct {
+        fn go(x: *Rig) void {
+            x.f.fail_blank_pages = true;
+        }
+    }.go);
 }

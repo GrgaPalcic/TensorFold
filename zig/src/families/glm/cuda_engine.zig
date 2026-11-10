@@ -125,6 +125,7 @@ pub const Engine = struct {
     next_snap: u64 = 1, // rank 0: the next id
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    disk_failed: std.AutoHashMapUnmanaged(u64, void) = .empty, // ids whose disk op failed on this rank (cuda_disk_ranks): their later writes are skipped and their seal answers with the failure
     prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
     prompt_bufs: ?prompt_lp.Buffers = null, // their head passes' buffers, made at the first pass that asks
     prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
@@ -281,6 +282,7 @@ pub const Engine = struct {
         e.snaps.deinit(e.gpa);
         if (e.snap_pages) |*p| p.deinit();
         e.dropped.deinit(e.gpa);
+        e.disk_failed.deinit(e.gpa);
         e.shared_buf.free();
         e.freeProfs();
         if (e.prompt_bufs) |*b| b.free();

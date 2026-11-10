@@ -150,7 +150,12 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
     e.tokens = s.gpa.dupe(u32, st.tokens) catch return have;
     e.decode_spans = s.gpa.dupe(modes.Span, st.spans) catch return have;
     e.last = s.gpa.dupe(u32, prompt) catch return have;
-    e.saved = read(r, i) catch return have;
+    e.saved = read(r, i) catch |err| { // the read failed: the state is not read again in this process
+        r.markUnreadable(name);
+        s.counts.disk_recalls_failed += 1;
+        pc.note("imprint: reading {d} tokens back failed ({s}); the state is not read again here", .{ at, @errorName(err) });
+        return have;
+    };
     if (s.family.vtable.charged) |f| e.bytes = f(s.family.ptr, e.saved);
     @import("prompt_cache_index.zig").add(s, e) catch {
         s.family.vtable.drop(s.family.ptr, e.saved);

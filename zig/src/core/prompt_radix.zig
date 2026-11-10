@@ -365,7 +365,15 @@ pub const Store = struct {
             t.evict(s.victim(prompt, found) orelse return found);
         }
         var pages: std.ArrayList(u32) = .empty;
-        const got = rows.read.readPages(r, i, &pages) catch {
+        const name = st.name;
+        const at = st.at;
+        const got = rows.read.readPages(r, i, &pages) catch |err| {
+            // the recall failed: rank 0 stays consistent — the pages it held go back (pool or part), the blank state
+            // is dropped (rows_read's), the tree unchanged, the state not read again here, and the pass runs cold
+            r.markUnreadable(name);
+            t.counts.disk_recalls_failed += 1;
+            note("recalling {d} tokens from disk failed ({s}); the pass prefills from the start", .{ at, @errorName(err) });
+            for (pages.items) |id| t.pages.vtable.release(t.pages.ptr, id);
             pages.deinit(t.gpa);
             return found;
         };

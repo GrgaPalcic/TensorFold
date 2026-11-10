@@ -128,7 +128,7 @@ pub const Entry = struct {
     own: []u32 = &.{}, // the kept prompt's one copy, which `tokens` and at first `last` slice (empty: they own theirs)
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, disk_recalls_failed: u64 = 0 };
 
 pub const RestoreDetails = @import("prompt_cache_restore.zig").Details;
 pub const RestoreLog = @import("prompt_cache_restore.zig").Log;
