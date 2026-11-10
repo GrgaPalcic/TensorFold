@@ -401,10 +401,11 @@ fn answered(e: *Engine, l: *follow.Link, h: follow.Header, rank: u32, state: ?u6
     if (h.top_k == rank) {
         const bytes = std.mem.sliceAsBytes(l.ids);
         const host = bytes[0..h.depth];
-        // `state` is the kept state the op names; a page op names a pool page (no state: a save's read, nothing to
-        // poison, its failure is the answer alone)
+        // a failed read answers with its failure and nothing more: the state it read stays (rank 0 still holds its
+        // copy and may resume from it; a save of it is what is skipped). A state a failed recall dropped here fails
+        // its reads by being gone.
         if (state != null and e.disk_failed.contains(state.?)) ok = 1 else if (body(e, h, host)) |_| {} else |err| {
-            if (state) |id| poison(e, id, err) else std.log.warn("rank {d}: a disk read of page {d} failed ({s}); rank 0's save of it is skipped", .{ e.share.rank, h.a, @errorName(err) });
+            std.log.warn("rank {d}: a disk read for {d} failed ({s}); rank 0's save of it is skipped", .{ e.share.rank, h.a, @errorName(err) });
             ok = 1;
         }
         std.mem.writeInt(u32, bytes[h.depth..][0..status_bytes], ok, .little);
