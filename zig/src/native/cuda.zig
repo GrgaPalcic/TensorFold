@@ -134,6 +134,7 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
+        if (h.prompts) |x| h.host.paged_disk = x.disk; // TF_KV_SHARE with --learn-conversations: its writes ride the host's idle turns
         h.host.kv_parts = h.kv_parts;
         h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
@@ -467,7 +468,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
     const share_limit = if (!share) 0 else if (slots != null) paged.?.snaps else try @import("core").kv_prompts.sharing(); // what its slots hold
     if (comptime @hasDecl(F, "share_attach")) if (share and (if (comptime F.share_kept_ppm == 0) share_limit > 0 else cache > 0)) { // GLM keeps copies: the store opens when its slots hold a state
-        h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
+        h.prompts = try prompt_pages.Adapter.openWith(F, if (F == glm.native) &@import("cuda_glm_disk.zig").image else null, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
         if (o.learn_conversations) if (o.learn) |root| if (F == glm.native) {
             try @import("cuda_glm_disk.zig").attachShare(a, io, &g.ctx, o, root, kernels, loaded, h.prompts.?);
         };

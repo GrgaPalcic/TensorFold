@@ -20,6 +20,14 @@ pub const LeafFilter = struct {
     free: ?*const fn (ctx: *anyopaque) usize = null,
 };
 
+/// A sharded pool's parts as a keep sees them (TF_GLM_KV_SHARD's, cuda_kv_shard.Parts): whether ids all lie in
+/// one part, and a note when a keep is refused for pages that would not. A kept state's path never spans parts.
+pub const Parting = struct {
+    ctx: *anyopaque,
+    one: *const fn (ctx: *anyopaque, ids: []const u32) bool,
+    refused: *const fn (ctx: *anyopaque) void,
+};
+
 /// The state kept at a node's end.
 pub const Entry = struct {
     saved: Saved,
@@ -223,8 +231,8 @@ pub const Tree = struct {
         return up;
     }
 
-    /// Frees the state at `n`, and the nodes below nothing keeps.
-    pub fn evict(t: *Tree, n: *Node) void {
+    /// Frees the state at `n`: its snapshot and its prompt; the node stands until prune takes it.
+    pub fn dropEntry(t: *Tree, n: *Node) void {
         const e = n.entry orelse return;
         if (t.on_evict) |h| h.call(h.ctx, n); // a save still queued is staged now (its pages are held)
         t.family.vtable.drop(t.family.ptr, e.saved);
@@ -232,6 +240,11 @@ pub const Tree = struct {
         n.entry = null;
         t.snaps -= 1;
         t.counts.evicted += 1;
+    }
+
+    /// Frees the state at `n`, and the nodes below nothing keeps.
+    pub fn evict(t: *Tree, n: *Node) void {
+        t.dropEntry(n);
         t.prune(n);
     }
 
@@ -246,6 +259,26 @@ pub const Tree = struct {
             t.drop(n);
             n = parent;
         }
+    }
+
+    /// Whether nothing branches off the path to `n`: it holds no child, and every node above it (to the root) the
+    /// one the path comes through.
+    pub fn alone(t: *const Tree, n: *Node) bool {
+        _ = t;
+        var x: *Node = n;
+        while (x.parent) |parent| {
+            if (x.kids.items.len > @intFromBool(x != n)) return false;
+            x = parent;
+        }
+        return true;
+    }
+
+    /// The path from the root to `n` goes whole (its pages lie in another part than a new state's, and nothing
+    /// branches off it): its states freed, then its nodes pruned from `n` up.
+    pub fn dropChain(t: *Tree, n: *Node) void {
+        var x: ?*Node = n;
+        while (x) |c| : (x = c.parent) if (c.parent != null) t.dropEntry(c);
+        t.prune(n);
     }
 
     /// Whether nothing but the tree holds the pages of `n`.

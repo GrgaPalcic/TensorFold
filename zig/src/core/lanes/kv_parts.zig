@@ -36,6 +36,7 @@ pub const Stats = struct {
     carry_bytes: u64 = 0,
     resumes_dropped: u64 = 0,
     resumes_skipped: u64 = 0,
+    keeps_refused: u64 = 0,
     checks: u64 = 0,
     part: [max_parts]Part = @splat(.{}),
 
@@ -57,6 +58,7 @@ pub const Stats = struct {
         .carry_bytes = "Bytes those carries sent.",
         .resumes_dropped = "Resumes that started from 0: the stream could not go to its home part and carries are off.",
         .resumes_skipped = "Share resumes skipped: the kept prefix would not pay prefilling the tail without a twin, so the pass ran cold.",
+        .keeps_refused = "Share keeps refused: the kept pages and the new ones would span two parts, so nothing was kept.",
         .checks = "Layout digests rank 0 sent (the follower compared each; a difference ends the pair).",
     };
 };

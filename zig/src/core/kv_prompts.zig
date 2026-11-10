@@ -17,6 +17,8 @@ pub const Prompts = struct {
         keep: *const fn (ctx: *anyopaque, prompt: []const u32, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize,
         /// One log line after a prompt pass: where it resumed and how many states it kept.
         report: *const fn (ctx: *anyopaque, prompt: usize, from: u32, kept: u64) void,
+        /// The kept state at `at` for `prompt` goes (a peer could not resume it, or its pages would span the parts).
+        forget: *const fn (ctx: *anyopaque, prompt: []const u32, at: u32) void,
         free: *const fn (ctx: *anyopaque, marks: []const u32) void,
     };
 
@@ -30,6 +32,10 @@ pub const Prompts = struct {
 
     pub fn report(p: Prompts, prompt: usize, from: u32, kept: u64) void {
         p.vtable.report(p.ctx, prompt, from, kept);
+    }
+
+    pub fn forget(p: Prompts, prompt: []const u32, at: u32) void {
+        p.vtable.forget(p.ctx, prompt, at);
     }
 
     pub fn free(p: Prompts, marks: []const u32) void {
@@ -98,6 +104,8 @@ pub const Parts = struct {
     /// `out.len` pages held for a recalled state in one part with room (its pools reclaiming first), global ids
     /// (false: none; a recall's home part, cuda_kv_shard.Parts.choose). Null: the parts cannot hold pages.
     holdPages: ?*const fn (ctx: *anyopaque, out: []u32) bool = null,
+    /// The store refused a keep whose pages would span the parts (TF_GLM_KV_SHARD): the family counts it.
+    refused: *const fn (ctx: *anyopaque) void,
     ctx: *anyopaque,
 };
 

@@ -12,7 +12,7 @@ const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, layout, share };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -232,6 +232,11 @@ pub const Leader = struct {
     /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
     /// others make theirs on this step, its states past the shared store's pages as rank 0's. The pinned bytes each
     /// rank holds come back (0: device pages alone).
+    /// Every rank's `share_pages` follows rank 0's from here on (the disk probe keeps whole copies under TF_KV_SHARE).
+    pub fn sharePages(x: Leader, on: bool) !void {
+        try x.send(.{ .kind = @backingInt(Kind.share), .flags = @intFromBool(on) }, &.{});
+    }
+
     pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
         try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked, .flags = @intFromBool(x.e.share_pages) }, &.{});
         return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
@@ -506,6 +511,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
         },
         .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
         .layout => try checkLayout(e, h.a),
+        .share => e.share_pages = h.flags & 1 != 0,
         .drop => for (ids_in) |id| e.dropState(id),
         .release => e.release(h.slot),
         .idle => cuda.tp_watch.sleep(e.io),

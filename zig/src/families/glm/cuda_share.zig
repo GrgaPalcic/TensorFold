@@ -50,10 +50,22 @@ pub fn of(e: *const engine.Engine) ?kp.Prompts {
 pub const Owner = struct { pending: ?*engine.Kept = null };
 
 /// Before a prompt pass: the deepest kept state's pages in `adopt` (held for the stream), the state in `owner`.
+/// Sharded (TF_GLM_KV_SHARD, on rank 0 where the store is, every build mode): the adopted ids must lie in one
+/// part — on a violation nothing is adopted, the state is evicted (a cold pass is correct, a cross-part resume
+/// is not) and one warning logged.
 pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.ArrayList(u32)) !kp.Plan {
     const prompts = of(e) orelse return error.NoPromptStore;
-    const plan = try prompts.begin(cacheKey(s) orelse return error.ImageCacheKeyRequired, s.history_len, s.shared_prefixes, owner, adopt);
+    const key = cacheKey(s) orelse return error.ImageCacheKeyRequired;
+    const plan = try prompts.begin(key, s.history_len, s.shared_prefixes, owner, adopt);
     defer prompts.free(plan.marks);
+    if (e.pages) |p| if (p.shard) |x| if (adopt.items.len > 0 and !x.parts.onePart(adopt.items)) {
+        const n = adopt.items.len;
+        for (adopt.items) |id| x.parts.release(id); // the begin's holds go back
+        adopt.clearRetainingCapacity();
+        owner.pending = null;
+        prompts.forget(key, plan.from); // the mixed state goes: a later pass runs cold
+        std.log.warn("kv shard: a kept state at {d} tokens holds {d} pages in both parts (TF_GLM_KV_SHARD); it is evicted, the pass runs cold", .{ plan.from, n });
+    };
     const mine = e.gpa.dupe(u32, plan.marks) catch |err| { // the lane's own marks, freed by its allocator
         e.pages.?.give(adopt.items);
         adopt.clearRetainingCapacity();
@@ -84,20 +96,24 @@ pub fn adoptPays(adopted: u32, prompt: usize, pct: u32) bool {
 
 /// TF_KV_SHARE sharded: a resume adopts only when its untwinned tail pays (TF_GLM_KV_SHARE_UNTWINNED_PCT). A
 /// skipped one runs cold as the pass would without a kept state (its twin borrowed, the kept state left in the
-/// store and still resumable), counted in `kv_shard_resumes_skipped_total`. Rank 0 decides — with nothing adopted
-/// the begin step opens the follower's pass cold as it does today. Unsharded (no parts) a resume adopts always.
-pub fn gate(e: *engine.Engine, owner: *Owner, adopt: *std.ArrayList(u32), prompt: usize) void {
-    if (adopt.items.len == 0) return;
-    const p = e.pages orelse return;
-    const x = p.shard orelse return;
-    const at = if (owner.pending) |k| k.at else return;
+/// store and still resumable), counted in `kv_shard_resumes_skipped_total`, and seated in the kept prefix's part
+/// (returned, so the seat takes it as a kept state's home; there the tree's prefix pages and the tail's lie in
+/// one part when the keep comes). Rank 0 decides — with nothing adopted the begin step opens the follower's pass
+/// cold as it does today. Unsharded (no parts) a resume adopts always.
+pub fn gate(e: *engine.Engine, owner: *Owner, adopt: *std.ArrayList(u32), prompt: usize) ?u8 {
+    if (adopt.items.len == 0) return null;
+    const p = e.pages orelse return null;
+    const x = p.shard orelse return null;
+    const at = if (owner.pending) |k| k.at else return null;
     const pct = e.settings.share_untwinned_pct;
-    if (adoptPays(at, prompt, pct)) return;
+    if (adoptPays(at, prompt, pct)) return null;
+    const home = p.partOf(adopt.items[0]); // the kept prefix's part, remembered before the pages go back
     for (adopt.items) |id| x.parts.release(id); // the begin's holds go back, the tree's keep the state resumable
     adopt.clearRetainingCapacity();
     owner.pending = null;
     x.parts.counts.resumes_skipped += 1;
     std.log.debug("kv shard: a share resume's kept {d} tokens stay in the store, its {d}-token tail untwinned does not pay (TF_GLM_KV_SHARE_UNTWINNED_PCT {d}); the pass runs cold", .{ at, prompt -| at, pct });
+    return home;
 }
 
 /// A pass's marks (the engine's Marks.ctx): the mark it stands at, or the last it completed when cancelled, keeps.
