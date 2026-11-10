@@ -111,3 +111,25 @@ test "live half: halfOf keeps both halves when the flag is off, when a layer is 
     try t.expectEqual(@as(?u1, null), layout.halfOf(&same, 2, true));
     try t.expectEqual(@as(?u1, 0), layout.halfOf(&zero, 1, true));
 }
+
+test "live half: with the switch on the plan follows the slot's parity (a uniform one keeps a half, a mixed one both)" {
+    var d = Fake.driver();
+    var layers: [2]weights.Layer = undefined;
+    var w: weights.Weights = undefined;
+    var st = try fixture(&d, &w, &layers);
+    defer st.deinit();
+    defer layout.test_switch = null;
+    layout.test_switch = true;
+    const len = st.kda_layers * st.rec_layer;
+    for (st.cur) |*b| b.* = 1;
+    const one = try layout.Plan.init(&st, &w.config, 2048, null);
+    try t.expectEqual(@as(?u1, 1), one.half);
+    const given = try layout.Plan.withHalf(&st, &w.config, 2048, null, true, 1);
+    try t.expectEqual(given.len, one.len);
+    try t.expectEqual(given.count, one.count);
+    layout.test_switch = false; // the switch off: the same uniform parity keeps both halves, as before it
+    const off = try layout.Plan.init(&st, &w.config, 2048, null);
+    try t.expectEqual(@as(?u1, null), off.half);
+    try t.expectEqual(one.len + len, off.len);
+    try t.expectEqual(off.len, try layout.Plan.size(&st, &w.config, st.capacity, 2048, null)); // the disk store's charge too
+}

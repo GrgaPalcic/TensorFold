@@ -93,11 +93,11 @@ fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ra
 /// image's fixed order, and each other rank's prefix through the link (rank 0's files, as every store's).
 fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
     if (pages.len == 0) return error.NoPages;
-    const sh = try ranks.shape(e);
+    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
+    const sh = try ranks.shapeOf(e, s);
     var list: std.ArrayList(img.Part) = .empty;
     defer list.deinit(e.gpa);
     try img.pageParts(sh, k.at, &list, e.gpa, false);
-    if (!e.snaps.contains(k.id)) return error.NoKeptState;
     const p = e.pages orelse return error.NoPages;
     const page = p.layout.pageBytes();
     const arena: u64 = if (p.arena) |a| a.ptr else return error.NoPages;
@@ -108,11 +108,11 @@ fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.im
     for (ranges) |g| {
         const end = g.off + g.len;
         var base: u64 = 0; // the part's first image byte
-        var lease: u64 = 0; // the slot's bytes before this fixed part
+        var fixed: u64 = 0; // the fixed-part image bytes before this one, past the words
         for (list.items, 0..) |part, pi| {
             defer {
                 base += part.bytes;
-                if (pi > 0 and part.row == 0) lease += part.bytes;
+                if (pi > 0 and part.row == 0) fixed += part.bytes;
             }
             const lo = @max(g.off, base);
             const hi = @min(end, base + part.bytes);
@@ -123,7 +123,9 @@ fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.im
                 @memcpy(host, std.mem.sliceAsBytes(&words)[@intCast(within)..][0..host.len]);
             } else if (part.row > 0) {
                 try pageRows(e, part, sh, pages, within, host, arena, page);
-            } else try ranks.slot(e, 0, k.id, lease + within, host, true);
+            } else if (img.fixedLease(sh, fixed + within)) |at| {
+                try ranks.slot(e, 0, k.id, at, host, true);
+            } else @memset(host, 0); // the dead half's place: a live-half keep's lease holds no bytes there
         }
         try rankPrefixes(e, k.id, g, end, own, o, out, true);
         o += @intCast(g.len);
@@ -136,11 +138,12 @@ fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.im
 /// the gather walks the ranks a piece's bytes come from, all written through rank 0's files.
 fn gatherPagesSharded(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
     if (pages.len == 0) return error.NoPages;
-    const sh = try ranks.shape(e);
+    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
+    const sh = try ranks.shapeOf(e, s);
     var list: std.ArrayList(img.Part) = .empty;
     defer list.deinit(e.gpa);
     try img.pageParts(sh, k.at, &list, e.gpa, true);
-    const home = (e.snaps.get(k.id) orelse return error.NoKeptState).home orelse return error.SnapshotShape; // a sharded state's latent rows are its home part's
+    const home = s.home orelse return error.SnapshotShape; // a sharded state's latent rows are its home part's
     var words = (try ranks.wordsOf(e, k.id)).encode();
     var own: u64 = 0; // rank 0's image bytes: the words, the rows and the fixed parts; the rank prefixes follow
     for (list.items) |part| own += part.bytes;
@@ -148,11 +151,11 @@ fn gatherPagesSharded(e: *Engine, k: *Kept, pages: []const u32, ranges: []const 
     for (ranges) |g| {
         const end = g.off + g.len;
         var base: u64 = 0; // the part's first image byte
-        var lease: u64 = 0; // the slot's bytes before this fixed part
+        var fixed: u64 = 0; // the fixed-part image bytes before this one, past the words
         for (list.items, 0..) |part, pi| {
             defer {
                 base += part.bytes;
-                if (pi > 0 and part.row == 0) lease += part.bytes;
+                if (pi > 0 and part.row == 0) fixed += part.bytes;
             }
             const lo = @max(g.off, base);
             const hi = @min(end, base + part.bytes);
@@ -163,7 +166,9 @@ fn gatherPagesSharded(e: *Engine, k: *Kept, pages: []const u32, ranges: []const 
                 @memcpy(host, std.mem.sliceAsBytes(&words)[@intCast(within)..][0..host.len]);
             } else if (part.row > 0) {
                 try ranks.pageRows(e, part, sh, home, pages, within, host, true);
-            } else try ranks.slot(e, 0, k.id, lease + within, host, true);
+            } else if (img.fixedLease(sh, fixed + within)) |at| {
+                try ranks.slot(e, 0, k.id, at, host, true);
+            } else @memset(host, 0); // the dead half's place: a live-half keep's lease holds no bytes there
         }
         try rankPrefixes(e, k.id, g, end, own, o, out, true);
         o += @intCast(g.len);
@@ -282,22 +287,22 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, r
 /// rank's pool pages get the rows (each holds them) and its lease the fixed parts past its prefix.
 fn scatterPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
     if (pages.len == 0) return error.NoPages;
-    const sh = try ranks.shape(e);
+    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
+    const sh = try ranks.shapeOf(e, s);
     var list: std.ArrayList(img.Part) = .empty;
     defer list.deinit(e.gpa);
     try img.pageParts(sh, k.at, &list, e.gpa, false);
-    if (!e.snaps.contains(k.id)) return error.NoKeptState;
     var own: u64 = 0;
     for (list.items) |part| own += part.bytes;
     var o: usize = 0;
     for (ranges) |g| {
         const end = g.off + g.len;
         var base: u64 = 0;
-        var lease: u64 = 0;
+        var fixed: u64 = 0; // the fixed-part image bytes before this one, past the words
         for (list.items, 0..) |part, pi| {
             defer {
                 base += part.bytes;
-                if (pi > 0 and part.row == 0) lease += part.bytes;
+                if (pi > 0 and part.row == 0) fixed += part.bytes;
             }
             const lo = @max(g.off, base);
             const hi = @min(end, base + part.bytes);
@@ -305,7 +310,9 @@ fn scatterPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.i
             const bytes = in[o + @as(usize, @intCast(lo - g.off)) ..][0..@intCast(hi - lo)];
             const within = lo - base;
             if (pi == 0) continue; // the words went with the seal
-            if (part.row > 0) try ranks.poolRows(e, part, sh, pages, within, bytes) else try fixedParts(e, k.id, lease + within, bytes);
+            if (part.row > 0) try ranks.poolRows(e, part, sh, pages, within, bytes) else if (img.fixedLease(sh, fixed + within)) |at| {
+                try fixedParts(e, k.id, at, bytes);
+            } else {} // the dead half's place: the file's zeros there have no bytes of the lease's
         }
         try rankPrefixes(e, k.id, g, end, own, o, in, false);
         o += @intCast(g.len);
@@ -318,22 +325,23 @@ fn scatterPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.i
 /// lease and every rank's past its prefix.
 fn scatterPagesSharded(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
     if (pages.len == 0) return error.NoPages;
-    const sh = try ranks.shape(e);
+    const s = e.snaps.get(k.id) orelse return error.NoKeptState;
+    const sh = try ranks.shapeOf(e, s);
     var list: std.ArrayList(img.Part) = .empty;
     defer list.deinit(e.gpa);
     try img.pageParts(sh, k.at, &list, e.gpa, true);
-    const home = (e.snaps.get(k.id) orelse return error.NoKeptState).home orelse return error.SnapshotShape;
+    const home = s.home orelse return error.SnapshotShape;
     var own: u64 = 0;
     for (list.items) |part| own += part.bytes;
     var o: usize = 0;
     for (ranges) |g| {
         const end = g.off + g.len;
         var base: u64 = 0;
-        var lease: u64 = 0;
+        var fixed: u64 = 0; // the fixed-part image bytes before this one, past the words
         for (list.items, 0..) |part, pi| {
             defer {
                 base += part.bytes;
-                if (pi > 0 and part.row == 0) lease += part.bytes;
+                if (pi > 0 and part.row == 0) fixed += part.bytes;
             }
             const lo = @max(g.off, base);
             const hi = @min(end, base + part.bytes);
@@ -343,7 +351,9 @@ fn scatterPagesSharded(e: *Engine, k: *Kept, pages: []const u32, ranges: []const
             if (pi == 0) continue; // the words went with the seal
             if (part.row > 0) {
                 try ranks.pageRows(e, part, sh, home, pages, within, @constCast(bytes), false);
-            } else try fixedParts(e, k.id, lease + within, bytes);
+            } else if (img.fixedLease(sh, fixed + within)) |at| {
+                try fixedParts(e, k.id, at, bytes);
+            } else {} // the dead half's place: the file's zeros there have no bytes of the lease's
         }
         try rankPrefixes(e, k.id, g, end, own, o, in, false);
         o += @intCast(g.len);
@@ -421,6 +431,19 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !
     return .{ .hash = std.hash.Wyhash.hash(0x676c6d, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };
 }
 
+/// The store identity's facts: the share's world and shape, the drafter, the caller's layout word (`extra`), and
+/// each rank's prefix — with TF_GLM_KV_LIVE_HALF's own beside them (its store is another directory; with the
+/// switch off the facts, and the identity, are as they have always been).
+fn identityFacts(a: Allocator, e: anytype, sh: img.Shape, extra: []const u64) !std.ArrayList(u64) {
+    var facts: std.ArrayList(u64) = .empty;
+    errdefer facts.deinit(a);
+    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });
+    try facts.appendSlice(a, extra);
+    if (glm.snapshots.layout.liveHalfEnabled()) try facts.append(a, 1);
+    try facts.appendSlice(a, prefixes);
+    return facts;
+}
+
 /// --learn-conversations: every rank's prefix read, the identity probed on this thread, the store attached.
 pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
     const e: *Engine = loaded.target;
@@ -428,9 +451,8 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     try ranks.prefixes(e, prefix_buf[0..e.share.world]);
     prefixes = prefix_buf[0..e.share.world];
     const sh = try ranks.shape(e);
-    var facts: std.ArrayList(u64) = .empty;
-    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });
-    try facts.appendSlice(a, prefixes);
+    var facts = try identityFacts(a, e, sh, &.{});
+    defer facts.deinit(a);
     const p = try probe(a, io, loaded.backend, e);
     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
     const gibs = struct {
@@ -471,11 +493,9 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
     try ranks.prefixes(e, prefix_buf[0..e.share.world]);
     prefixes = prefix_buf[0..e.share.world];
     const sh = try ranks.shape(e);
-    var facts: std.ArrayList(u64) = .empty;
-    defer facts.deinit(a);
     // 1: the pages layout, 2 beside the shard — the copy layout's store, the pages one and the sharded pages one never mix
-    try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null), 1 + @intFromBool(sharded) });
-    try facts.appendSlice(a, prefixes);
+    var facts = try identityFacts(a, e, sh, &.{1 + @intFromBool(sharded)});
+    defer facts.deinit(a);
     const was = e.share_pages;
     const held = if (e.pages) |pg| pg.prompts else null;
     // the probe keeps a whole copy through its own mark hook, as without the share: the store stands aside for it
@@ -512,6 +532,27 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "the store identity's facts: TF_GLM_KV_LIVE_HALF's own beside them; off, the facts as before" {
+    const layout = glm.snapshots.layout;
+    const fake = .{ .share = .{ .world = 2 }, .drafter = @as(?*u8, null) };
+    const sh = std.mem.zeroes(img.Shape);
+    defer layout.test_switch = null;
+    layout.test_switch = false;
+    const off = try identityFacts(t.allocator, &fake, sh, &.{});
+    defer off.deinit(t.allocator);
+    const again = try identityFacts(t.allocator, &fake, sh, &.{});
+    defer again.deinit(t.allocator);
+    try t.expectEqualSlices(u64, again.items, off.items); // the switch off (or unset): the identity as before
+    layout.test_switch = true;
+    const on = try identityFacts(t.allocator, &fake, sh, &.{1}); // attachShare's layout word beside the rest
+    defer on.deinit(t.allocator);
+    try t.expectEqual(off.items.len + 1, on.items.len);
+    try t.expectEqualSlices(u64, off.items[0..7], on.items[0..7]); // the share's facts first, as they have been
+    try t.expectEqual(@as(u64, 1), on.items[7]); // the pages layout's word, then the live half's
+    try t.expectEqual(@as(u64, 1), on.items[8]); // its own: another directory, the sets never mix
+    try t.expectEqual(@as(u64, 1), on.items[on.items.len - 1]); // rank 1's prefix last, as before
 }
 
 test "TF_GLM_LEARN_STAGING_GIB: unset keeps the store's 1 GiB, a number gives whole pages of GiB, anything else is refused" {

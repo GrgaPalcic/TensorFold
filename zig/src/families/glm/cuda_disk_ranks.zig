@@ -27,6 +27,12 @@ pub fn shape(e: anytype) !image.Shape {
     return image.Shape.of(&e.cur.st, &e.c, e.capacity, e.mtp);
 }
 
+/// The image shape of a kept state's copy: `shape` with the state's own parity (`s.cur`) — the slot's may have
+/// moved on since the keep, and a live-half keep's image follows the keep's half, as its lease was laid out.
+pub fn shapeOf(e: anytype, s: anytype) !image.Shape {
+    return image.Shape.ofCur(&e.cur.st, &e.c, e.capacity, e.mtp, s.cur);
+}
+
 /// A kept state's home part under TF_GLM_KV_SHARD, the part whose rank holds its latent rows (null: unsharded).
 pub fn homeOf(e: anytype, s: anytype) ?u8 {
     return if (e.settings.kv_shard.on) s.home else null;
@@ -51,7 +57,7 @@ pub fn wordsOf(e: anytype, id: u64) !image.Words {
 /// Off its home rank a sharded state's latent rows are absent (KvShardAbsent): `route` asks only the home for them.
 pub fn copy(e: anytype, id: u64, off: u64, host: []u8, out: bool) !void {
     const s = e.snaps.get(id) orelse return error.NoKeptState;
-    const sh = try shape(e);
+    const sh = try shapeOf(e, s);
     const at: u32 = @intCast(s.pos);
     if (s.len == 0 and off + host.len > image.Words.bytes + image.front(sh, at)) return error.DiskOrder;
     var segs: std.ArrayList(image.Seg) = .empty;

@@ -3,6 +3,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const st_mod = @import("cuda_state.zig");
 const sparse = @import("cuda_sparse.zig");
+const layout = @import("cuda_snapshot_layout.zig");
 const Config = @import("config.zig").Config;
 const pages = @import("cuda_snapshot_pages.zig");
 const State = st_mod.State;
@@ -82,8 +83,32 @@ pub const Shape = struct {
     pooled_row: u32,
     capacity: u32,
     head: bool, // the MTP head's caches are kept (drafting)
+    half: ?u1 = null, // TF_GLM_KV_LIVE_HALF: the KDA half a keep of this parity carries (null: the head whole)
+    dead: u64 = 0, // the dead half's first byte in the prefix (its place, `half_len` wide, is no lease's)
+    half_len: u64 = 0, // a KDA half's bytes
 
     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
+        return ofCur(st, c, capacity, head, st.cur);
+    }
+
+    /// `of` with a kept state's own parity (`cur`): its copy's half follows it, not the slot's (the slot's may
+    /// have moved on since the keep, as layout.Plan's `initFor` plans by the keep's).
+    pub fn ofCur(st: *const State, c: *const Config, capacity: usize, head: bool, cur: []const u1) !Shape {
+        var sh = try ofWhole(st, c, capacity, head);
+        if (layout.halfOf(cur, st.kda_layers, layout.liveHalfEnabled())) |h| {
+            const len = st.kda_layers * st.rec_layer;
+            const dead = st.rec + @as(u64, 1 - h) * len;
+            if (dead < st.arena.buf.ptr) return error.SnapshotShape;
+            const at: u64 = dead - st.arena.buf.ptr;
+            if (at > sh.prefix or sh.prefix - at < len) return error.SnapshotShape;
+            sh.half = h;
+            sh.dead = at;
+            sh.half_len = len;
+        }
+        return sh;
+    }
+
+    fn ofWhole(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
         if (st.rings.len == 0) return error.SnapshotShape;
         const base = st.arena.buf.ptr;
         const first = if (st.table != 0) st.rings[0] else if (st.caches.len > 0) st.caches[0].lc else st.mtp_caches.lc;
@@ -204,15 +229,13 @@ pub fn segmentsFor(sh: Shape, at: u32, mtp_len: u64, latent: bool, out: *std.Arr
     var img: u64 = Words.bytes;
     var lease: u64 = 0;
     try out.append(a, .{ .img = 0, .len = Words.bytes, .from = .words });
+    try prefixSegs(sh, &img, &lease, out, a);
     if (latent or mut(.copy_keeps_latent)) {
-        const f = front(sh, at);
-        try out.append(a, .{ .img = img, .len = f, .from = .{ .lease = 0 } });
-        img += f;
-        lease += f;
+        const rows = front(sh, at) - sh.prefix; // every DSA layer's parts, contiguous in the lease past the prefix
+        if (rows > 0) try out.append(a, .{ .img = img, .len = rows, .from = .{ .lease = lease } });
+        img += rows;
+        lease += rows;
     } else {
-        if (sh.prefix > 0) try out.append(a, .{ .img = img, .len = sh.prefix, .from = .{ .lease = 0 } });
-        img += sh.prefix;
-        lease += sh.prefix;
         const c = cache(sh, at);
         for (0..sh.layers) |_| {
             if (c[0] + c[1] > 0) try out.append(a, .{ .img = img, .len = c[0] + c[1], .from = .absent });
@@ -232,6 +255,26 @@ pub fn segmentsFor(sh: Shape, at: u32, mtp_len: u64, latent: bool, out: *std.Arr
     if (sh.tail > 0) try out.append(a, .{ .img = img, .len = sh.tail, .from = .{ .lease = lease } });
 }
 
+/// The image's prefix section as a kept state's lease holds it: one run, or a live-half keep's two around the dead
+/// half's place (zeros in the image, no bytes in the lease). `img` and `lease` move past the section.
+fn prefixSegs(sh: Shape, img: *u64, lease: *u64, out: *std.ArrayList(Seg), a: std.mem.Allocator) !void {
+    if (sh.half == null) {
+        if (sh.prefix > 0) try out.append(a, .{ .img = img.*, .len = sh.prefix, .from = .{ .lease = 0 } });
+        img.* += sh.prefix;
+        lease.* += sh.prefix;
+        return;
+    }
+    if (sh.dead > 0) try out.append(a, .{ .img = img.*, .len = sh.dead, .from = .{ .lease = 0 } });
+    img.* += sh.dead;
+    lease.* += sh.dead;
+    try out.append(a, .{ .img = img.*, .len = sh.half_len, .from = .zeros }); // the dead half's place: no lease's
+    img.* += sh.half_len;
+    const rest = sh.prefix - sh.dead - sh.half_len;
+    if (rest > 0) try out.append(a, .{ .img = img.*, .len = rest, .from = .{ .lease = lease.* } });
+    img.* += rest;
+    lease.* += rest;
+}
+
 /// The image bytes after the words that sit in the lease as in the image: the prefix and every DSA layer's parts.
 pub fn front(sh: Shape, at: u32) u64 {
     var n: u64 = sh.prefix;
@@ -241,7 +284,8 @@ pub fn front(sh: Shape, at: u32) u64 {
     return n;
 }
 
-/// The lease bytes of a state at `at` whose head holds `mtp_len` rows (layout.Plan's length for it).
+/// The lease bytes of a state at `at` whose head holds `mtp_len` rows (layout.Plan's length for it). A live-half
+/// keep's lease leaves the dead KDA half out (`half_len` bytes of the prefix).
 pub fn leaseBytes(sh: Shape, at: u32, mtp_len: u64) u64 {
     var n: u64 = sh.prefix + sh.tail;
     for (0..sh.layers) |_| for (cache(sh, at)) |x| {
@@ -250,7 +294,17 @@ pub fn leaseBytes(sh: Shape, at: u32, mtp_len: u64) u64 {
     if (sh.head) for (cache(sh, mtp_len)) |x| {
         n += x;
     };
-    return n;
+    return n - sh.half_len;
+}
+
+/// The slot-lease offset of a pages-layout fixed part's image byte `x` past the words: a live-half keep's lease
+/// holds the prefix around its dead half, whose place (`half_len` bytes from `dead`) no byte of the lease holds
+/// (null), and the lease past it sits `half_len` lower than its image place.
+pub fn fixedLease(sh: Shape, x: u64) ?u64 {
+    if (sh.half == null) return x;
+    if (x < sh.dead) return x;
+    if (x < sh.dead + sh.half_len) return null;
+    return x - sh.half_len;
 }
 
 /// Rank 0's image bytes at `at` (its head counted at a verify window past `at`).

@@ -183,6 +183,11 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
     if (s.len != 0) return error.StateKept;
     if (s.cur.len > 64 or (s.cur.len < 64 and cur >> @intCast(s.cur.len) != 0)) return error.DiskWords;
+    // the words' parity first: the blank's is zeros, and the state's size and half follow the keep's, not the slot's
+    for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
+    // TF_GLM_KV_LIVE_HALF: the disk image lays a state's parts out as a live-half keep's lease, whose dead half
+    // has no bytes; a state whose words say both halves (a keep with layers on both) has no such image here
+    if (layout.liveHalfEnabled() and layout.halfOf(s.cur, e.cur.st.kda_layers, true) == null) return error.DiskWords;
     const head = if (e.mtp) @min(e.capacity, s.pos + @import("cuda_state.zig").window_rows) else 0;
     if (mtp_len > head) return error.DiskWords;
     const rows = e.cur.st.ring_rows;
@@ -195,7 +200,6 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     else
         try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own, s.cur);
     if (n == 0 or n > s.lease.count() * pages.page) return error.SnapshotSize;
-    for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
     s.len = n;
     s.mtp_len = mtp_len;
     s.bases = bases;

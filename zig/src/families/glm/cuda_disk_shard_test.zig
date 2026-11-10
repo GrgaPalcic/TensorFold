@@ -270,6 +270,9 @@ fn pattern(rank: usize, k: usize, j: usize) u8 {
     return if (k == 0) @truncate(rank *% 97 +% j *% 13 +% 1) else @truncate(k *% 131 +% j *% 7 +% 3);
 }
 
+/// The parity a fill's KDA copy bits take (null: mixed, as the other tests'): a live-half keep's.
+var fill_parity: ?u1 = null;
+
 /// Each part of the bound sequence's full plan at `at` (on a rank that does not hold its latent rows, those land on
 /// the trash page), filled with `pattern`; then its position and head rows set as a pass leaves them.
 fn fill(e: *Engine) !void {
@@ -284,7 +287,7 @@ fn fill(e: *Engine) !void {
     }
     const bits = try e.gpa.alloc(u1, e.cur.st.cur.len);
     defer e.gpa.free(bits);
-    for (bits, 0..) |*b, i| b.* = @intCast(i & 1);
+    for (bits, 0..) |*b, i| b.* = if (fill_parity) |h| h else @intCast(i & 1);
     try e.cur.st.restoreHost(e.stream, at, 0, bits, .{ 0, 0 });
 }
 
@@ -298,8 +301,7 @@ const Parts = struct {
         const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true, e.cur.st.cur);
         var out: Parts = .{ .count = plan.count };
         for (plan.parts[0..plan.count], 0..) |part, k| {
-            out.lat[k] = k == 1 or k == 2; // the DSA layer's codes, then its E4M3 scales (`lat` marks them sharded)
-            if (part.lat and !out.lat[k]) return error.Mismatch;
+            out.lat[k] = part.lat; // the DSA layer's codes and scales: the home rank's alone (sharded; a live-half keep's head in two parts shifts them)
             out.bytes[k] = try e.gpa.alloc(u8, part.len);
             var done: usize = 0;
             while (done < part.len) {
@@ -664,4 +666,63 @@ test "GLM disk image: each sharded disk mutant is caught" {
     try p.init(true, true);
     defer p.deinit();
     try expectError(error.Mismatch, roundTrip(&p, &p, 1, true));
+}
+
+test "GLM disk image: a live-half keep round-trips through an image, sharded and unsharded, carried too" {
+    defer layout.test_switch = null;
+    defer fill_parity = null;
+    layout.test_switch = true;
+    fill_parity = 1; // every KDA layer on half 1: the keeps carry the live half alone
+    for ([_]u8{ 0, 1 }) |home| for ([_]bool{ false, true }) |away| {
+        var p: Pair = undefined;
+        try p.init(true, true);
+        defer p.deinit();
+        try expectEqual(away, try roundTrip(&p, &p, home, away)); // the half keep written, read and restored
+    };
+    var p: Pair = undefined;
+    try p.init(false, true);
+    defer p.deinit();
+    try expect(!try roundTrip(&p, &p, null, false)); // unsharded: the same, no home and no carry
+}
+
+// The startup probe's shape (cuda_glm_disk.probe, run with the store standing aside): a keep at the mark, the
+// whole store image gathered in one range, and each rank's shared bytes compared equal to the image's.
+test "GLM disk image: the startup probe's keep and whole-image gather pass under TF_GLM_KV_LIVE_HALF, the ranks' shared bytes the image's" {
+    const a = std.testing.allocator;
+    defer layout.test_switch = null;
+    defer fill_parity = null;
+    layout.test_switch = true;
+    fill_parity = 1;
+    for ([_]bool{ false, true }) |on| {
+        var p: Pair = undefined;
+        try p.init(on, true);
+        defer p.deinit();
+        try p.open(1, prompt, null);
+        defer p.close(1);
+        try p.bind(1);
+        for (&p.r) |*x| try fill(&x.e);
+        for (&p.r) |*x| try snapshots.keepAs(&x.e, 1);
+        const pre = try prefixesOf(&p);
+        const sh = try ranks.shape(&p.r[0].e);
+        const home = ranks.homeOf(&p.r[0].e, p.r[0].e.snaps.get(1).?);
+        const own = image.imageBytes(sh, at);
+        const total = own + pre[1];
+        const bytes = try a.alloc(u8, @intCast(total));
+        defer a.free(bytes);
+        const one = [1]Range{.{ .off = 0, .len = total }};
+        try ranks.gatherWith(Io{ .p = &p, .id = 1 }, sh, &pre, at, home, &one, bytes, a); // one range, as the probe's
+        const shared = bytes[@intCast(image.Words.bytes + sh.prefix)..@intCast(own)];
+        const theirs = try a.alloc(u8, shared.len);
+        defer a.free(theirs);
+        for (pre[1..], 1..) |q, r| {
+            var held: std.ArrayList([2]u64) = .empty;
+            defer held.deinit(a);
+            try image.heldShared(sh, at, if (home) |h| h == r else true, &held, a);
+            for (held.items) |x| {
+                const part = theirs[@intCast(x[0])..][0..@intCast(x[1])];
+                try ranks.copy(&p.r[r].e, 1, image.Words.bytes + q + x[0], part, true); // that rank's copy of what it holds
+                try expect(std.mem.eql(u8, shared[@intCast(x[0])..][0..part.len], part));
+            }
+        }
+    }
 }

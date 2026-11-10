@@ -8,9 +8,13 @@ const sparse = @import("cuda_sparse.zig");
 
 /// TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone; nothing reads the dead half after a restore.
 pub fn liveHalfEnabled() bool {
+    if (test_switch) |on| return on; // a host test's word only: production never sets it, the environment rules
     const v = std.c.getenv("TF_GLM_KV_LIVE_HALF") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
+
+/// The switch as a host test holds it (null: the environment's word). Tests set and reset it around a case.
+pub var test_switch: ?bool = null;
 
 /// The half a plan keeps: `on` with every KDA layer on the same half gives that half; otherwise both (null).
 pub fn halfOf(cur: []const u1, layers: usize, on: bool) ?u1 {

@@ -4,8 +4,9 @@ const cuda = @import("cuda");
 const weights = @import("cuda_weights.zig");
 const shard = @import("cuda_shard.zig");
 const image = @import("cuda_disk_image.zig");
+const layout = @import("cuda_snapshot_layout.zig");
 const State = @import("cuda_state.zig").State;
-const Plan = @import("cuda_snapshot_layout.zig").Plan;
+const Plan = layout.Plan;
 const pages = @import("cuda_snapshot_pages.zig");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -213,6 +214,144 @@ fn roundTrip(dev_bytes: u64, host_bytes: u64) !void {
     for (plan.parts[0..plan.count], into.parts[0..into.count]) |x, y| {
         try std.testing.expectEqualSlices(u8, H.bytes(x.live, x.len), H.bytes(y.live, y.len));
     }
+}
+
+test "GLM disk image: a live-half keep's shape splits the prefix at its dead half, and its lease bytes are the half plan's" {
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const c = &m.w.config;
+    var st = try State.initFormat(std.testing.allocator, &d, &m.w, capacity, true);
+    defer st.deinit();
+    defer layout.test_switch = null;
+    layout.test_switch = true;
+    const at: u32 = 4096;
+    const mtp: u64 = at - 1;
+    const len = st.kda_layers * st.rec_layer;
+    try expect(len > 0);
+    for ([_]u1{ 0, 1 }) |h| {
+        for (st.cur) |*b| b.* = h;
+        const sh = try image.Shape.of(&st, c, capacity, true);
+        try expectEqual(@as(?u1, h), sh.half);
+        try expectEqual(len, sh.half_len);
+        try expectEqual(st.rec + @as(u64, 1 - h) * len - st.arena.buf.ptr, sh.dead);
+        const plan = try Plan.init(&st, c, at, mtp); // the keep plans by the slot's parity, as the image does
+        try expectEqual(plan.len, image.leaseBytes(sh, at, mtp));
+        // the image itself is as before: the dead half's place stays in it (zeros), the lease is what is shorter
+        const whole = try image.Shape.ofCur(&st, c, capacity, true, &.{});
+        try expectEqual(@as(?u1, null), whole.half);
+        try expectEqual(plan.len + len, image.leaseBytes(whole, at, mtp));
+        try expectEqual(image.imageBytes(whole, at), image.imageBytes(sh, at));
+    }
+    for (st.cur, 0..) |*b, i| b.* = @intCast(i & 1); // layers on both halves: a keep of both, as without the switch
+    const sh = try image.Shape.of(&st, c, capacity, true);
+    try expectEqual(@as(?u1, null), sh.half);
+    const plan = try Plan.init(&st, c, at, mtp);
+    try expectEqual(plan.len, image.leaseBytes(sh, at, mtp));
+}
+
+test "GLM disk image: a pages-layout fixed part's lease place follows the half, the dead half's place none" {
+    var sh: image.Shape = .{ .prefix = 100, .tail = 1, .layers = 1, .latent = 8, .scales = false, .ring_rows = 4, .ring_row = 16, .pk_rows = 4, .pooled_row = 8, .capacity = 64, .head = false };
+    try expectEqual(@as(?u64, 40), image.fixedLease(sh, 40)); // no half: the image place is the lease place
+    sh.half = 1;
+    sh.dead = 30;
+    sh.half_len = 10;
+    try expectEqual(@as(?u64, 29), image.fixedLease(sh, 29)); // before the dead half: as before it
+    try expectEqual(@as(?u64, null), image.fixedLease(sh, 30)); // its place: no byte of the lease's
+    try expectEqual(@as(?u64, null), image.fixedLease(sh, 39));
+    try expectEqual(@as(?u64, 30), image.fixedLease(sh, 40)); // past it: the lease sits half_len higher in the image
+    try expectEqual(@as(?u64, 70), image.fixedLease(sh, 80));
+}
+
+test "GLM disk image: a live-half keep's image read out of its lease restores the live half, the dead half's place zeros" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const c = &m.w.config;
+    defer layout.test_switch = null;
+    layout.test_switch = true;
+    var st = try State.initFormat(a, &d, &m.w, capacity, false);
+    defer st.deinit();
+    for (H.bytes(st.arena.buf.ptr, st.arena.buf.len), 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    var pool = try pages.Pool.initTiers(a, &d, 64 << 20, 0);
+    defer pool.deinit();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const at: u32 = 2048;
+    const mtp: u64 = at - 1;
+    for ([_]u1{ 0, 1 }) |h| {
+        for (st.cur) |*b| b.* = h;
+        const sh = try image.Shape.of(&st, c, capacity, true);
+        const plan = try Plan.init(&st, c, at, mtp);
+        var kept = try pool.take(plan.len);
+        defer pool.give(&kept);
+        try pool.move(stream, &kept, &plan, true);
+        var segs: std.ArrayList(image.Seg) = .empty;
+        defer segs.deinit(a);
+        try image.segments(sh, at, mtp, &segs, a);
+        const last = segs.items[segs.items.len - 1];
+        const img = try a.alloc(u8, @intCast(last.img + last.len));
+        defer a.free(img);
+        const bits = ((@as(u64, 1) << @intCast(st.cur.len)) - 1) * h;
+        var words = (image.Words{ .at = at, .mtp_len = mtp, .base = 0, .mtp_base = 0, .cur = bits }).encode();
+        const out: image.Copy = .{ .d = &d, .pool = &pool, .lease = &kept, .segs = segs.items, .words = &words };
+        const cut = [_]u64{ 0, 1000, plan.len / 2, img.len };
+        for (cut[0..3], cut[1..]) |lo, hi| try out.run(lo, img[@intCast(lo)..@intCast(hi)], true);
+        for (segs.items) |s| if (s.from == .zeros) for (img[@intCast(s.img)..][0..@intCast(s.len)]) |b| try expectEqual(@as(u8, 0), b); // the dead half's place, the head's unfilled rows
+        // a blank state as a disk read takes it (the half plan's lease), filled from the image and restored
+        var blank = try pool.take(@intCast(image.leaseBytes(sh, at, mtp)));
+        defer pool.give(&blank);
+        var back: [image.Words.count]u64 = undefined;
+        const in: image.Copy = .{ .d = &d, .pool = &pool, .lease = &blank, .segs = segs.items, .words = &back };
+        try in.run(0, img, false);
+        const w = try image.Words.decode(back, at);
+        try expectEqual(bits, w.cur);
+        var fresh = try State.initFormat(a, &d, &m.w, capacity, false);
+        defer fresh.deinit();
+        for (fresh.cur) |*b| b.* = h; // the words' parity: a restore plans by the keep's half, not the slot's
+        const into = try Plan.init(&fresh, c, at, w.mtp_len);
+        try expectEqual(plan.len, into.len);
+        try pool.move(stream, &blank, &into, false);
+        for (plan.parts[0..plan.count], into.parts[0..into.count]) |x, y| {
+            try std.testing.expectEqualSlices(u8, H.bytes(x.live, x.len), H.bytes(y.live, y.len));
+        }
+    }
+}
+
+test "GLM disk image: under TF_GLM_KV_LIVE_HALF a disk state's seal takes a half's parity and refuses both" {
+    const snaps = @import("cuda_snapshots.zig");
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const a = std.testing.allocator;
+    var e: Fake = .{ .gpa = a, .d = &d, .stream = .{ .d = &d, .handle = null }, .c = m.w.config, .cur = .{ .st = try State.initFormat(a, &d, &m.w, capacity, false) } };
+    defer e.cur.st.deinit();
+    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20);
+    defer e.snap_pages.?.deinit();
+    try e.snaps.ensureTotalCapacity(a, 8);
+    defer e.snaps.deinit(a);
+    const at: u32 = 2048;
+    defer layout.test_switch = null;
+    layout.test_switch = true;
+    try snaps.blankAs(&e, 5, at, null, 0);
+    defer {
+        var s = e.snaps.get(5).?;
+        snaps.free(&e, &s);
+    }
+    try expectError(error.DiskWords, snaps.seal(&e, 5, at - 1, .{ 3, 5 }, 0b01)); // layers on both halves: no such image here
+    try snaps.seal(&e, 5, at - 1, .{ 3, 5 }, 0b11); // one half's parity: sealed, its lease the half plan's
+    const s = e.snaps.get(5).?;
+    const sh = try image.Shape.of(&e.cur.st, &e.c, capacity, true);
+    try expectEqual(image.leaseBytes(sh, at, at - 1), @as(u64, s.len));
+    try std.testing.expectEqualSlices(u1, &.{ 1, 1 }, s.cur);
+    layout.test_switch = false;
+    try snaps.blankAs(&e, 6, at, null, 0);
+    defer {
+        var gone = e.snaps.get(6).?;
+        snaps.free(&e, &gone);
+    }
+    try snaps.seal(&e, 6, at - 1, .{ 3, 5 }, 0b01); // the switch off: both halves seal, as before
+    try std.testing.expectEqualSlices(u1, &.{ 1, 0 }, e.snaps.get(6).?.cur);
 }
 
 test "GLM disk image: the store's image is rank 0's then each other rank's prefix, and routes every byte once" {
