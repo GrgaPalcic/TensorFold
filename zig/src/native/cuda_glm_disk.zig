@@ -462,7 +462,7 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
     const raw = std.c.getenv("TF_GLM_LEARN_STAGING_GIB");
     const named = raw != null and std.mem.trim(u8, std.mem.span(raw.?), " \t").len > 0;
     const staging_bytes = try stagingOf(if (raw) |v| std.mem.span(v) else null);
-    const r = try rows.Rows.open(x.gpa, x.store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = x.store.rules.lookahead, .planned = x.store.rules.planned, .grid = x.store.rules.grid, .staging_bytes = staging_bytes });
+    const r = try rows.Rows.open(x.gpa, x.store.tree.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = x.store.rules.lookahead, .planned = x.store.rules.planned, .grid = x.store.rules.grid, .staging_bytes = staging_bytes });
     r.prefill_rate = p.rate;
     x.store.attachDisk(r);
     x.disk = r;
