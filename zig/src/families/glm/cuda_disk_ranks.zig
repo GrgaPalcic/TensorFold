@@ -2,13 +2,19 @@
 //! A KV-sharded state (TF_GLM_KV_SHARD) is written and read as each rank holds it: its latent rows on its home rank
 //! alone, every other byte on every rank; the store image is the same as an unsharded state's.
 const std = @import("std");
+const cuda = @import("cuda");
 const follow = @import("cuda_follow.zig");
 const image = @import("cuda_disk_image.zig");
+const pages_mod = @import("cuda_pages.zig");
+const snapshots = @import("cuda_snapshots.zig");
+const kvs = @import("cuda_kv_shard.zig");
 const Engine = @import("cuda_engine.zig").Engine;
 
 /// A disk step's op (Header.flags); its id is `a`, its image offset `seed`, its bytes `depth`, its rank `top_k`; a
-/// blank's home part + 1 in `depth` (0: unsharded).
-pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes };
+/// blank's home part + 1 in `depth` and the pages a recall holds in `top_k`. A page op's page is `a` (a key page's
+/// global id, a latent page's part-local one), the byte in the page `seed`: rank 0's pool pages are read and written
+/// through them (the other ranks' beside TF_GLM_KV_SHARD and on a read-back), a slot's lease through `slot`.
+pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, key_put, lat_put, lat_take, slot_put, slot_take, page_put, page_take };
 const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
 
 /// This rank's image shape (every sequence of the engine has the same).
@@ -78,14 +84,14 @@ pub fn readHome(e: anytype) ?u8 {
 }
 
 /// Rank 0: a new id leased at `at` on every rank (rank 0 first: the ranks' pools match, so theirs cannot fail apart),
-/// under TF_GLM_KV_SHARD in its home part (`readHome`) on every rank.
-pub fn blank(e: *Engine, at: u32) !u64 {
+/// under TF_GLM_KV_SHARD in its home part on every rank, and with the pages layout's shared page count recorded on
+/// every rank (a recall's: its slot's parts past the pages, on every rank as a keep records its own).
+pub fn blank(e: *Engine, at: u32, home: ?u8, shared: u32) !u64 {
     if (e.next_snap > std.math.maxInt(u32)) return error.SnapshotIdLimit;
     const id = e.next_snap;
-    const home = readHome(e);
-    try e.blankAs(id, at, home);
+    try e.blankAs(id, at, home, shared);
     e.next_snap += 1;
-    if (leader(e)) |x| try x.disk(.{ .kind = kind, .flags = @backingInt(Op.blank), .a = id, .seed = at, .depth = if (home) |h| @as(u32, h) + 1 else 0 }, &.{});
+    if (leader(e)) |x| try x.disk(.{ .kind = kind, .flags = @backingInt(Op.blank), .a = id, .seed = at, .depth = if (home) |h| @as(u32, h) + 1 else 0, .top_k = shared }, &.{});
     return id;
 }
 
@@ -125,6 +131,167 @@ pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
     if (leader(e)) |x| {
         const words = w.encode();
         try x.disk(.{ .kind = kind, .flags = @backingInt(Op.seal), .a = id }, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&words)));
+    }
+}
+
+/// This rank's shard (null: unsharded): its parts' pools, its key pages (every page's, global ids) and its own part's
+/// latent pages (part-local ids, the trash page last).
+fn shard(e: *Engine) !*pages_mod.Shard {
+    const p = e.pages orelse return error.NoPages;
+    return p.shard orelse error.SnapshotShape;
+}
+
+/// Rank `rank`'s key page `id` (its global id; both ranks hold every page's keys) bytes [off, off + host.len), out
+/// (its pages to host) or in; rank 0's directly, another rank's through the link in pieces.
+pub fn keyPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool) !void {
+    const x0 = try shard(e);
+    if (rank == 0) return shardBytes(e, x0.keys orelse return error.NoPages, x0.g.keyPage(), id, off, host, out);
+    const x = leader(e) orelse return error.NoRank;
+    const room = x.link.ids.len * 4;
+    var done: usize = 0;
+    while (done < host.len) {
+        const n = @min(room, host.len - done);
+        if (out) {
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+            try x.link.from(rank, n);
+            try x.link.buf.download(64, host[done..][0..n]);
+        } else {
+            @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.key_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+        }
+        done += n;
+    }
+}
+
+/// Rank `rank`'s latent page `id` (its part-local id; the home rank's alone hold a sharded state's latent rows) bytes
+/// [off, off + host.len), out or in; rank 0's directly, another rank's through the link in pieces.
+pub fn latPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool) !void {
+    const x0 = try shard(e);
+    if (rank == 0) return shardBytes(e, x0.lat orelse return error.NoPages, x0.g.latPage(), id, off, host, out);
+    const x = leader(e) orelse return error.NoRank;
+    const room = x.link.ids.len * 4;
+    var done: usize = 0;
+    while (done < host.len) {
+        const n = @min(room, host.len - done);
+        if (out) {
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+            try x.link.from(rank, n);
+            try x.link.buf.download(64, host[done..][0..n]);
+        } else {
+            @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.lat_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+        }
+        done += n;
+    }
+}
+
+fn words4(n: usize) usize {
+    return (n + 3) / 4;
+}
+
+/// One page's bytes [off, off + host.len) in a rank's key or latent pages (a run never crosses a page).
+fn shardBytes(e: *Engine, buf: cuda.DeviceBuffer, stride: u64, id: u32, off: u64, host: []u8, out: bool) !void {
+    if (off + host.len > stride) return error.SnapshotShape;
+    const base = buf.ptr + @as(u64, id) * stride + off;
+    if (out) try e.d.check(e.d.api.cuMemcpyDtoH_v2(host.ptr, base, host.len), "cuMemcpyDtoH") else try e.d.check(e.d.api.cuMemcpyHtoD_v2(base, host.ptr, host.len), "cuMemcpyHtoD");
+}
+
+/// Rank `rank`'s slot lease bytes [off, off + host.len) of `id`, out or in (its raw lease offsets, a pages layout's
+/// fixed parts packed past its prefix); rank 0's directly, another rank's through the link in pieces.
+pub fn slot(e: *Engine, rank: u32, id: u64, off: u64, host: []u8, out: bool) !void {
+    if (rank == 0) return snapshots.slotBytes(e, e.snaps.getPtr(id) orelse return error.NoKeptState, @intCast(off), host, out);
+    const x = leader(e) orelse return error.NoRank;
+    const room = x.link.ids.len * 4;
+    var done: usize = 0;
+    while (done < host.len) {
+        const n = @min(room, host.len - done);
+        if (out) {
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.slot_take), .a = @intCast(id), .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+            try x.link.from(rank, n);
+            try x.link.buf.download(64, host[done..][0..n]);
+        } else {
+            @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.slot_put), .a = @intCast(id), .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+        }
+        done += n;
+    }
+}
+
+/// Rank `rank`'s pool page `id` (unsharded: its whole pages in its arena) bytes [off, off + host.len), out or in;
+/// rank 0's directly, another rank's through the link in pieces (a read-back's rows to every rank's pages).
+pub fn poolPage(e: *Engine, rank: u32, id: u32, off: u64, host: []u8, out: bool) !void {
+    if (rank == 0) {
+        const p = e.pages orelse return error.NoPages;
+        if (p.shard != null) return error.SnapshotShape;
+        const arena = if (p.arena) |a| a.ptr else return error.NoPages;
+        const stride = p.layout.pageBytes();
+        if (off + host.len > stride) return error.SnapshotShape;
+        const base = arena + @as(u64, id) * stride + off;
+        if (out) try e.d.check(e.d.api.cuMemcpyDtoH_v2(host.ptr, base, host.len), "cuMemcpyDtoH") else try e.d.check(e.d.api.cuMemcpyHtoD_v2(base, host.ptr, host.len), "cuMemcpyHtoD");
+        return;
+    }
+    const x = leader(e) orelse return error.NoRank;
+    const room = x.link.ids.len * 4;
+    var done: usize = 0;
+    while (done < host.len) {
+        const n = @min(room, host.len - done);
+        if (out) {
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.page_take), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, &.{});
+            try x.link.from(rank, n);
+            try x.link.buf.download(64, host[done..][0..n]);
+        } else {
+            @memcpy(std.mem.sliceAsBytes(x.link.ids[0..words4(n)])[0..n], host[done..][0..n]);
+            try x.disk(.{ .kind = kind, .flags = @backingInt(Op.page_put), .a = id, .seed = off + done, .depth = @intCast(n), .top_k = rank }, x.link.ids[0..words4(n)]);
+        }
+        done += n;
+    }
+}
+
+/// A pages-layout sharded state's row part gathered or scattered through the pool's pages: byte `b` of the part sits
+/// in page `pages[b / span]` at `b % span` past the part's place in its page (`part.at`); the pooled keys are rank
+/// 0's key pages (every rank's key pages get them on the way back in), the latent codes and scales the home rank's
+/// latent pages. `out`: gather (the pages to host) or scatter.
+pub fn pageRows(e: *Engine, part: image.Part, sh: image.Shape, home: u8, pages: []const u32, b: u64, host: []u8, out: bool) !void {
+    const x = try shard(e);
+    const span = image.pageSpan(sh, part);
+    const keys = part.row != sh.latent and part.row != 4;
+    const h: u32 = @intCast(x.parts.h);
+    var done: usize = 0;
+    while (done < host.len) {
+        const y = b + done;
+        const k = y / span;
+        if (k >= pages.len) return error.SnapshotShape;
+        const n: usize = @intCast(@min(host.len - done, span - y % span));
+        const chunk = host[done..][0..n];
+        const off = part.at + y % span;
+        if (keys) {
+            try keyPage(e, 0, pages[k], off, chunk, out);
+            if (!out) for (1..e.share.world) |r| try keyPage(e, @intCast(r), pages[k], off, chunk, out);
+        } else {
+            const g = pages[k];
+            if (kvs.partOf(g, x.parts.h) != home) return error.SnapshotShape; // a kept state's pages lie in its home part
+            try latPage(e, home, g - home * h, off, chunk, out);
+        }
+        done += n;
+    }
+}
+
+/// A pages-layout unsharded state's row part written into every rank's pool pages (every rank holds the rows; a
+/// read-back's scatter): rank 0's directly, the others through the link.
+pub fn poolRows(e: *Engine, part: image.Part, sh: image.Shape, pages: []const u32, b: u64, host: []u8) !void {
+    const p = e.pages orelse return error.NoPages;
+    if (p.shard != null) return error.SnapshotShape;
+    const span = image.pageSpan(sh, part);
+    var done: usize = 0;
+    while (done < host.len) {
+        const y = b + done;
+        const k = y / span;
+        if (k >= pages.len) return error.SnapshotShape;
+        const n: usize = @intCast(@min(host.len - done, span - y % span));
+        const off = part.at + y % span;
+        try poolPage(e, 0, pages[k], off, host[done..][0..n], false);
+        for (1..e.share.world) |r| try poolPage(e, @intCast(r), pages[k], off, host[done..][0..n], false);
+        done += n;
     }
 }
 
@@ -192,13 +359,13 @@ fn mut(comptime m: Mutant) bool {
 
 /// A rank other than 0: rank 0's disk step on this rank's copy of its state.
 pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
-    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.prefixes)) return error.BadStep;
+    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.page_take)) return error.BadStep;
     const op: Op = @fromBackingInt(h.flags);
     const rank: u32 = @intCast(e.share.rank);
     switch (op) {
         .blank => {
             if (h.depth > image.Words.kv_parts or (h.depth != 0 and !e.settings.kv_shard.on)) return error.BadStep;
-            try e.blankAs(h.a, @intCast(h.seed), if (h.depth == 0) null else @intCast(h.depth - 1));
+            try e.blankAs(h.a, @intCast(h.seed), if (h.depth == 0) null else @intCast(h.depth - 1), h.top_k);
         },
         .seal => {
             if (ids.len != 2 * image.Words.count) return error.BadStep;
@@ -216,6 +383,33 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
             if (h.top_k == rank) {
                 const host = std.mem.sliceAsBytes(l.ids)[0..h.depth];
                 try copy(e, h.a, h.seed, host, true);
+                try l.buf.uploadAsync(64, host, l.stream.handle);
+            }
+            try l.from(h.top_k, h.depth);
+        },
+        // rank 0's pool-page and slot writes and reads (a pages layout's rows and fixed parts, beside the shard its
+        // keys and its home's latent rows): the bytes ride the ids there and the link's buffer back
+        .key_put, .lat_put, .slot_put, .page_put => if (h.top_k == rank) {
+            if (h.depth > ids.len * 4) return error.BadStep;
+            const host = @constCast(std.mem.sliceAsBytes(ids))[0..h.depth];
+            switch (op) {
+                .key_put => try shardBytes(e, (try shard(e)).keys orelse return error.NoPages, (try shard(e)).g.keyPage(), @intCast(h.a), h.seed, host, false),
+                .lat_put => try shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, false),
+                .slot_put => try snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, false),
+                .page_put => try poolPage(e, 0, @intCast(h.a), h.seed, host, false),
+                else => unreachable,
+            }
+        },
+        .lat_take, .slot_take, .page_take => {
+            if (h.depth > l.ids.len * 4) return error.BadStep;
+            if (h.top_k == rank) {
+                const host = std.mem.sliceAsBytes(l.ids)[0..h.depth];
+                switch (op) {
+                    .lat_take => try shardBytes(e, (try shard(e)).lat orelse return error.NoPages, (try shard(e)).g.latPage(), @intCast(h.a), h.seed, host, true),
+                    .slot_take => try snapshots.slotBytes(e, e.snaps.getPtr(h.a) orelse return error.NoKeptState, @intCast(h.seed), host, true),
+                    .page_take => try poolPage(e, 0, @intCast(h.a), h.seed, host, true),
+                    else => unreachable,
+                }
                 try l.buf.uploadAsync(64, host, l.stream.handle);
             }
             try l.from(h.top_k, h.depth);

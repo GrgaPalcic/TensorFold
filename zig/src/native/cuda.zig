@@ -210,11 +210,11 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
     "lower --context, or free device memory";
 const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
-/// Whether the family keeps its shared store's states on disk beside TF_KV_SHARE: GLM unsharded (its store's image
-/// carries the pages; sharded, whose image splits a state's rows by rank, keeps the pair refused for now).
+/// Whether the family keeps its shared store's states on disk beside TF_KV_SHARE: GLM (its store's image carries the
+/// pages, sharded as each rank holds its part of them).
 fn shareDisk(comptime F: type, loaded: anytype) bool {
-    if (F != glm.native) return false;
-    return !loaded.target.settings.kv_shard.on;
+    _ = loaded;
+    return F == glm.native;
 }
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -360,7 +360,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     defer if (!opened) loaded.deinit(loaded.ctx);
     const share = try prompt_pages.wanted(F, loaded); // TF_KV_SHARE: the cache is pool pages, kept by the family's store
     if (o.learn_conversations and share and !shareDisk(F, loaded)) {
-        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two (GLM-5.3-Flash unsharded keeps both: its store's states on disk carry their pages)";
+        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two (GLM-5.3-Flash keeps both: its store's states on disk carry their pages)";
         return null;
     }
     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
