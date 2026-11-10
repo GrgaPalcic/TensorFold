@@ -471,6 +471,10 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
     };
     if (op == .blank) e.disk_cur = h.a;
     if (write_op and e.disk_failed.contains(state)) return; // a poisoned id's writes are skipped: its seal says so
+    if (write_op and op != .blank and e.settings.disk_fault != 0) { // the fault drill (TF_GLM_DISK_FAULT)
+        e.disk_writes += 1;
+        if (e.disk_writes == e.settings.disk_fault) return poison(e, state, error.DiskFaultDrill);
+    }
     switch (op) {
         .blank => {
             if (h.depth > image.Words.kv_parts or (h.depth != 0 and !e.settings.kv_shard.on)) return error.BadStep;

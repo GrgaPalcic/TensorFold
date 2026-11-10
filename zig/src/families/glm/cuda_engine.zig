@@ -125,6 +125,7 @@ pub const Engine = struct {
     next_snap: u64 = 1, // rank 0: the next id
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    disk_writes: u32 = 0, // a rank other than 0: its disk writes counted for the fault drill (TF_GLM_DISK_FAULT)
     disk_cur: u64 = 0, // a rank other than 0: the state rank 0 last blanked here, which its page writes belong to (cuda_disk_ranks)
     disk_failed: std.AutoHashMapUnmanaged(u64, void) = .empty, // ids whose disk op failed on this rank (cuda_disk_ranks): their later writes are skipped and their seal answers with the failure
     prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
