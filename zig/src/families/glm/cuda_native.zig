@@ -458,6 +458,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BadRoceCap => "TF_ROCE_MAX_KB: give an integer from 1 through 4194303 KiB, or unset it for 4096 KiB",
         error.BadHostCache => "TF_GLM_HOST_CACHE_GIB: give GiB of pinned host memory over all the ranks (0 turns the host tier off), or unset it or set auto for a quarter of what the host has available (at most 16 GiB)",
+        error.BadStagingGib => "TF_GLM_LEARN_STAGING_GIB: give GiB of host RAM the conversation states' saves may stage at once (whole pages), or unset it for 1 GiB",
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
@@ -485,6 +486,10 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
 
 test "a checkpoint refused for its format, at the entry or by the loader, is explained" {
     for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.UnreadableExl3 }) |e| try std.testing.expect(explain(null, e) != null);
+}
+
+test "TF_GLM_LEARN_STAGING_GIB: a refusal names the switch" {
+    try std.testing.expect(explain(null, error.BadStagingGib) != null);
 }
 
 test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and 1 page like on, others are refused" {
