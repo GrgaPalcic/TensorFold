@@ -278,7 +278,7 @@ pub fn pageRows(e: *Engine, part: image.Part, sh: image.Shape, home: u8, pages: 
 
 /// A pages-layout unsharded state's row part written into every rank's pool pages (every rank holds the rows; a
 /// read-back's scatter): rank 0's directly, the others through the link.
-pub fn poolRows(e: *Engine, part: image.Part, sh: image.Shape, pages: []const u32, b: u64, host: []u8) !void {
+pub fn poolRows(e: *Engine, part: image.Part, sh: image.Shape, pages: []const u32, b: u64, host: []const u8) !void {
     const p = e.pages orelse return error.NoPages;
     if (p.shard != null) return error.SnapshotShape;
     const span = image.pageSpan(sh, part);
@@ -289,8 +289,8 @@ pub fn poolRows(e: *Engine, part: image.Part, sh: image.Shape, pages: []const u3
         if (k >= pages.len) return error.SnapshotShape;
         const n: usize = @intCast(@min(host.len - done, span - y % span));
         const off = part.at + y % span;
-        try poolPage(e, 0, pages[k], off, host[done..][0..n], false);
-        for (1..e.share.world) |r| try poolPage(e, @intCast(r), pages[k], off, host[done..][0..n], false);
+        try poolPage(e, 0, pages[k], off, @constCast(host[done..][0..n]), false);
+        for (1..e.share.world) |r| try poolPage(e, @intCast(r), pages[k], off, @constCast(host[done..][0..n]), false);
         done += n;
     }
 }

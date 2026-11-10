@@ -122,7 +122,7 @@ fn gatherPages(e: *Engine, k: *Kept, pages: []const u32, ranges: []const rows.im
             if (pi == 0) {
                 @memcpy(host, std.mem.sliceAsBytes(&words)[@intCast(within)..][0..host.len]);
             } else if (part.row > 0) {
-                try pageRows(e, part, pages, within, host, arena, page);
+                try pageRows(e, part, sh, pages, within, host, arena, page);
             } else try ranks.slot(e, 0, k.id, lease + within, host, true);
         }
         try rankPrefixes(e, k.id, g, end, own, o, out, true);
