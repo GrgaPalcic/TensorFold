@@ -209,6 +209,13 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
     "lower --context, or free device memory";
 const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
+/// Whether the family keeps its shared store's states on disk beside TF_KV_SHARE: GLM unsharded (its store's image
+/// carries the pages; sharded, whose image splits a state's rows by rank, keeps the pair refused for now).
+fn shareDisk(comptime F: type, loaded: anytype) bool {
+    if (F != glm.native) return false;
+    return !loaded.target.settings.kv_shard.on;
+}
+
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (refusals.family(F, o)) |why| {
         problem.* = why;
@@ -351,8 +358,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
     const share = try prompt_pages.wanted(F, loaded); // TF_KV_SHARE: the cache is pool pages, kept by the family's store
-    if (o.learn_conversations and share) {
-        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
+    if (o.learn_conversations and share and !shareDisk(F, loaded)) {
+        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two (GLM-5.3-Flash unsharded keeps both: its store's states on disk carry their pages)";
         return null;
     }
     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
@@ -461,6 +468,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const share_limit = if (!share) 0 else if (slots != null) paged.?.snaps else try @import("core").kv_prompts.sharing(); // what its slots hold
     if (comptime @hasDecl(F, "share_attach")) if (share and (if (comptime F.share_kept_ppm == 0) share_limit > 0 else cache > 0)) { // GLM keeps copies: the store opens when its slots hold a state
         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
+        if (o.learn_conversations) if (o.learn) |root| if (F == glm.native) {
+            try @import("cuda_glm_disk.zig").attachShare(a, io, &g.ctx, o, root, kernels, loaded, h.prompts.?);
+        };
     };
     errdefer if (h.prompts) |x| x.close();
     var conversations = false;
