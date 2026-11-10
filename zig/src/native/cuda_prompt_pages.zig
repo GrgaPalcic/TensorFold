@@ -39,6 +39,11 @@ pub const Adapter = struct {
     /// The family's store, its pool's reclaim evicting the tree's idle pages — one pool's all of them, a sharded
     /// pool's each part its own leaves (below); null: the family has no pool.
     pub fn open(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
+        return openWith(F, null, gpa, target, page_tokens, snap_limit);
+    }
+
+    /// `open` with the family's disk rows (`image`; null: none), which --learn-conversations beside the store needs.
+    pub fn openWith(comptime F: type, comptime image: ?*const api.prompt_cache.rows.Image, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
         const src = F.share_pool(target) orelse return null;
         const x = try gpa.create(Adapter);
         errdefer gpa.destroy(x);
@@ -50,7 +55,7 @@ pub const Adapter = struct {
         }
         rules.min_gap = 256;
         rules.tail = true;
-        const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, null).vtable };
+        const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, image).vtable };
         x.* = .{ .gpa = gpa, .src = src, .store = undefined, .detach = Detach(F).call, .target = target };
         x.store = try radix.Store.init(gpa, copies, x.pages(), rules);
         switch (src) {
