@@ -30,15 +30,17 @@ pub const Job = struct {
     files: []File,
     bytes: u64,
     staged: u64,
+    final: bool = true, // the state's own file and metadata: its publish makes the entry (a piece names blocks alone)
+    new_blocks: u32 = 0, // a final job's: the pieces of this save that wrote blocks (its log line's count)
     verify: bool = false,
     began: i128 = 0,
     done: std.atomic.Value(bool) = .init(false),
     taken: bool = false,
     failure: ?anyerror = null,
 
-    /// The block files it writes: every file but the last, which is the state's own.
+    /// The block files it writes: every file but the last of a final job, which is the state's own.
     pub fn blocks(j: *const Job) []File {
-        return j.files[0..j.files.len -| 1];
+        return j.files[0 .. j.files.len - @intFromBool(j.final)];
     }
 
     pub fn destroy(j: *Job) void {
@@ -138,7 +140,7 @@ pub const Worker = struct {
     pub fn names(w: *Worker, name: chain.Name) bool {
         w.lock();
         defer w.mutex.unlock();
-        for (w.slots) |s| if (s) |j| if (std.mem.eql(u8, &j.name, &name)) return true;
+        for (w.slots) |s| if (s) |j| if (j.final and std.mem.eql(u8, &j.name, &name)) return true;
         return false;
     }
 

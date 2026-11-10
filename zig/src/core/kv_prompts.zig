@@ -95,6 +95,9 @@ pub const Parts = struct {
     onePart: *const fn (ctx: *anyopaque, ids: []const u32) bool,
     /// `part`'s pool takes the store's reclaim hook, or drops it.
     setReclaim: *const fn (ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void,
+    /// `out.len` pages held for a recalled state in one part with room (its pools reclaiming first), global ids
+    /// (false: none; a recall's home part, cuda_kv_shard.Parts.choose). Null: the parts cannot hold pages.
+    holdPages: ?*const fn (ctx: *anyopaque, out: []u32) bool = null,
     ctx: *anyopaque,
 };
 

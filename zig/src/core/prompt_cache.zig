@@ -75,6 +75,9 @@ pub const Pages = struct {
         holders: *const fn (ptr: *anyopaque, id: u32) u32,
         /// Pages free and not promised to a stream.
         available: *const fn (ptr: *anyopaque) usize,
+        /// `out.len` free pages the store holds itself (a paged store's recall into pages), the pool reclaiming first;
+        /// a sharded pool's in one part with room (false: none). Null: the family cannot hold pages.
+        hold: ?*const fn (ptr: *anyopaque, out: []u32) bool = null,
     };
 };
 
@@ -511,7 +514,7 @@ pub const Store = struct {
         s.held += charged;
         s.counts.kept += 1;
         if (shared) learned.learn(s, e, starts);
-        if (s.disk) |r| rows.write.queued(r, e, starts);
+        if (s.disk) |r| rows.write.queued(r, rows.Kept.of(e), starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;
     }

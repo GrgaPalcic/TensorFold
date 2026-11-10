@@ -74,11 +74,13 @@ pub fn Kept(comptime F: type) type {
             st.history = w.history;
         }
 
-        fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+        fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+            _ = pages;
             try copy(of(ptr), @ptrCast(@alignCast(saved)), ranges, out, true);
         }
 
-        fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+        fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+            _ = pages;
             try copy(of(ptr), @ptrCast(@alignCast(saved)), ranges, @constCast(in), false);
         }
 
@@ -231,7 +233,7 @@ test "Flash Next completion: a kept state's copy out or in that fails part way d
         OneCopy.queued = 0;
         OneCopy.pending = 0;
         const ranges = [_]rows.image.Range{ .{ .off = 0, .len = words + 512 }, .{ .off = words + 512, .len = if (refused) 512 else 1024 } };
-        const got = if (out) K.image.gather(&c, &st, &ranges, &host) else K.image.scatter(&c, &st, &ranges, &host);
+        const got = if (out) K.image.gather(&c, &st, &.{}, &ranges, &host) else K.image.scatter(&c, &st, &.{}, &ranges, &host);
         try std.testing.expectError(if (refused) error.NotReady else error.BadKeptRange, got);
         try std.testing.expectEqual(@as(usize, 1), OneCopy.queued);
         try std.testing.expectEqual(@as(usize, 0), OneCopy.pending); // the caller's `host` may go: nothing copies on it

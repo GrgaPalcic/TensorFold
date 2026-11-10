@@ -36,7 +36,7 @@ const Snaps = struct {
     fn parts(_: *anyopaque, at: u32, out: *std.ArrayList(pc.rows.image.Part), a: Allocator) anyerror!void {
         try out.append(a, .{ .bytes = @as(u64, at) * 4, .row = 4 });
     }
-    fn gather(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
+    fn gather(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, out: []u8) anyerror!void {
         const src = std.mem.sliceAsBytes(kept(saved).items);
         var o: usize = 0;
         for (ranges) |r| {
@@ -50,7 +50,7 @@ const Snaps = struct {
         try k.appendNTimes(of(ptr).gpa, 0, at);
         return k;
     }
-    fn scatter(_: *anyopaque, saved: pc.Saved, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
+    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const u32, ranges: []const pc.rows.image.Range, in: []const u8) anyerror!void {
         const dst = std.mem.sliceAsBytes(kept(saved).items);
         var o: usize = 0;
         for (ranges) |r| {

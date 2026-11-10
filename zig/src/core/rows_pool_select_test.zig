@@ -11,7 +11,7 @@ const Image = struct {
     fn parts(_: *anyopaque, _: u32, out: *std.ArrayList(rows.image.Part), allocator: std.mem.Allocator) !void {
         try out.append(allocator, .{ .bytes = 16 });
     }
-    fn gather(_: *anyopaque, saved: pc.Saved, _: []const rows.image.Range, out: []u8) !void {
+    fn gather(_: *anyopaque, saved: pc.Saved, _: []const u32, _: []const rows.image.Range, out: []u8) !void {
         const state: *Fake.State = @ptrCast(@alignCast(saved));
         std.mem.writeInt(u64, out[0..8], state.at, .little);
         std.mem.writeInt(u64, out[8..16], state.sum, .little);
@@ -23,7 +23,7 @@ const Image = struct {
         defer f.at = previous;
         return f.pooled().vtable.save(ptr, null, at);
     }
-    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const rows.image.Range, bytes: []const u8) !void {
+    fn scatter(_: *anyopaque, saved: pc.Saved, _: []const u32, _: []const rows.image.Range, bytes: []const u8) !void {
         const state: *Fake.State = @ptrCast(@alignCast(saved));
         state.at = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
         state.sum = std.mem.readInt(u64, bytes[8..16], .little);
