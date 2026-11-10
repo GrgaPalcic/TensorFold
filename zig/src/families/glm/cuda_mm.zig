@@ -257,7 +257,8 @@ pub const default_stage_index = 2; // 6 stages
 pub fn stageIndex(v: ?[]const u8) usize {
     const t = v orelse return default_stage_index;
     for (stage_variants, 0..) |st, i| if (t.len == 1 and t[0] == '0' + @as(u8, @intCast(st))) return i;
-    if (t.len != 0) std.log.err("TF_GLM_MM_STAGES: 3, 5, 6 or 8 (not '{s}'): {d}", .{ t, stage_variants[default_stage_index] });
+    // warn, not err: a mistyped knob falls back to the default, and the tests' runner fails any run that logs an error
+    if (t.len != 0) std.log.warn("TF_GLM_MM_STAGES: 3, 5, 6 or 8 (not '{s}'): {d}", .{ t, stage_variants[default_stage_index] });
     return default_stage_index;
 }
 

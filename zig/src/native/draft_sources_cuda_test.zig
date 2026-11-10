@@ -36,8 +36,10 @@ test "draft sources: CUDA GLM distinguishes its checkpoint head from loaded DFla
     b.mtp_confidence = null;
     e.mtp = false;
     e.drafter = null;
+    e.drafts = false;
     try check(b.facts(), null, false, false);
-    e.mtp = true;
+    e.mtp = true; // the checkpoint head: speculation on (cuda_engine.heads, facts reads e.drafts since recipe 0014)
+    e.drafts = true;
     try check(b.facts(), null, true, true);
     b.mtp_confidence = 0.3; // --mtp-confidence: the head's chances size its windows, still a checkpoint head
     try check(b.facts(), null, true, true);
