@@ -372,7 +372,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !
     var total = own;
     for (prefixes[1..]) |p| total += p;
     const bytes = try a.alloc(u8, @intCast(total));
-    try gather(e, saved, &.{.{ .off = 0, .len = total }}, bytes);
+    try gather(e, saved, &.{}, &.{.{ .off = 0, .len = total }}, bytes); // the probe is a copied state: no pages
     const shared = bytes[@intCast(img.Words.bytes + sh.prefix)..@intCast(own)];
     const theirs = try a.alloc(u8, shared.len);
     // each rank's copy of what it holds (under TF_GLM_KV_SHARD the latent rows on the probe's home alone)
