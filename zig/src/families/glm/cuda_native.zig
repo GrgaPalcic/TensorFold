@@ -526,6 +526,9 @@ fn partsHoldPages(ctx: *anyopaque, out: []u32) bool {
     if (!x.pools[part].hold(out)) return false;
     for (out) |*id| id.* += @as(u32, @intCast(part * x.h));
     return true;
+}
+
+/// The store refused a keep whose pages would span the parts: counted.
 fn partsRefused(ctx: *anyopaque) void {
     partsOf(ctx).counts.keeps_refused += 1;
 }
