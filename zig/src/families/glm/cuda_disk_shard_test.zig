@@ -341,7 +341,7 @@ fn write(p: *Pair, id: u64) ![]u8 {
 fn read(p: *Pair, img: []const u8, id: u64) !image.Words {
     const a = std.testing.allocator;
     const home = ranks.readHome(&p.r[0].e);
-    for (&p.r) |*x| try snapshots.blankAs(&x.e, id, at, home);
+    for (&p.r) |*x| try snapshots.blankAs(&x.e, id, at, home, 0);
     const pre = try prefixesOf(p);
     const sh = try ranks.shape(&p.r[0].e);
     var list: std.ArrayList(image.Part) = .empty;
