@@ -450,6 +450,7 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
     // the probe keeps a whole copy through its own mark hook, as without the share: the store stands aside for it
     e.share_pages = false;
     if (e.pages) |pg| pg.prompts = null;
+    if (e.link) |l| try (glm.follow.Leader{ .e = e, .link = @ptrCast(@alignCast(l)) }).sharePages(false); // the other ranks keep it whole too
     const p = probe(a, io, loaded.backend, e) catch |err| {
         e.share_pages = was;
         if (e.pages) |pg| pg.prompts = held;
@@ -457,6 +458,7 @@ pub fn attachShare(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Op
     };
     e.share_pages = was;
     if (e.pages) |pg| pg.prompts = held;
+    if (e.link) |l| try (glm.follow.Leader{ .e = e, .link = @ptrCast(@alignCast(l)) }).sharePages(was);
     pages_mode = true;
     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
     const gibs = struct {
