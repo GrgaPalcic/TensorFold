@@ -395,14 +395,16 @@ fn poison(e: *Engine, id: u64, err: anyerror) void {
 /// A take's answer on this rank: its bytes into the link's ids with this rank's status word past them (a poisoned
 /// id's bytes are stale and its status says so; a failing op poisons the id and answers with its failure), then the
 /// link's broadcast the op's answer crosses by. The step loop runs on either way.
-fn answered(e: *Engine, l: *follow.Link, h: follow.Header, rank: u32, body: *const fn (*Engine, follow.Header, []u8) anyerror!void) !void {
+fn answered(e: *Engine, l: *follow.Link, h: follow.Header, rank: u32, state: ?u64, body: *const fn (*Engine, follow.Header, []u8) anyerror!void) !void {
     if (h.depth > l.ids.len * 4 - status_bytes) return error.BadStep;
     var ok: u32 = 0;
     if (h.top_k == rank) {
         const bytes = std.mem.sliceAsBytes(l.ids);
         const host = bytes[0..h.depth];
-        if (e.disk_failed.contains(h.a)) ok = 1 else if (body(e, h, host)) |_| {} else |err| {
-            poison(e, h.a, err);
+        // `state` is the kept state the op names; a page op names a pool page (no state: a save's read, nothing to
+        // poison, its failure is the answer alone)
+        if (state != null and e.disk_failed.contains(state.?)) ok = 1 else if (body(e, h, host)) |_| {} else |err| {
+            if (state) |id| poison(e, id, err) else std.log.warn("rank {d}: a disk read of page {d} failed ({s}); rank 0's save of it is skipped", .{ e.share.rank, h.a, @errorName(err) });
             ok = 1;
         }
         std.mem.writeInt(u32, bytes[h.depth..][0..status_bytes], ok, .little);
@@ -460,7 +462,14 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
         .blank, .put, .key_put, .lat_put, .slot_put, .page_put => true,
         else => false,
     };
-    if (write_op and e.disk_failed.contains(h.a)) return; // a poisoned id's writes are skipped: its seal says so
+    // a page op's `a` is a pool page id, not a state's: its state is the one this rank last blanked (rank 0 recalls
+    // one state at a time: blank, its pieces, seal)
+    const state: u64 = switch (op) {
+        .key_put, .lat_put, .page_put => e.disk_cur,
+        else => h.a,
+    };
+    if (op == .blank) e.disk_cur = h.a;
+    if (write_op and e.disk_failed.contains(state)) return; // a poisoned id's writes are skipped: its seal says so
     switch (op) {
         .blank => {
             if (h.depth > image.Words.kv_parts or (h.depth != 0 and !e.settings.kv_shard.on)) return error.BadStep;
@@ -486,16 +495,16 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
             if (h.depth > ids.len * 4) return error.BadStep;
             if (putBody(e, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, h.a, err);
         },
-        .take => try answered(e, l, h, rank, takeBody),
+        .take => try answered(e, l, h, rank, h.a, takeBody),
         // rank 0's pool-page and slot writes and reads (a pages layout's rows and fixed parts, beside the shard its
         // keys and its home's latent rows): the bytes ride the ids there and the link's buffer back
         .key_put, .lat_put, .slot_put, .page_put => if (h.top_k == rank) {
             if (h.depth > ids.len * 4) return error.BadStep;
-            if (pagePutBody(e, op, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, h.a, err);
+            if (pagePutBody(e, op, h, @constCast(std.mem.sliceAsBytes(ids))[0..h.depth])) |_| {} else |err| poison(e, state, err);
         },
-        .lat_take => try answered(e, l, h, rank, latTakeBody),
-        .slot_take => try answered(e, l, h, rank, slotTakeBody),
-        .page_take => try answered(e, l, h, rank, pageTakeBody),
+        .lat_take => try answered(e, l, h, rank, null, latTakeBody),
+        .slot_take => try answered(e, l, h, rank, h.a, slotTakeBody),
+        .page_take => try answered(e, l, h, rank, null, pageTakeBody),
         .prefixes => {
             var out: [64]u64 = undefined;
             if (e.share.world > out.len) return error.BadStep;
