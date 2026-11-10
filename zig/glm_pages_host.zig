@@ -205,15 +205,15 @@ test "GLM pages: a follower refuses a duplicate owner and rolls back a failed ta
     defer f.deinit();
     f.p.leader = false;
     F.fail_put = true;
-    try t.expectError(error.NotReady, f.p.map(0, &.{ 3, 2 }));
+    try t.expectError(error.NotReady, f.p.map(0, &.{ 3, 2 }, 0));
     try t.expectEqual(@as(usize, 0), f.p.leases[0].ids.items.len);
     try t.expect(!f.p.used[0]);
     F.fail_put = false;
-    try f.p.map(0, &.{ 3, 2 });
-    try t.expectError(error.BadStep, f.p.map(0, &.{ 1, 0 }));
+    try f.p.map(0, &.{ 3, 2 }, 0);
+    try t.expectError(error.BadStep, f.p.map(0, &.{ 1, 0 }, 0));
     try t.expectEqualSlices(u32, &.{ 3, 2 }, f.e.seqs.items[0].?.st.pages);
     f.p.close(0);
-    try f.p.map(0, &.{ 1, 0 });
+    try f.p.map(0, &.{ 1, 0 }, 0);
     f.p.close(0);
     try t.expect(f.p.pool.idle());
 }
@@ -258,7 +258,7 @@ test "GLM pages: a begin packet the link refuses leaves rank 0's pending keep fo
     link.keep_pending = .{ .slot = 0, .rows = 3 }; // committed on rank 0, not yet sent: it must not be sent or lost
     const x: glm.follow.Leader = .{ .e = &f.e, .link = &link };
     for (0..2) |_| {
-        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }));
+        try t.expectError(error.TooManyIds, x.beginOn(null, &.{ 4, 5 }, 0));
         try t.expect(link.keep_pending != null);
         try t.expectEqual(@as(u32, 0), link.keep_pending.?.slot);
         try t.expectEqual(@as(u32, 3), link.keep_pending.?.rows);
@@ -285,13 +285,13 @@ test "GLM pages: a failed seat binding returns its pages and lane before retry" 
     defer back.deinit();
     var stream = try lanes.Stream.init(t.allocator, .{ .id = "page-test", .prompt = &.{100}, .max_new = 8 });
     defer stream.deinit(t.allocator);
-    try t.expectError(error.OutOfMemory, back.seat(&stream, 1, 8));
+    try t.expectError(error.OutOfMemory, back.seat(&stream, 1, 8, &.{}));
     try t.expectEqual(@as(usize, 0), back.lanes.count());
     try t.expect(f.p.pool.idle());
     try t.expectEqual(@as(usize, 8), f.p.pool.census().free);
     try t.expectEqual(@as(u32, 1), f.e.slot);
     v.gpa = t.allocator;
-    try t.expectEqual(@as(usize, 1), (try back.seat(&stream, 1, 8)).len);
+    try t.expectEqual(@as(usize, 1), (try back.seat(&stream, 1, 8, &.{})).len);
     try t.expectEqual(@as(usize, 1), back.lanes.count());
     try t.expectEqual(@as(u32, 0), f.e.slot);
     f.e.release(0);

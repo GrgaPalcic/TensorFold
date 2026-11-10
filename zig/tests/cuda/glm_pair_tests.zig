@@ -95,7 +95,7 @@ pub fn pairCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
                 for (held[1..], held[0 .. held.len - 1]) |b, prev| unordered += @intFromBool(b != prev + 1);
             }
             try x.bind(slots[twin]);
-            if (set.pages) try x.beginOn(null, held) else try x.begin(null);
+            if (set.pages) try x.beginOn(null, held, 0) else try x.begin(null);
             const before = e.pair.?.steps;
             var at: usize = 0;
             const t = while (true) {

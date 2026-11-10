@@ -270,6 +270,7 @@ const Fake = struct {
     drafter: ?*@import("dflash.zig").Drafter = null, // 0015: beside DFlash2 a kept state holds no head rows
     slot: u32 = 0,
     share: struct { rank: usize = 0, world: usize = 1 } = .{},
+    share_pages: bool = false, // TF_KV_SHARE: the store holds the pages below a kept state's mark
     settings: @import("cuda_ranks.zig").Settings = .{}, // TF_GLM_KV_SHARD off: no state has a home part
     // ...so a restore never carries: its staging, counters and link are never read
     kv_stage: ?cuda.DeviceBuffer = null,

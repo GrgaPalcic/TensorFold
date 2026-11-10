@@ -151,14 +151,14 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         for (ids, 0..) |*u, i| u.* = @intCast(100 + (i * 7919 + k * 31) % 5000);
         // a live stream in the other part, so the placement is the case's, not an empty pool's
         try x.bind(other_slot);
-        const busy = try pages.openFor(other_slot, 600, 0, 1 - c.home);
-        try x.beginOn(null, busy);
+        const busy = try pages.openWith(other_slot, 600, 0, 1 - c.home, &.{});
+        try x.beginOn(null, busy, 0);
         pages.shard.?.switches.twins = c.twin;
         var first: [2]u32 = undefined;
         const at: usize = glm.engine.prompt_rows; // the kept state's mark (a chunk start)
         for ([_]u32{ sharded_slot, twin_slot }, 0..) |slot, j| {
             try x.bind(slot);
-            if (slot == sharded_slot) try x.beginOn(null, try pages.openFor(slot, c.len, 64, c.home)) else try x.begin(null);
+            if (slot == sharded_slot) try x.beginOn(null, try pages.openWith(slot, c.len, 64, c.home, &.{}), 0) else try x.begin(null);
             const marks: ?glm.engine.Marks = if (c.resume_part != null and slot == sharded_slot) .{ .at = &.{@as(u32, @intCast(at))}, .ctx = e, .call = keepAt } else null;
             first[j] = try x.prefill(ids, null, null, marks);
             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
@@ -172,7 +172,7 @@ pub fn shardCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
             pages.shard.?.switches.twins = c.resume_twin;
             if (c.disk and kept_id != 0) kept_id = try throughDisk(a, e, kept_id);
             try x.bind(sharded_slot);
-            try x.beginOn(null, try pages.openFor(sharded_slot, c.len, 64, rp));
+            try x.beginOn(null, try pages.openWith(sharded_slot, c.len, 64, rp, &.{}), 0);
             if (kept_id == 0) {
                 std.debug.print("FAIL kv shard: {s}: no state was kept at {d}\n", .{ c.name, at });
                 failed = true;

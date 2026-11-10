@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const kv = @import("core").kv_pool;
+const kp = @import("core").kv_prompts;
 const fw = @import("cuda_forward.zig");
 const state = @import("cuda_state.zig");
 const types = @import("cuda_engine_types.zig");
@@ -101,6 +102,7 @@ pub const Pages = struct {
     used: []bool,
     leader: bool,
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
+    prompts: ?kp.Prompts = null, // TF_KV_SHARE: the shared prompt store over this pool (rank 0's), from the server
     waiting: ?usize = null, // rank 0: the pages the request admission last held back needs (one log line a wait)
     shard: ?*Shard = null, // TF_GLM_KV_SHARD: the pool's two parts (then `pool` holds no page)
 
@@ -240,13 +242,19 @@ pub const Pages = struct {
 
     /// Rank 0: paged slot `slot` takes the pages of a prompt, its reply and a last window; LaneMemory: not yet.
     pub fn open(p: *Pages, slot: u32, prompt: usize, max_tokens: usize) ![]const u32 {
-        return p.openFor(slot, prompt, max_tokens, null);
+        return p.openWith(slot, prompt, max_tokens, null, &.{});
+    }
+
+    /// The shared store's pages a resume held, given back when no lease took them.
+    pub fn give(p: *Pages, adopted: []const u32) void {
+        for (adopted) |id| p.pool.release(id);
     }
 
     /// `open`, sharded in `home` (a kept state's part) when it has the room (cuda_kv_shard.Parts.choose), with a twin
     /// of the prompt's pages in the other part under TF_GLM_KV_SHARD_TWINS when it has them. The ids that cross with
-    /// the begin step: the stream's, then its twin's (`twinCount`).
-    pub fn openFor(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8) ![]const u32 {
+    /// the begin step: the stream's, then its twin's (`twinCount`). Unsharded with `adopted` (the shared store's pages
+    /// a resume held, first in the lease): their rows stay as the store kept them, the rest promised and covered.
+    pub fn openWith(p: *Pages, slot: u32, prompt: usize, max_tokens: usize, home: ?u8, adopted: []const u32) ![]const u32 {
         if (!p.paged(slot) or p.used[slot]) return error.SlotTaken;
         if (p.shard) |x| {
             const n = need(p.layout, prompt, max_tokens);
@@ -262,25 +270,33 @@ pub const Pages = struct {
             try x.wire.appendSlice(p.gpa, sl.twin.items);
             return x.wire.items;
         }
+        var held = adopted.len > 0;
+        errdefer if (held) for (adopted) |id| p.pool.release(id);
         const n = need(p.layout, prompt, max_tokens);
-        if (n > tableLen(p.e.capacity)) return error.PromptTooLong;
-        if (n > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
+        if (n > tableLen(p.e.capacity) or adopted.len > n) return error.PromptTooLong;
+        if (n - adopted.len > p.pool.total()) return error.PoolTooSmall; // never fits, even with every other stream done
         const l = &p.leases[slot];
-        try p.pool.promise(l, n);
+        try p.pool.promise(l, n - adopted.len);
         errdefer p.pool.finish(l);
+        if (adopted.len > 0) {
+            held = false;
+            try p.pool.adopt(l, adopted); // the lease holds them now (its finish releases them)
+        }
         var up: Upload = .{ .p = p, .slot = slot };
+        if (adopted.len > 0) try Upload.write(&up, l.ids.items, 0);
         try p.pool.cover(l, n, .{ .ctx = &up, .write = Upload.write });
-        try p.mapped(slot, l.ids.items);
+        try p.mapped(slot, l.ids.items, adopted.len);
         return l.ids.items;
     }
 
     /// Another rank: paged slot `slot` maps rank 0's page ids (sent with the stream's begin step).
-    pub fn map(p: *Pages, slot: u32, ids: []const u32) !void {
-        return p.mapWith(slot, ids, 0);
+    pub fn map(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
+        return p.mapWith(slot, ids, 0, kept);
     }
 
-    /// `map` of a begin step whose last `twin` ids are a sharded stream's twin (cuda_follow: the header's depth).
-    pub fn mapWith(p: *Pages, slot: u32, all: []const u32, twin: usize) !void {
+    /// `map` of a begin step whose last `twin` ids are a sharded stream's twin (cuda_follow: the header's depth), the
+    /// shared store's `kept` first (its rows stay; TF_KV_POISON leaves them alone).
+    pub fn mapWith(p: *Pages, slot: u32, all: []const u32, twin: usize, kept: usize) !void {
         if (p.shard) |x| {
             if (!p.paged(slot) or twin > all.len or p.used[slot]) return error.BadStep;
             const ids = all[0 .. all.len - twin];
@@ -291,7 +307,7 @@ pub const Pages = struct {
         }
         if (twin != 0) return error.BadStep;
         const ids = all;
-        if (!p.paged(slot) or ids.len == 0 or ids.len > tableLen(p.e.capacity)) return error.BadStep;
+        if (!p.paged(slot) or ids.len == 0 or ids.len > tableLen(p.e.capacity) or kept > ids.len) return error.BadStep;
         if (p.used[slot]) return error.BadStep;
         for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
         const l = &p.leases[slot];
@@ -300,17 +316,17 @@ pub const Pages = struct {
         errdefer l.ids.clearRetainingCapacity();
         var up: Upload = .{ .p = p, .slot = slot };
         try Upload.write(&up, l.ids.items, 0);
-        try p.mapped(slot, l.ids.items);
+        try p.mapped(slot, l.ids.items, kept);
     }
 
-    /// The slot's sequence reaches its pages' rows (NaN first under TF_KV_POISON).
-    fn mapped(p: *Pages, slot: u32, ids: []const u32) !void {
+    /// The slot's sequence reaches its pages' rows (past the `kept` first, NaN first under TF_KV_POISON).
+    fn mapped(p: *Pages, slot: u32, ids: []const u32, kept: usize) !void {
         // every id names a page of this pool, on every rank (the kernels read pt[pos / 512] for pos under the capacity
         // set below, and State.ready refuses a pass past it), so no table can send a kernel past the pages' arena
         for (ids) |id| if (id >= p.pool.total()) return error.BadStep;
         const st = &p.e.seqs.items[slot].?.st;
         const page = p.layout.pageBytes();
-        if (p.poison) for (ids) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
+        if (p.poison) for (ids[kept..]) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
         st.pages = ids;
         st.capacity = @min(ids.len * state.page_rows, p.e.capacity);
         p.used[slot] = true;
@@ -392,11 +408,11 @@ pub const Pages = struct {
         x.parts.stats(out);
     }
 
-    /// The idle server's line: nothing promised, every page free (the copy store holds none).
+    /// The idle server's line: nothing promised, every page free or, under TF_KV_SHARE, the store's.
     fn report(p: *const Pages) void {
         if (@import("builtin").is_test) return;
         const c = p.pool.census();
-        const ok = p.pool.idle() and c.free == c.total;
+        const ok = p.pool.idle() and (p.e.share_pages or c.free == c.total);
         std.log.info("kv pool idle{s}: promised {d}, free {d} + store {d} == total {d}", .{ if (ok) "" else " (UNEVEN)", c.promised, c.free, c.kept, c.total });
     }
 

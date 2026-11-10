@@ -19,8 +19,8 @@ pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts; begin: its twin's ids (KV shard)
-    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
-    a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
+    flags: u32 = 0, // begin: sampled; draft: from the prompt (1), chances (2); prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows; snapshots: pages shared
+    a: u64 = 0, // begin: the shared store's pages first in its table; keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position; snapshots: the host tier asked
     temperature: f64 = 0,
     top_p: f64 = 0,
@@ -201,16 +201,16 @@ pub const Leader = struct {
     }
 
     pub fn begin(x: Leader, s: ?sampler.Sampling) !void {
-        return x.beginOn(s, &.{});
+        return x.beginOn(s, &.{}, 0);
     }
 
-    /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
-    /// Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot (and
-    /// mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
-    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
+    /// `begin` on a paged sequence: its page ids (rank 0's lease, the shared store's `kept` first) go to every rank's
+    /// table. Rank 0's own begin failing after the step went out sends a release step: the other ranks began the slot
+    /// (and mapped its pages), so they free it as the caller frees it here, and its next begin maps there again.
+    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32, kept: usize) !void {
         try x.flush();
         const c = sampler.check(s);
-        var h: Header = .{ .kind = @backingInt(Kind.begin) };
+        var h: Header = .{ .kind = @backingInt(Kind.begin), .a = kept };
         if (x.e.settings.kv_shard.on) if (x.e.pages) |p| { // TF_GLM_KV_SHARD: the last ids are its twin's
             h.depth = @intCast(p.twinCount(x.e.slot));
         };
@@ -230,9 +230,10 @@ pub const Leader = struct {
     }
 
     /// Every rank's prompt cache at rank 0's device budget, and the host tier `asked` (snapshots.agreeTiers): the
-    /// others make theirs on this step. The pinned bytes each rank holds come back (0: device pages alone).
+    /// others make theirs on this step, its states past the shared store's pages as rank 0's. The pinned bytes each
+    /// rank holds come back (0: device pages alone).
     pub fn snapshots(x: Leader, budget: u64, asked: u64) !u64 {
-        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked }, &.{});
+        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget, .seed = asked, .flags = @intFromBool(x.e.share_pages) }, &.{});
         return @import("cuda_snapshots.zig").agreeTiers(x.e, budget, asked);
     }
 
@@ -423,7 +424,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
     e.structured = structuredStep(h); // rank 0 alone masks them
     switch (kind) {
         .begin => {
-            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth);
+            if (ids_in.len > 0) try (e.pages orelse return error.BadStep).mapWith(h.slot, ids_in, h.depth, @intCast(@min(h.a, std.math.maxInt(u32))));
             try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
         },
         .pool => {
@@ -499,7 +500,10 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             try v.take(h.slot, ids_in);
             try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
         },
-        .snapshots => _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed),
+        .snapshots => {
+            e.share_pages = h.flags & 1 != 0; // TF_KV_SHARE on rank 0: a kept state leaves the shared store's pages out
+            _ = try @import("cuda_snapshots.zig").agreeTiers(e, h.a, h.seed);
+        },
         .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, ids_in),
         .layout => try checkLayout(e, h.a),
         .drop => for (ids_in) |id| e.dropState(id),
