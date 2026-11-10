@@ -134,6 +134,7 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
+        if (h.prompts) |x| h.host.paged_disk = x.disk; // TF_KV_SHARE with --learn-conversations: its writes ride the host's idle turns
         h.host.kv_parts = h.kv_parts;
         h.host.warm_quiet = if (info.warm_turns) h.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };

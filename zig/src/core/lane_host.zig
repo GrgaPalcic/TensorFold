@@ -61,6 +61,7 @@ pub const LaneHost = struct {
     kv_parts: ?lanes.kv_parts.Source = null, // a sharded backend's KV parts, read on the engine thread at each noteLive
     kv_status: ?api.Status.KvParts = null, // ...and published under mutex for status readers
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+    paged_disk: ?*pc.rows.Rows = null, // TF_KV_SHARE: the paged store's disk, written behind as `cache`'s is (no `cache` then)
     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     health: ?api.HealthSource = null,
