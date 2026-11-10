@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const heat = @import("heat");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const kv_shard = @import("cuda_kv_shard.zig");
+const share_mod = @import("cuda_share.zig");
 
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
@@ -25,6 +26,7 @@ pub const Settings = struct {
     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
+    share_untwinned_pct: u32 = share_mod.untwinned_pct_default, // TF_GLM_KV_SHARE_UNTWINNED_PCT: a sharded share resume adopts only when its untwinned tail pays
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -117,6 +119,10 @@ pub const Settings = struct {
         };
         s.kv_shard = kv_shard.Switches.read(get) catch |err| {
             problem.* = kv_shard.why(err).?;
+            return error.BadSetting;
+        };
+        s.share_untwinned_pct = share_mod.untwinnedPct(get("TF_GLM_KV_SHARE_UNTWINNED_PCT")) catch {
+            problem.* = "TF_GLM_KV_SHARE_UNTWINNED_PCT: 1 to 100 (an untwinned prefill's rate as a percentage of the twinned; 75 the default, 100 always adopts a kept prefix)";
             return error.BadSetting;
         };
         if (get("TF_GLM_KV_LIVE_HALF")) |v| {

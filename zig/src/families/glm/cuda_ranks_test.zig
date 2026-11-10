@@ -416,3 +416,26 @@ test "TF_GLM_KV_LIVE_HALF: off by default, 0 or 1, a typo refused, and every ran
     const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), @splat(0)), Fingerprint.of(2, 1, on, 8192, true, @splat(0), @splat(0), @splat(0)) };
     try std.testing.expectEqual(Mismatch{ .field = .kv_live_half, .rank = 1 }, mismatch(&all).?);
 }
+
+test "TF_GLM_KV_SHARE_UNTWINNED_PCT: 75 by default, 1 to 100 read, a value outside refused by name" {
+    const Reader = struct {
+        fn absent(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
+        fn pct(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "90" else null;
+        }
+        fn always(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "100" else null;
+        }
+        fn bad(key: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, "TF_GLM_KV_SHARE_UNTWINNED_PCT")) "0" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expectEqual(@as(u32, 75), (try Settings.read(Reader.absent, &problem)).share_untwinned_pct);
+    try std.testing.expectEqual(@as(u32, 90), (try Settings.read(Reader.pct, &problem)).share_untwinned_pct);
+    try std.testing.expectEqual(@as(u32, 100), (try Settings.read(Reader.always, &problem)).share_untwinned_pct);
+    try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "TF_GLM_KV_SHARE_UNTWINNED_PCT") != null);
+}

@@ -321,6 +321,7 @@ pub const Lanes = struct {
         defer adopt.deinit(gpa);
         // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
         const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
+        if (share) share_mod.gate(self.x.e, &owner, &adopt, ids.len); // sharded: a resume adopts only when its untwinned tail pays
         var held = true;
         errdefer if (held) gpa.free(marks);
         const pages = try self.seat(s, ids.len, s.max_new, adopt.items);

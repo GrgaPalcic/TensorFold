@@ -62,6 +62,44 @@ pub fn begin(e: *engine.Engine, s: *const Stream, owner: *Owner, adopt: *std.Arr
     return .{ .from = plan.from, .marks = mine };
 }
 
+/// TF_GLM_KV_SHARE_UNTWINNED_PCT's default: an untwinned prefill's rate as a percentage of the twinned rate.
+pub const untwinned_pct_default: u32 = 75;
+
+/// The setting's value (blank or unset: the default), `error.BadKvShareUntwinned` outside 1 to 100.
+pub fn untwinnedPct(raw: ?[]const u8) error{BadKvShareUntwinned}!u32 {
+    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
+    if (t.len == 0) return untwinned_pct_default;
+    const v = std.fmt.parseInt(u32, t, 10) catch return error.BadKvShareUntwinned;
+    if (v < 1 or v > 100) return error.BadKvShareUntwinned;
+    return v;
+}
+
+/// Whether a resume adopts a kept prefix of `adopted` tokens before a prompt of `prompt` tokens: the tail it
+/// prefills without a twin pays for the prefix it skips when `new × (100 − pct) ≤ adopted × pct`, the untwinned
+/// rate as `pct`% of the twinned (75: a tail of at most three times the adopted prefix; 100: always adopt).
+pub fn adoptPays(adopted: u32, prompt: usize, pct: u32) bool {
+    const new = prompt -| adopted;
+    return @as(u64, new) * (100 - @as(u64, pct)) <= @as(u64, adopted) * @as(u64, pct);
+}
+
+/// TF_KV_SHARE sharded: a resume adopts only when its untwinned tail pays (TF_GLM_KV_SHARE_UNTWINNED_PCT). A
+/// skipped one runs cold as the pass would without a kept state (its twin borrowed, the kept state left in the
+/// store and still resumable), counted in `kv_shard_resumes_skipped_total`. Rank 0 decides — with nothing adopted
+/// the begin step opens the follower's pass cold as it does today. Unsharded (no parts) a resume adopts always.
+pub fn gate(e: *engine.Engine, owner: *Owner, adopt: *std.ArrayList(u32), prompt: usize) void {
+    if (adopt.items.len == 0) return;
+    const p = e.pages orelse return;
+    const x = p.shard orelse return;
+    const at = if (owner.pending) |k| k.at else return;
+    const pct = e.settings.share_untwinned_pct;
+    if (adoptPays(at, prompt, pct)) return;
+    for (adopt.items) |id| x.parts.release(id); // the begin's holds go back, the tree's keep the state resumable
+    adopt.clearRetainingCapacity();
+    owner.pending = null;
+    x.parts.counts.resumes_skipped += 1;
+    std.log.debug("kv shard: a share resume's kept {d} tokens stay in the store, its {d}-token tail untwinned does not pay (TF_GLM_KV_SHARE_UNTWINNED_PCT {d}); the pass runs cold", .{ at, prompt -| at, pct });
+}
+
 /// A pass's marks (the engine's Marks.ctx): the mark it stands at, or the last it completed when cancelled, keeps.
 pub const Keeps = struct {
     e: *engine.Engine,
@@ -94,4 +132,31 @@ pub const Keeps = struct {
 pub fn marks(e: *engine.Engine, slot: u32, s: *const Stream, at: []const u32, keeps: *Keeps) ?engine.Marks {
     keeps.* = .{ .e = e, .slot = slot, .prompt = cacheKey(s) orelse return null };
     return if (at.len == 0) null else .{ .at = at, .ctx = keeps, .call = Keeps.at, .interrupted = Keeps.at };
+}
+
+test "TF_GLM_KV_SHARE_UNTWINNED_PCT: 75 the default, 1 to 100 taken, anything else refused" {
+    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct(null));
+    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct(""));
+    try std.testing.expectEqual(@as(u32, 75), try untwinnedPct("  "));
+    try std.testing.expectEqual(@as(u32, 1), try untwinnedPct("1"));
+    try std.testing.expectEqual(@as(u32, 100), try untwinnedPct("100"));
+    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("0"));
+    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("101"));
+    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("-1"));
+    try std.testing.expectError(error.BadKvShareUntwinned, untwinnedPct("half"));
+}
+
+test "TF_GLM_KV_SHARE_UNTWINNED_PCT 75: a resume adopts when the tail is at most three times the kept prefix" {
+    try std.testing.expect(!adoptPays(4096, 126407, 75)); // 122,311 new tokens over 3 x 4,096 adopted: cold
+    try std.testing.expect(adoptPays(122880, 126407, 75)); // 3,527 new tokens: adopted
+    try std.testing.expect(!adoptPays(122880, 610128, 75)); // 487,248 new tokens over 3 x 122,880: cold
+    try std.testing.expect(adoptPays(126407, 126407, 75)); // the whole prompt kept: an empty tail pays
+    try std.testing.expect(!adoptPays(0, 4096, 75)); // nothing kept: cold
+}
+
+test "TF_GLM_KV_SHARE_UNTWINNED_PCT 100: a resume adopts however long its tail; at 1 almost never" {
+    try std.testing.expect(adoptPays(4096, 126407, 100));
+    try std.testing.expect(adoptPays(0, 4096, 100));
+    try std.testing.expect(adoptPays(126407, 126407, 1)); // the tail empty: adopted
+    try std.testing.expect(!adoptPays(4096, 126407, 1)); // a tail a hundredfold the prefix: cold
 }
