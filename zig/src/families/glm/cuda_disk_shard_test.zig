@@ -13,6 +13,7 @@ const snap_pages = @import("cuda_snapshot_pages.zig");
 const layout = @import("cuda_snapshot_layout.zig");
 const image = @import("cuda_disk_image.zig");
 const ranks = @import("cuda_disk_ranks.zig");
+const follow = @import("cuda_follow.zig");
 const kvs = @import("cuda_kv_shard.zig");
 const kv_keep = @import("cuda_kv_shard_keep.zig");
 const Engine = @import("cuda_engine.zig").Engine;
@@ -71,6 +72,19 @@ const H = struct {
     fn wait(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         return 0;
     }
+    fn eventCreate(out: *cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
+        out.* = @ptrFromInt(8);
+        return 0;
+    }
+    fn eventDestroy(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn eventRecord(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn eventQuery(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
     fn hostAlloc(out: *?*anyopaque, n: usize, _: c_uint) callconv(.c) cuda.abi.Result {
         var p: u64 = 0;
         const r = alloc(&p, n);
@@ -88,6 +102,16 @@ const H = struct {
     }
     fn rankOf(comm: cuda.nccl.Comm) usize {
         return @intFromPtr(comm) - 1;
+    }
+    var link: [2]u64 = .{ 0, 0 }; // each rank's link buffer (the test notes it after Link.init)
+    fn bcast(buf: u64, _: u64, n: usize, _: cuda.nccl.DataType, root: c_int, comm: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+        const r = rankOf(comm);
+        if (root < 0 or root >= link.len) return 3;
+        const g: usize = @intCast(root);
+        if (link[r] == 0 or link[g] == 0 or buf < link[r] or buf - link[r] + n > (64 + 256 * 4)) return 3;
+        const off = buf - link[r];
+        @memmove(bytes(link[r] + off, n), bytes(link[g] + off, n));
+        return 0;
     }
     fn send(buf: u64, n: usize, _: cuda.nccl.DataType, peer: c_int, comm: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
         const r = rankOf(comm);
@@ -108,6 +132,7 @@ const H = struct {
     fn reset() void {
         for (&queue) |*q| q.clearAndFree(std.heap.page_allocator);
         taken = .{ 0, 0 };
+        link = .{ 0, 0 };
     }
 };
 
@@ -135,11 +160,16 @@ const Rank = struct {
         r.d.api.cuMemcpyDtoH_v2 = H.dtoh;
         r.d.api.cuMemcpyDtoDAsync_v2 = H.dtod;
         r.d.api.cuStreamSynchronize = H.wait;
+        r.d.api.cuEventCreate = H.eventCreate;
+        r.d.api.cuEventDestroy_v2 = H.eventDestroy;
+        r.d.api.cuEventRecord = H.eventRecord;
+        r.d.api.cuEventQuery = H.eventQuery;
         r.d.api.cuMemHostAlloc = H.hostAlloc;
         r.d.api.cuMemFreeHost = H.hostFree;
         r.d.api.cuMemcpyDtoHAsync_v2 = H.toHost;
         r.d.api.cuMemcpyHtoDAsync_v2 = H.fromHost;
         r.lib = undefined;
+        r.lib.api.ncclBroadcast = H.bcast;
         r.lib.api.ncclSend = H.send;
         r.lib.api.ncclRecv = H.recv;
         for (&r.layers, [_]bool{ false, true, false }) |*l, mla| l.mixer = if (mla) .{ .mla = undefined } else .{ .kda = undefined };
@@ -166,6 +196,7 @@ const Rank = struct {
         e.next_snap = 1;
         e.announce = 0;
         e.dropped = .empty;
+        e.disk_failed = .empty;
         e.link = null;
         e.lib = &r.lib;
         e.comm = @ptrFromInt(rank + 1);
@@ -185,6 +216,7 @@ const Rank = struct {
         var it = e.snaps.valueIterator();
         while (it.next()) |s| snapshots.free(e, s);
         e.snaps.deinit(e.gpa);
+        e.disk_failed.deinit(e.gpa);
         r.p.deinit();
         for (e.seqs.items) |q| if (q) |s| {
             s.st.deinit();
@@ -318,6 +350,61 @@ const Range = struct { off: u64, len: u64 };
 
 fn prefixesOf(p: *Pair) ![2]u64 {
     return .{ (try ranks.shape(&p.r[0].e)).prefix, (try ranks.shape(&p.r[1].e)).prefix };
+}
+
+// Rank 1's disk steps with rank 0's link beside it: an op that fails here poisons its id, answers rank 0's takes
+// and seal with the failure, and the step loop runs on — a failed recall costs rank 0 a cold pass, not the rank.
+test "GLM disk steps: a follower's failed op poisons the id, answers the seal with a failure and the loop runs on" {
+    const a = std.testing.allocator;
+    var p: Pair = undefined;
+    try p.init(false, false);
+    defer p.deinit();
+    try p.open(1, prompt, null); // the bound stream the blanks' states stand beside
+    defer p.close(1);
+    try p.bind(1);
+    var link: [2]follow.Link = undefined;
+    for (&p.r, 0..) |*r, i| {
+        link[i] = try follow.Link.init(a, &r.d, &r.lib, r.e.comm, r.e.stream, 256);
+        H.link[i] = link[i].buf.ptr;
+    }
+    defer for (&link) |*l| l.deinit();
+    const e = &p.r[1].e;
+    const disk: u32 = @backingInt(follow.Kind.disk);
+    // its blank for id 3 stands
+    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.blank), .a = 3, .seed = at, .depth = 0, .top_k = 0 }, &.{});
+    try expect(e.snaps.contains(3));
+    // a write into it past the blank's front fails on this rank: the id poisoned, its half-made state dropped,
+    // and no error out of the step
+    var bytes: [2]u32 = undefined; // the op's 8 bytes of ids
+    const sh = try ranks.shape(e);
+    const put: follow.Header = .{ .kind = disk, .flags = @backingInt(ranks.Op.put), .a = 3, .seed = image.Words.bytes + image.front(sh, at) + 8, .depth = 8, .top_k = 1 };
+    try ranks.step(e, &link[1], put, &bytes);
+    try expect(!e.snaps.contains(3)); // the half-made state dropped
+    try expect(e.disk_failed.contains(3));
+    try ranks.step(e, &link[1], put, &bytes); // skipped, not an error
+    // a take for the poisoned id still crosses the link and answers with its status
+    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.take), .a = 3, .seed = 0, .depth = 8, .top_k = 1 }, &.{});
+    try link[0].from(1, 8 + @sizeOf(u32));
+    var answer: [8 + @sizeOf(u32)]u8 = undefined;
+    try link[0].buf.download(64, &answer);
+    try expectEqual(@as(u32, 1), std.mem.readInt(u32, answer[8..12], .little));
+    // its seal answers the failure too
+    var seal_ids: [2 * image.Words.count]u32 = undefined;
+    @memset(&seal_ids, 0);
+    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.seal), .a = 3 }, &seal_ids);
+    try link[0].from(1, @sizeOf(u32));
+    var ok: u32 = 0;
+    try link[0].buf.download(64, std.mem.asBytes(&ok));
+    try expectEqual(@as(u32, 1), ok);
+    // a healthy blank's seal answers 0 and stands sealed
+    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.blank), .a = 8, .seed = at, .depth = 0, .top_k = 0 }, &.{});
+    const words = (image.Words{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 0 }).encode();
+    try ranks.step(e, &link[1], .{ .kind = disk, .flags = @backingInt(ranks.Op.seal), .a = 8 }, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&words)));
+    try link[0].from(1, @sizeOf(u32));
+    try link[0].buf.download(64, std.mem.asBytes(&ok));
+    try expectEqual(@as(u32, 0), ok);
+    try expect(e.snaps.get(8).?.len != 0);
+    try expect(!e.disk_failed.contains(8));
 }
 
 /// The store image of kept state `id` (rank 0's image, then rank 1's prefix), gathered in ranges across the seams.

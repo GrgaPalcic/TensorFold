@@ -125,7 +125,7 @@ fn recalled(a: Allocator, tag: []const u8, c: Case, read_ahead: bool) !void {
     try t.expectEqual(@as(u64, 0), x.r.counts.reads);
     try t.expectEqual(@as(u64, if (c.mine) 0 else 1), x.r.counts.failed);
     try t.expectEqual(@as(usize, @intFromBool(c.mine)) + @intFromBool(c.other), x.r.states.items.len);
-    try t.expectEqual(c.mine, x.r.best(turns[0], &.{}, &.{}, 0) != null);
+    try t.expect(x.r.best(turns[0], &.{}, &.{}, 0) == null); // the read failed: refused ones are forgotten, the rest marked, not read again here
     try t.expectEqual(c.mine, exists(x.r, own.name, ".st"));
     try t.expectEqual(c.other, exists(x.r, other, ".st"));
     try t.expectEqual(c.mine or c.other, exists(x.r, shared.name, ".blk"));

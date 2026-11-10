@@ -78,6 +78,8 @@ pub const State = struct {
     rows: u64,
     used: u64,
     shared: bool,
+    /// A recall of it failed in this process: not read again (its files stay, for a process that can read it).
+    unreadable: bool = false,
 };
 
 /// A block file's bytes, and how many states name it.
@@ -300,9 +302,11 @@ pub const Rows = struct {
     }
 
     /// The disk state reaching furthest into `prompt` past `longer_than`: its tokens a prefix, spans and starts equal.
+    /// A state a recall of already failed here is not read again (rows_read's mark): the next request prefills cold.
     pub fn best(r: *const Rows, prompt: []const u32, starts: []const u32, spans: []const Span, longer_than: u32) ?usize {
         var out: ?usize = null;
         for (r.states.items, 0..) |*s, i| {
+            if (s.unreadable) continue;
             if (s.at <= longer_than) continue;
             if (out != null and s.at <= r.states.items[out.?].at) continue;
             if (!r.matches(s, prompt, starts, spans)) continue;
@@ -316,6 +320,11 @@ pub const Rows = struct {
         if (!std.mem.eql(u32, prompt[0..s.tokens.len], s.tokens) or !modes.equal(s.spans, spans, s.at)) return false;
         if (r.keying.planned and starts.len == 0 and r.grid > 0) return s.at % r.grid == 0 and onGrid(s.starts, s.at, r.grid);
         return !r.keying.planned or sameBelow(starts, s.starts, s.at);
+    }
+
+    /// The state named `name` is not read again in this process (a recall of it failed; its files stay on disk).
+    pub fn markUnreadable(r: *Rows, name: Name) void {
+        if (r.find(name)) |i| r.states.items[i].unreadable = true;
     }
 
     /// State `i` was used now: the newest for eviction.
