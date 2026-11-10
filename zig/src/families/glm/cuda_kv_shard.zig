@@ -478,6 +478,7 @@ pub const Counts = struct {
     carries: u64 = 0, // resumes whose latent rows went to the rank lacking them
     carry_bytes: u64 = 0,
     resumes_dropped: u64 = 0, // resumes that started from 0: the stream could not go home and carries are off
+    resumes_skipped: u64 = 0, // share resumes skipped: the kept prefix would not pay its untwinned tail, the pass ran cold
     checks: u64 = 0, // layout digests sent (rank 0) or compared
 
     pub fn into(c: Counts, out: *kv_parts.Stats) void {

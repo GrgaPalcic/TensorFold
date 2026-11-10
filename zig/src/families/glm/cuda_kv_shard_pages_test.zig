@@ -440,3 +440,100 @@ test "kv shard pages: the follower maps a begin whose leading ids are the store'
     try expectEqual(kvs.Hold{ .owner = 1 }, s.hold.?); // owner-computed pass: rank 0 alone holds the rows
     try expectEqual(p0.digest(), p1.digest()); // the adopted pages are in the slot's ids, so in the digest
 }
+
+test "kv shard pages: a share resume whose untwinned tail does not pay runs cold, the kept state stays; one that pays adopts" {
+    const gpa = std.testing.allocator;
+    const Lanes = @import("cuda_lanes.zig").Lanes;
+    const share_mod = @import("cuda_share.zig");
+    const lanes = @import("lanes");
+    const types = @import("cuda_engine_types.zig");
+    const kv = @import("core").kv_pool;
+    var f: Fake = undefined;
+    Fake.reset();
+    try f.init(gpa, 0, true);
+    const p = try f.pool(4, 20, true); // two parts of 8
+    defer f.deinit(p);
+    const x = p.shard.?;
+    // the store's page in part 1 (global 8): a keep left it, a begin holds it once more for the resume it offered
+    var lease: kv.Lease = .{};
+    try x.parts.pools[1].promise(&lease, 1);
+    try x.parts.pools[1].cover(&lease, 1, null);
+    const page = lease.ids.items[0] + 8;
+    x.parts.retain(page); // the tree's own hold on the page
+    x.parts.pools[1].finish(&lease); // the stream's lease goes, the tree's and the begins' holds stay
+    var ln: Lanes = .{ .x = .{ .e = &f.e, .link = undefined } };
+    defer ln.lanes.deinit(gpa);
+    var adopt: std.ArrayList(u32) = .empty;
+    defer adopt.deinit(gpa);
+    var kept: types.Kept = .{ .id = 7, .at = 4096 };
+    var owner: share_mod.Owner = .{ .pending = &kept };
+
+    // 4,096 kept against a 126,407-token prompt: the tail would not pay, the resume is skipped and counted
+    x.parts.retain(page); // the begin's hold for the resume
+    try adopt.append(gpa, page);
+    share_mod.gate(&f.e, &owner, &adopt, 126407);
+    try expectEqual(@as(usize, 0), adopt.items.len);
+    try expect(owner.pending == null);
+    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped);
+    try expectEqual(@as(u32, 1), x.parts.holders(page)); // the tree's hold: the kept state is still in the store
+    var s: lanes.Stream = undefined;
+    s.reuse = .{};
+    _ = try ln.seat(&s, 600, 100, adopt.items); // the cold pass: placed by the parts' choice, its twin borrowed
+    const slot = ln.lanes.get(&s).?.slot;
+    try expect(p.twinCount(slot) > 0);
+    p.close(slot);
+
+    // 122,880 kept against the same prompt: the tail pays, the resume adopts with no twin
+    x.parts.retain(page); // a fresh begin's hold
+    var kept2: types.Kept = .{ .id = 7, .at = 122880 };
+    owner = .{ .pending = &kept2 };
+    try adopt.append(gpa, page);
+    share_mod.gate(&f.e, &owner, &adopt, 126407);
+    try expectEqual(@as(usize, 1), adopt.items.len);
+    try expect(owner.pending == &kept2);
+    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped); // the adopted one is not a skip
+    var s2: lanes.Stream = undefined;
+    s2.reuse = .{};
+    _ = try ln.seat(&s2, 600, 100, adopt.items); // the resume: its adopted pages' part, no twin
+    const slot2 = ln.lanes.get(&s2).?.slot;
+    try expectEqual(@as(u8, 1), f.st(slot2).hold.?.owner);
+    try expectEqualSlices(u32, &.{page}, f.st(slot2).pages[0..1]);
+    try expectEqual(@as(usize, 0), p.twinCount(slot2));
+    try expectEqual(@as(u32, 2), x.parts.holders(page)); // the tree's and the lease's
+    p.close(slot2);
+
+    // at 100 the short-kept resume adopts too
+    f.e.settings.share_untwinned_pct = 100;
+    x.parts.retain(page); // a fresh begin's hold
+    var kept3: types.Kept = .{ .id = 7, .at = 4096 };
+    owner = .{ .pending = &kept3 };
+    share_mod.gate(&f.e, &owner, &adopt, 126407);
+    try expectEqual(@as(usize, 1), adopt.items.len);
+    try expect(owner.pending == &kept3);
+    try expectEqual(@as(u64, 1), x.parts.counts.resumes_skipped);
+    var s3: lanes.Stream = undefined;
+    s3.reuse = .{};
+    _ = try ln.seat(&s3, 600, 100, adopt.items);
+    try expectEqual(@as(u8, 1), f.st(ln.lanes.get(&s3).?.slot).hold.?.owner);
+    try expectEqual(@as(usize, 0), p.twinCount(ln.lanes.get(&s3).?.slot));
+    p.close(ln.lanes.get(&s3).?.slot);
+}
+
+test "kv shard pages: an unsharded share resume adopts always (the gate leaves the begin's pages alone)" {
+    const gpa = std.testing.allocator;
+    const share_mod = @import("cuda_share.zig");
+    const types = @import("cuda_engine_types.zig");
+    var f: Fake = undefined;
+    Fake.reset();
+    try f.init(gpa, 0, false); // unsharded
+    const p = try f.pool(4, 20, true);
+    defer f.deinit(p);
+    var kept: types.Kept = .{ .id = 7, .at = 4096 };
+    var owner: share_mod.Owner = .{ .pending = &kept };
+    var adopt: std.ArrayList(u32) = .empty;
+    defer adopt.deinit(gpa);
+    try adopt.append(gpa, 3); // a page id nobody holds: the gate must not touch it
+    share_mod.gate(&f.e, &owner, &adopt, 126407);
+    try expectEqual(@as(usize, 1), adopt.items.len);
+    try expect(owner.pending == &kept);
+}
