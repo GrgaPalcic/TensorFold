@@ -86,7 +86,7 @@ fn mtpHead(e: anytype, at: usize) error{Overflow}!?usize {
 pub fn bytes(e: anytype, at: usize) u64 {
     const head = mtpHead(e, at) catch return std.math.maxInt(u64);
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
-    const n = layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at), true) catch return std.math.maxInt(u64);
+    const n = layout.Plan.sizeForShared(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at), true, e.cur.st.cur) catch return std.math.maxInt(u64);
     const ring: usize = if (e.drafter != null) dflash.ring_bytes else 0; // at most: DFlash2's ring when it holds rows
     return pages.rounded(n + ring) catch std.math.maxInt(u64);
 }
@@ -141,8 +141,8 @@ pub fn keepAs(e: anytype, id: u64) !void {
     // TF_KV_SHARE: the shared store's pages below the mark stay out (the state's copy resumes from them by reference).
     const own = kv_keep.keepsLatent(hold, e.share.rank);
     const held = heldPages(e, e.cur.st.pos);
-    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, own);
-    const latent_bytes = if (own) 0 else (try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, true)).len - plan.len;
+    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, own, e.cur.st.cur);
+    const latent_bytes = if (own) 0 else (try layout.Plan.initForShared(&e.cur.st, &e.c, e.cur.st.pos, head, held, true, e.cur.st.cur)).len - plan.len;
     const ring = try drafterPart(e, &plan, e.cur.st.pos);
     var lease = try pool.take(plan.len + latent_bytes);
     errdefer {
@@ -188,7 +188,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     if (!ringHolds(bases[0], s.pos, rows) or !ringHolds(bases[1], mtp_len, rows)) return error.DiskWords;
     // TF_GLM_KV_SHARD: off its home rank the copy packs every part but the latent rows, as keepAs leaves it
     const own = if (s.home) |h| h == e.share.rank else true;
-    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own);
+    const n = try layout.Plan.sizeFor(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, own, s.cur);
     if (n == 0 or n > s.lease.count() * pages.page) return error.SnapshotSize;
     for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
     s.len = n;
@@ -203,7 +203,8 @@ pub fn restore(e: anytype, id: u64) !void {
     const hold = holdOf(e);
     const home: ?u8 = if (e.settings.kv_shard.on) s.home else null;
     const own = if (home) |h| h == e.share.rank else true; // this rank's copy holds the latent rows
-    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own);
+    // the kept state's own parity picks the half a live-half keep carries; the slot's dead half stays as it is
+    var plan = try layout.Plan.initForShared(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared, own, s.cur);
     if (s.ring_from != null) try plan.outside(try (e.drafter orelse return error.SnapshotSize).ringPtr(e.slot), dflash.ring_bytes);
     if (plan.len != s.len) return error.SnapshotSize;
     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
@@ -268,7 +269,7 @@ fn carrySend(e: anytype, s: *const types.Snap, plan: *const layout.Plan) !void {
 /// piece at a time from the peer into the staging buffer and on into the rows.
 fn carryRecv(e: anytype, s: *const types.Snap) !void {
     const stage = (e.kv_stage orelse return error.KvShardRoom).ptr;
-    const live = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, true);
+    const live = try layout.Plan.initFor(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, true, e.cur.st.cur);
     var buf: [layout.Plan.max_parts]usize = undefined;
     const lens = latentLens(&live, &buf);
     var parts: [layout.Plan.max_parts]layout.Part = undefined;

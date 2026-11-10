@@ -24,6 +24,7 @@ pub const Settings = struct {
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     numerics: Numerics = .{}, // opt-in prompt kernels that round differently (each off by default)
     kv_shard: kv_shard.Switches = .{}, // TF_GLM_KV_SHARD and its knobs: each stream's latent rows on one rank
+    kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -118,6 +119,12 @@ pub const Settings = struct {
             problem.* = kv_shard.why(err).?;
             return error.BadSetting;
         };
+        if (get("TF_GLM_KV_LIVE_HALF")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         if (s.prompt_fixed_k and !s.tiled) {
             problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
             return error.BadSetting;
@@ -148,7 +155,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 15, // this struct's version (14 had no kv_shard words; 13 was num3's numerics or prefill3's pair alone)
+    layout: u32 = 16, // this struct's version (15 had no kv_live_half; 14 had no kv_shard words; 13 was num3's numerics or prefill3's pair alone)
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -170,6 +177,7 @@ pub const Fingerprint = extern struct {
     numerics: u32 = 0, // Settings.numerics: every rank's prompt kernels round alike
     kv_shard: u32 = 0, // TF_GLM_KV_SHARD and _CARRY, _TWINS (kv_shard.Switches.word; 0: off)
     kv_shard_check: u32 = 0, // TF_GLM_KV_SHARD_CHECK when on (0 off)
+    kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -200,6 +208,7 @@ pub const Fingerprint = extern struct {
         numerics,
         kv_shard,
         kv_shard_check,
+        kv_live_half,
         capacity,
         heat_high,
         heat_low,
@@ -235,6 +244,7 @@ pub const Fingerprint = extern struct {
             .numerics = s.numerics.bits(),
             .kv_shard = s.kv_shard.word(),
             .kv_shard_check = s.kv_shard.checkWord(),
+            .kv_live_half = @intFromBool(s.kv_live_half),
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -274,6 +284,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "numerics",
             "kv_shard",
             "kv_shard_check",
+            "kv_live_half",
             "capacity",
             "heat_high",
             "heat_low",
@@ -386,6 +397,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .numerics => "TF_GLM_ABSORB_MMA or TF_GLM_W8A8",
         .kv_shard => "TF_GLM_KV_SHARD, TF_GLM_KV_SHARD_CARRY or TF_GLM_KV_SHARD_TWINS",
         .kv_shard_check => "TF_GLM_KV_SHARD_CHECK",
+        .kv_live_half => "TF_GLM_KV_LIVE_HALF",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

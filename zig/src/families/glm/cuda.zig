@@ -52,6 +52,7 @@ test {
     _ = @import("cuda_load_owner.zig");
     _ = @import("cuda_images_interleave_test.zig");
     _ = @import("cuda_pages_test.zig");
+    _ = @import("cuda_snapshot_layout_test.zig");
     _ = kv_shard;
     _ = share;
     _ = @import("cuda_kv_shard_pages_test.zig");

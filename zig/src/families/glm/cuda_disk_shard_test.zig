@@ -241,7 +241,7 @@ fn pattern(rank: usize, k: usize, j: usize) u8 {
 /// Each part of the bound sequence's full plan at `at` (on a rank that does not hold its latent rows, those land on
 /// the trash page), filled with `pattern`; then its position and head rows set as a pass leaves them.
 fn fill(e: *Engine) !void {
-    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true);
+    const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true, e.cur.st.cur);
     for (plan.parts[0..plan.count], 0..) |part, k| {
         var done: usize = 0;
         while (done < part.len) {
@@ -263,7 +263,7 @@ const Parts = struct {
     count: usize = 0,
 
     fn of(e: *Engine) !Parts {
-        const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true);
+        const plan = try layout.Plan.initFor(&e.cur.st, &e.c, at, null, true, e.cur.st.cur);
         var out: Parts = .{ .count = plan.count };
         for (plan.parts[0..plan.count], 0..) |part, k| {
             out.lat[k] = k == 1 or k == 2; // the DSA layer's codes, then its E4M3 scales (`lat` marks them sharded)
