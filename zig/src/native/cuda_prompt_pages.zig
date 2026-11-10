@@ -32,6 +32,9 @@ pub const Adapter = struct {
     part: [2]Part = undefined, // each part's reclaim hook (the parts variant)
     detach: *const fn (*anyopaque) void,
     target: *anyopaque,
+    /// --learn-conversations beside TF_KV_SHARE: the states' disk store (cuda_glm_disk.attachShare); closed with the
+    /// store, whose deinit lets the writer's queued saves go first.
+    disk: ?*api.prompt_cache.rows.Rows = null,
 
     /// The family's store, its pool's reclaim evicting the tree's idle pages — one pool's all of them, a sharded
     /// pool's each part its own leaves (below); null: the family has no pool.
@@ -79,6 +82,7 @@ pub const Adapter = struct {
         .release = PartsPages.release,
         .holders = PartsPages.holders,
         .available = PartsPages.available,
+        .hold = PartsPages.hold,
     };
 
     const PartsPages = struct {
@@ -101,6 +105,11 @@ pub const Adapter = struct {
             const s = parts(ptr);
             return s.available(s.ctx);
         }
+        fn hold(ptr: *anyopaque, out: []u32) bool {
+            const s = parts(ptr);
+            const f = s.holdPages orelse return false;
+            return f(s.ctx, out);
+        }
     };
 
     fn Detach(comptime F: type) type {
@@ -111,7 +120,8 @@ pub const Adapter = struct {
         };
     }
 
-    /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages.
+    /// The family stops calling, the pool's reclaim goes, the tree drops its states and releases its pages; a disk
+    /// store closes with it, its queued saves let go first (its pages' holds back, its tokens freed).
     pub fn close(x: *Adapter) void {
         x.detach(x.target);
         switch (x.src) {
@@ -119,6 +129,7 @@ pub const Adapter = struct {
             .parts => |s| for (0..s.count) |i| s.setReclaim(s.ctx, i, null),
         }
         x.store.deinit();
+        if (x.disk) |r| r.deinit();
         x.gpa.destroy(x);
     }
 

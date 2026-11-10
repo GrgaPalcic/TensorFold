@@ -516,7 +516,14 @@ test "GLM disk image: a sharded read's words: format 3 names a home within two p
     const w: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .home = 1 };
     const x = w.encode();
     try expectEqual(@as(?u8, 1), (try image.Words.decode(x, at)).home);
-    for ([_]u64{ 3 | 2 << 8 | 2 << 16, 3 | 0 << 8 | 3 << 16, 3 | 1 << 8 | 2 << 16 | 1 << 24, 1 | 1 << 8, 2, 4 }) |bad| {
+    // the pages layout (TF_KV_SHARE's store): formats 4 and 5 say so, a home beside it as sharding's does
+    const pw: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .pages = true };
+    const ps: image.Words = .{ .at = at, .mtp_len = 0, .base = 0, .mtp_base = 0, .cur = 5, .home = 1, .pages = true };
+    try expectEqual(@as(u64, 4), pw.encode()[0]);
+    try expectEqual(@as(u64, 5 | 1 << 8 | 2 << 16), ps.encode()[0]);
+    try expect((try image.Words.decode(pw.encode(), at)).pages);
+    try expectEqual(@as(?u8, 1), (try image.Words.decode(ps.encode(), at)).home);
+    for ([_]u64{ 3 | 2 << 8 | 2 << 16, 3 | 0 << 8 | 3 << 16, 3 | 1 << 8 | 2 << 16 | 1 << 24, 1 | 1 << 8, 2, 4 | 1 << 8, 5, 6 }) |bad| {
         var y = x;
         y[0] = bad;
         try expectError(error.DiskWords, image.Words.decode(y, at));

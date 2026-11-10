@@ -10,7 +10,8 @@ const window_rows = st_mod.window_rows;
 
 /// The image's first bytes: the format, the position, the head's rows, both ring bases and the KDA copy bits. A
 /// KV-sharded state (TF_GLM_KV_SHARD) also names its home part and the parts its pool had in the format word; the
-/// image's bytes are the same either way, as its latent rows come from the home rank alone (`route`).
+/// image's bytes are the same either way, as its latent rows come from the home rank alone (`route`). A store under
+/// TF_KV_SHARE (--learn-conversations beside it) writes the pages layout instead: its rows sit in the pool's pages.
 pub const Words = struct {
     at: u64,
     mtp_len: u64,
@@ -18,28 +19,44 @@ pub const Words = struct {
     mtp_base: u64,
     cur: u64,
     home: ?u8 = null, // the part that held its latent rows when it was written (null: unsharded)
+    pages: bool = false, // the pages layout: its rows are the tree's pages' (cuda_glm_disk's store under TF_KV_SHARE)
 
     pub const count = 6;
     pub const bytes: u64 = count * 8;
     const format: u64 = 1;
     const sharded: u64 = 3; // | home << 8 | kv_parts << 16
+    const pages_fmt: u64 = 4; // the pages layout
+    const pages_sharded: u64 = 5; // the pages layout, sharded: | home << 8 | kv_parts << 16
     pub const kv_parts: u64 = 2; // a sharded pool's parts (TP=2 alone)
 
     pub fn encode(w: Words) [count]u64 {
-        const f = if (w.home) |h| if (mut(.words_no_home)) format else sharded | @as(u64, h) << 8 | kv_parts << 16 else format;
+        const f = if (w.home) |h|
+            (if (mut(.words_no_home)) format else (if (w.pages) pages_sharded else sharded) | @as(u64, h) << 8 | kv_parts << 16)
+        else if (w.pages) pages_fmt else format;
         return .{ f, w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
     }
 
     /// Words read back: refused unless the format is one of these and the state stands at `at`; a sharded state's
     /// home within its parts, and those parts the two of TP=2.
     pub fn decode(x: [count]u64, at: u32) !Words {
-        const home: ?u8 = switch (x[0] & 0xff) {
-            format => if (x[0] == format) null else return error.DiskWords,
-            sharded => if (x[0] >> 24 == 0 and (x[0] >> 16 & 0xff) == kv_parts and (x[0] >> 8 & 0xff) < kv_parts) @intCast(x[0] >> 8 & 0xff) else return error.DiskWords,
+        var home: ?u8 = null;
+        var paged = false;
+        switch (x[0] & 0xff) {
+            format => if (x[0] != format) return error.DiskWords,
+            pages_fmt => {
+                if (x[0] != pages_fmt) return error.DiskWords;
+                paged = true;
+            },
+            sharded, pages_sharded => {
+                paged = x[0] & 0xff == pages_sharded;
+                if (x[0] >> 24 == 0 and (x[0] >> 16 & 0xff) == kv_parts and (x[0] >> 8 & 0xff) < kv_parts) {
+                    home = @intCast(x[0] >> 8 & 0xff);
+                } else return error.DiskWords;
+            },
             else => return error.DiskWords,
-        };
+        }
         if (x[1] != at) return error.DiskWords;
-        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .home = home };
+        return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5], .home = home, .pages = paged };
     }
 };
 
@@ -118,6 +135,48 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
     }
     if (sh.head) for (cache(sh, sh.headRows(at))) |n| if (n > 0) try out.append(a, .{ .bytes = n });
     try out.append(a, .{ .bytes = sh.tail });
+}
+
+/// The image at `at` when its rows sit in the pool's pages (TF_KV_SHARE's disk store): the words, then each DSA
+/// layer's rows (its latent codes, scales and whole pooled keys, addressed through the tree's page ids), then the
+/// snapshot's fixed parts in the order its slot holds them (the arena head, per layer the rings and the pools past
+/// the mark, the MTP head's caches, the tail).
+pub fn pageParts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
+    if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
+    try out.append(a, .{ .bytes = Words.bytes });
+    const pooled: u64 = at / sparse.pool;
+    for (0..sh.layers) |_| {
+        const c = cache(sh, at);
+        try out.append(a, .{ .bytes = c[0], .row = sh.latent }); // the pages' rows, a row a token
+        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
+        try out.append(a, .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool });
+    }
+    try out.append(a, .{ .bytes = sh.prefix });
+    for (0..sh.layers) |_| {
+        const c = cache(sh, at);
+        try out.appendSlice(a, &.{ .{ .bytes = c[2] }, .{ .bytes = c[3] }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
+    }
+    if (sh.head) for (cache(sh, sh.headRows(at))) |n| if (n > 0) try out.append(a, .{ .bytes = n });
+    try out.append(a, .{ .bytes = sh.tail });
+}
+
+/// The bytes of a pages-layout state's rows (every row part between the words and the fixed parts).
+pub fn pageRowsBytes(sh: Shape, at: u32) u64 {
+    var n: u64 = 0;
+    const pooled: u64 = at / sparse.pool;
+    for (0..sh.layers) |_| {
+        const c = cache(sh, at);
+        n += c[0] + c[1] + pooled * sh.pooled_row;
+    }
+    return n;
+}
+
+/// How many bytes of a pages-layout row part one pool page carries there: its rows' span, a page's worth (a part's
+/// byte `b` sits in page ids[b / span] at b % span, as layout.Plan's `piece` addresses a paged cache's).
+pub fn pageSpan(sh: Shape, p: Part) u64 {
+    if (p.row == sh.latent) return @import("cuda_state.zig").page_rows * sh.latent;
+    if (p.row == 4) return @import("cuda_state.zig").page_rows * 4;
+    return @as(u64, @import("cuda_state.zig").page_rows / sparse.pool) * sh.pooled_row; // whole pooled keys
 }
 
 /// The image's segments in order for a state at `at` whose head holds `mtp_len` rows (0 without a head).
