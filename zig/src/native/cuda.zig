@@ -380,13 +380,17 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const wrapped = kv_pages.wrapped(F, loaded, free, served.stream_bytes, room);
     const layout = wrapped.layout;
     var paged: ?kv_pages.Plan = null;
+    var slots: ?usize = null; // TF_KV_SHARE: a slot a state, when the layout declares one (GLM)
     const streams = if (layout) |l| blk: {
         // the reserve the room was measured past, for a refusal's fit; the smallest state, for the device cache's rule
         const facts: kv_pages.Facts = .{
             .reserve = .{ .bytes = after.reserve, .least = @intFromFloat(budget.floor(after.unified).least * (1 << 30)), .limited = after.limit != null },
             .min_state = if (comptime @hasDecl(F, "snap_min_bytes")) F.snap_min_bytes(loaded.target) else 0,
         };
-        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts, if (share) 1_000_000 else 0) orelse return null;
+        if (share and l.snap_bytes > 0 and !host_cache) slots = try @import("core").kv_prompts.sharing(); // GLM: a slot a state
+        // TF_KV_SHARE's cache as pool pages: all of it unless the family keeps its states' rest elsewhere (GLM, ppm 0)
+        const kept_ppm: u32 = if (!share) 0 else if (comptime @hasDecl(F, "share_kept_ppm")) F.share_kept_ppm else 1_000_000;
+        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), facts, kept_ppm, slots) orelse return null;
         break :blk paged.?.lanes;
     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -423,14 +427,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const cache = kept.copied;
     var cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
     const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), @intCast(window), kept, o.kv8);
-    // TF_QWEN_KV_SHARE: the family keeps prompts itself, over its pool's pages
-    const cache_text = if (share) ", the prompt cache over the pool's pages" else shown[1];
+    const cache_text = try kv_pages.cacheText(a, share, slots, paged, layout, shown[1]);
     h.startup = try std.fmt.allocPrint(gpa, @import("cuda_startup.zig").format, .{
         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), @import("cuda_startup.zig").rows(F, loaded), if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         cache_text, if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    const kept_budget: u64 = if (comptime @hasDecl(F, "snap_save")) try kv_pages.storeBudget(F, loaded.target, kept) else 0; // card and host tier
+    const kept_budget: u64 = try kv_pages.keptBudget(F, loaded.target, kept, share); // card and host tier; under a share what the shared snapshots hold
     if (cache_capacity) |*c| c.budget_bytes = kept_budget; // the startup warning and metrics read what the store keeps in
     if (@hasDecl(F, "snap_save") and kept_budget > 0 and !share) {
         const pc = api.prompt_cache;
@@ -455,8 +458,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
-    if (comptime @hasDecl(F, "share_attach")) if (share and (cache > 0 or F.share_kept_ppm == 0)) { // GLM keeps copies: the store opens at any cache
-        h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
+    const share_limit = if (!share) 0 else if (slots != null) paged.?.snaps else try @import("core").kv_prompts.sharing(); // what its slots hold
+    if (comptime @hasDecl(F, "share_attach")) if (share and (if (comptime F.share_kept_ppm == 0) share_limit > 0 else cache > 0)) { // GLM keeps copies: the store opens when its slots hold a state
+        h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
     };
     errdefer if (h.prompts) |x| x.close();
     var conversations = false;
@@ -508,7 +512,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .slide_conversations = conversations,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
-    kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0, std.log);
+    kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, std.log); // TF_KV_SHARE: no copied rows
     if (@hasField(@TypeOf(loaded), "follow")) if (loaded.follow) |f| {
         h.follow_fn = f;
         return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt, .follow = Host.followFamily };
