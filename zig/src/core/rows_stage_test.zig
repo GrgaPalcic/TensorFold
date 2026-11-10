@@ -1,6 +1,7 @@
 //! Staging: a block still being written is charged and gathered once, and a save that fits the permit waits for it.
 const std = @import("std");
 const rows = @import("rows_store.zig");
+const pc = @import("prompt_cache.zig");
 const fixture = @import("rows_async_fixture.zig");
 const Fixture = fixture.Fixture;
 const Hold = fixture.Gate;
@@ -123,7 +124,7 @@ test "rows stage: a job a fence cancelled promises no block, so the next save wr
     try t.expect(x.f.restored_ok);
 }
 
-test "rows stage: a save larger than the permit alone is skipped, not held" {
+test "rows stage: a save larger than the permit is written in pieces as it frees; past any piece it is skipped" {
     const x = try Fixture.open("stage-big", .finish, false, 1 << 20);
     defer x.close();
     var hold: Hold = .{};
@@ -132,17 +133,33 @@ test "rows stage: a save larger than the permit alone is skipped, not held" {
     const first = fixture.prompt(22);
     try x.keep(&first, 600);
     try Hold.wait(&hold.entered);
-    x.r.worker.?.limit = x.r.worker.?.bytes();
+    x.r.worker.?.limit = x.r.worker.?.bytes(); // the job in flight holds the whole permit
     const second = fixture.prompt(23);
     try x.keep(&second, 1000);
-    try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
-    try t.expectEqual(@as(usize, 0), x.r.queue.items.len);
-    try t.expectEqual(error.StagingFull, x.r.failures.records[0].?.err);
+    try t.expectEqual(@as(usize, 1), x.r.queue.items.len); // even a piece waits while the permit is held
+    try t.expectEqual(@as(u64, 0), x.r.counts.skipped);
     try t.expectEqual(@as(usize, 1), x.r.worker.?.pending());
     try t.expect(!rows.write.ready(x.r));
     hold.release.store(true, .release);
-    try x.settle();
-    try t.expectEqual(@as(usize, 1), x.r.states.items.len);
+    try x.idle(2);
+    try t.expectEqual(@as(usize, 2), x.r.states.items.len); // written in pieces once the permit freed
+    // A save past any piece at all: a permit of none skips it, as one larger than the permit alone was skipped.
+    const y = try Fixture.open("stage-big-none", .finish, false, 1 << 20);
+    defer y.close();
+    var hold2: Hold = .{};
+    defer hold2.release.store(true, .release);
+    y.r.file_io = hold2.io();
+    const third = fixture.prompt(29);
+    try y.keep(&third, 600);
+    try Hold.wait(&hold2.entered);
+    y.r.worker.?.limit = 0;
+    const fourth = fixture.prompt(30);
+    try y.keep(&fourth, 600);
+    try t.expectEqual(@as(u64, 1), y.r.counts.skipped);
+    try t.expectEqual(error.StagingFull, y.r.failures.records[0].?.err);
+    hold2.release.store(true, .release);
+    try y.settle();
+    try t.expectEqual(@as(usize, 1), y.r.states.items.len);
 }
 
 test "rows stage: an eviction cannot wait, so a full permit skips the copy" {
@@ -180,12 +197,13 @@ test "rows stage: a newer save that fits beside the jobs in flight is staged ahe
     x.r.worker.?.limit = 2 * used - 1; // room beside the first job for less than another like it
     const second = fixture.prompt(27);
     try x.keep(&second, 600);
-    try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
+    try t.expectEqual(@as(usize, 1), x.r.queue.items.len); // the whole save waits: its first piece is staged
+    try t.expectEqual(@as(usize, 2), x.r.worker.?.pending());
     try t.expect(!rows.write.ready(x.r));
     const third = fixture.prompt(28);
     try x.keep(&third, 300);
-    try t.expectEqual(@as(usize, 2), x.r.worker.?.pending());
-    try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
+    try t.expectEqual(@as(usize, 2), x.r.queue.items.len); // both wait past their first pieces: the room is taken
+    try t.expectEqual(@as(usize, 3), x.r.worker.?.pending());
     try t.expectEqual(@as(u64, 0), x.r.counts.skipped);
     hold.release.store(true, .release);
     try x.idle(3);
@@ -227,7 +245,7 @@ test "rows stage: a save that waited for room and lost its entry is counted as s
     const second = fixture.prompt(32);
     try x.keep(&second, 600);
     try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
-    for (x.s.entries.items, 0..) |e, i| if (e == x.r.waiting.?) {
+    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(x.r.waiting.?)))) {
         x.s.remove(i);
         break;
     };
@@ -258,7 +276,7 @@ test "rows stage: losing the older of two waiting saves counts it as skipped" {
     try t.expectEqual(@as(usize, 2), x.r.queue.items.len);
     const newer = x.r.waiting.?;
     try t.expect(newer != older);
-    for (x.s.entries.items, 0..) |e, i| if (e == older) {
+    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(older)))) {
         x.s.remove(i);
         break;
     };
@@ -266,7 +284,7 @@ test "rows stage: losing the older of two waiting saves counts it as skipped" {
     try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
     try t.expectEqual(error.StagingFull, x.r.failures.records[0].?.err);
     try t.expect(x.r.waiting == newer);
-    try t.expect(x.r.queue.items[0].entry == newer and x.r.queue.items[0].waited);
+    try t.expect(x.r.queue.items[0].kept.owner == newer and x.r.queue.items[0].waited);
     hold.release.store(true, .release);
     try x.idle(2);
     try t.expectEqual(@as(u64, 1), x.r.counts.skipped);
@@ -295,7 +313,7 @@ test "rows stage: a save that waited and loses its entry after a reap still coun
     try x.keep(&third, 600);
     const staged_as = x.r.next_job;
     try t.expectEqual(@as(usize, 1), x.r.queue.items.len);
-    for (x.s.entries.items, 0..) |e, i| if (e == lost) {
+    for (x.s.entries.items, 0..) |e, i| if (e == @as(*pc.Entry, @ptrCast(@alignCast(lost)))) {
         x.s.remove(i);
         break;
     };

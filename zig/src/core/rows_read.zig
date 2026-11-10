@@ -14,17 +14,32 @@ const Name = chain.Name;
 
 /// Disk state `i` read into a new kept state of its family; a file that fails a check goes, with every state naming it.
 pub fn read(r: *Rows, i: usize) !pc.Saved {
+    return readInto(r, i, null);
+}
+
+/// `read`, the state's leading rows taken into pool pages the store holds (their ids appended to `out`, each held for
+/// the caller; the family's `blank_pages`). Null when the family cannot: `read` alone.
+pub fn readPages(r: *Rows, i: usize, out: *std.ArrayList(u32)) !pc.Saved {
+    return readInto(r, i, out);
+}
+
+fn readInto(r: *Rows, i: usize, pages: ?*std.ArrayList(u32)) !pc.Saved {
     const f = r.family.vtable;
     const s = r.states.items[i];
     const t0 = write.nowNs();
     var plan = try prefetch.Plan.of(r, r.gpa, &s);
     defer plan.deinit(r.gpa);
     const ahead = if (r.fetch) |p| p.take(s.name, &plan) else null; // read on the I/O thread, its files checked there
-    const saved = try r.img.blank(r.family.ptr, s.at);
+    var ids: []const u32 = &.{};
+    const saved = if (pages) |out| blk: {
+        const got = try r.img.blank_pages.?(r.family.ptr, s.at, out);
+        ids = out.items;
+        break :blk got;
+    } else try r.img.blank(r.family.ptr, s.at);
     errdefer f.drop(r.family.ptr, saved);
     var bytes: u64 = 0;
     for (plan.pieces) |p| {
-        if (ahead) |a| try scatter(r, p.name, prefetch.ext(p.kind), saved, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved);
+        if (ahead) |a| try scatter(r, p.name, prefetch.ext(p.kind), saved, ids, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved, ids);
     }
     if (ahead) |a| bytes = a.disk;
     const ns = if (ahead) |a| a.ns else write.nowNs() - t0;
@@ -37,7 +52,7 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
 }
 
 /// One file's payload read past the page cache, checked, and copied into `ranges` of `saved`; its bytes on disk.
-fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: []const image.Range, saved: pc.Saved) !u64 {
+fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: []const image.Range, saved: pc.Saved, pages: []const u32) !u64 {
     const n = image.total(ranges);
     var buf: [1200]u8 = undefined;
     const p = try file.path(&buf, r.dir, &chain.hex(name), ext, false);
@@ -46,7 +61,7 @@ fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: 
     if (o.trailer.payload != n or o.trailer.block != r.keying.block or o.trailer.at != at) return bad(r, name, ext, error.RowsRead);
     const stage = try r.staged(n);
     const got = file.payload(&o, stage) catch |err| return bad(r, name, ext, err);
-    try scatter(r, name, ext, saved, ranges, got);
+    try scatter(r, name, ext, saved, pages, ranges, got);
     return o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer);
 }
 
@@ -59,8 +74,8 @@ fn refused(err: anyerror) bool {
 }
 
 /// A file's payload copied into `ranges` of `saved`; a refusal of its words is a failed check of the file.
-fn scatter(r: *Rows, name: Name, ext: []const u8, saved: pc.Saved, ranges: []const image.Range, in: []const u8) !void {
-    r.img.scatter(r.family.ptr, saved, ranges, in) catch |err| return if (refused(err)) bad(r, name, ext, err) else err;
+fn scatter(r: *Rows, name: Name, ext: []const u8, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) !void {
+    r.img.scatter(r.family.ptr, saved, pages, ranges, in) catch |err| return if (refused(err)) bad(r, name, ext, err) else err;
 }
 
 /// A file that failed its checks deleted, with every state that names it; the error passed on.

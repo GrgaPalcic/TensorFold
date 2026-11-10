@@ -37,7 +37,8 @@ fn where(sh: kept.Shape, off: u64) struct { part: enum { words, kv, mamba }, at:
     return .{ .part = .mamba, .at = @intCast(off - words - sh.kv) };
 }
 
-fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+fn gather(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+    _ = pages;
     const t = target(ptr);
     const copy: *kept.Copy = @ptrCast(@alignCast(saved));
     const sh = kept.shape(t, copy.pos);
@@ -61,7 +62,8 @@ fn blank(ptr: *anyopaque, at: u32) anyerror!api.prompt_cache.Saved {
     return @ptrCast(try kept.blank(target(ptr), at));
 }
 
-fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+    _ = pages;
     const t = target(ptr);
     const copy: *kept.Copy = @ptrCast(@alignCast(saved));
     const sh = kept.shape(t, copy.pos);
@@ -144,7 +146,7 @@ fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, t: *Target) !
     if (!whole(t, saved)) return error.ProbeUnmarked;
     const sh = kept.shape(t, 4136);
     const bytes = try a.alloc(u8, words + sh.kv + sh.mamba);
-    try gather(t, saved, &.{ .{ .off = 0, .len = words }, .{ .off = words, .len = sh.kv }, .{ .off = words + sh.kv, .len = sh.mamba } }, bytes);
+    try gather(t, saved, &.{}, &.{ .{ .off = 0, .len = words }, .{ .off = words, .len = sh.kv }, .{ .off = words + sh.kv, .len = sh.mamba } }, bytes);
     // the row count: the last window's, from whatever ran first (a new build measures its windows)
     @memset(bytes[8..words], 0);
     return .{ .hash = std.hash.Wyhash.hash(0x6375, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };

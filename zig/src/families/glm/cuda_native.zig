@@ -476,6 +476,7 @@ pub fn share_pool(ptr: *anyopaque) ?kp.Pool {
         .inPart = partsInPart,
         .onePart = partsOnePart,
         .setReclaim = partsSetReclaim,
+        .holdPages = partsHoldPages,
         .ctx = &x.parts,
     } };
     return .{ .one = &p.pool };
@@ -515,6 +516,15 @@ fn partsOnePart(ctx: *anyopaque, ids: []const u32) bool {
 
 fn partsSetReclaim(ctx: *anyopaque, part: usize, hook: ?kv.Reclaim) void {
     partsOf(ctx).setReclaim(part, hook);
+}
+
+/// A recalled state's pages held in one part with room (its pools reclaiming first), as global ids.
+fn partsHoldPages(ctx: *anyopaque, out: []u32) bool {
+    const x = partsOf(ctx);
+    const part = x.choose(out.len, null) orelse return false;
+    if (!x.pools[part].hold(out)) return false;
+    for (out) |*id| id.* += @as(u32, @intCast(part * x.h));
+    return true;
 }
 
 /// TF_KV_SHARE: the store the prompt passes keep and resume through, on rank 0's pages (null: none).

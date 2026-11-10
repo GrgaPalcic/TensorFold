@@ -33,7 +33,7 @@ pub fn wordsOf(e: anytype, id: u64) !image.Words {
     if (s.cur.len > 64) return error.SnapshotShape;
     var cur: u64 = 0;
     for (s.cur, 0..) |b, i| cur |= @as(u64, b) << @intCast(i);
-    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .home = homeOf(e, s) };
+    return .{ .at = s.pos, .mtp_len = s.mtp_len, .base = s.bases[0], .mtp_base = s.bases[1], .cur = cur, .home = homeOf(e, s), .pages = s.shared > 0 };
 }
 
 /// Bytes [off, off + host.len) of this rank's image of `id`, out (lease to host) or in; unsealed: before its head only.

@@ -39,7 +39,8 @@ fn wordsOf(c: *const Copy) Words {
     return .{ .at = @intCast(c.at), .delta = c.delta, .format = @backingInt(c.format) };
 }
 
-fn gather(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+fn gather(_: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, out: []u8) anyerror!void {
+    _ = pages;
     const c: *const Copy = @ptrCast(@alignCast(saved));
     const w = wordsOf(c);
     var o: usize = 0;
@@ -76,7 +77,8 @@ pub fn blankCopy(e: *engine.Engine, at: u32) !*Copy {
     return copy;
 }
 
-fn scatter(_: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+fn scatter(_: *anyopaque, saved: api.prompt_cache.Saved, pages: []const u32, ranges: []const rows.image.Range, in: []const u8) anyerror!void {
+    _ = pages;
     const c: *Copy = @ptrCast(@alignCast(saved));
     var w = wordsOf(c);
     var o: usize = 0;

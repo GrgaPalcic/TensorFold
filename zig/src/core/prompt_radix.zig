@@ -3,6 +3,8 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const tree_mod = @import("prompt_radix_tree.zig");
+const rows = @import("rows_store.zig");
+const select = @import("rows_select.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Saved = tree_mod.Saved;
@@ -37,8 +39,11 @@ pub fn pagesOf(comptime T: type, owner: *T, bytes: u64) Pages {
         fn available(p: *anyopaque) usize {
             return of(p).available();
         }
+        fn hold(p: *anyopaque, out: []u32) bool {
+            return of(p).hold(out);
+        }
     };
-    return .{ .ptr = owner, .bytes = bytes, .vtable = &.{ .retain = V.retain, .release = V.release, .holders = V.holders, .available = V.available } };
+    return .{ .ptr = owner, .bytes = bytes, .vtable = &.{ .retain = V.retain, .release = V.release, .holders = V.holders, .available = V.available, .hold = V.hold } };
 }
 
 pub const Plan = pc.Plan;
@@ -51,8 +56,22 @@ pub const Store = struct {
     limits: Limits = .{},
     /// The tokens of recently planned shared cuts, hashed (at most SHARED_KEYS).
     shared_keys: std.ArrayList(u64) = .empty,
+    /// --learn-conversations: every kept state written behind to disk, read back where it pays (prompt_cache.Store's).
+    disk: ?*rows.Rows = null,
+    /// Saves of nodes under way or queued: their pages held once more, their tokens copied (rows_write's Kept.freed).
+    saves: std.ArrayList(Save) = .empty,
+
+    /// A save of a node the writer reads: the pages held for it, and the tokens its blocks are named by.
+    const Save = struct { node: *Node, pages: []u32, tokens: []u32 };
 
     const SHARED_KEYS = 64;
+
+    /// --learn-conversations on a paged store: every keep written behind (its pages held while the save reads them),
+    /// an eviction's still-queued save staged, and a begin that misses reading the longest state on disk that pays.
+    pub fn attachDisk(s: *Store, r: *rows.Rows) void {
+        s.disk = r;
+        s.tree.on_evict = .{ .ctx = s, .call = evicting };
+    }
 
     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, rules: Rules) !Store {
         if (rules.page == 0 or (rules.planned and (rules.grid == 0 or rules.grid % rules.page != 0))) return error.BadPromptRadixRules;
@@ -70,6 +89,10 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
+        while (s.saves.items.len > 0) if (s.disk) |r| { // the writer's queue lets the saves go first (their pages back)
+            rows.write.dropped(r, s.saves.items[s.saves.items.len - 1].node);
+        } else break;
+        s.saves.deinit(s.tree.gpa);
         s.shared_keys.deinit(s.tree.gpa);
         s.tree.deinit();
     }
@@ -93,10 +116,12 @@ pub const Store = struct {
     }
 
     /// Restores the longest state `prompt` resumes into `owner`, its pages into `adopt` (held once more); plans marks.
+    /// With a disk store, a miss (or a tree state shorter than one on disk) recalls the longest state there that pays.
     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, owner: ?*anyopaque, adopt: *std.ArrayList(u32)) !Plan {
         if (!s.on()) return .{ .marks = try a.alloc(u32, 0) };
-        const found = s.find(prompt);
-        if (found == null) s.tree.counts.misses += 1;
+        const found0 = s.find(prompt);
+        if (found0 == null) s.tree.counts.misses += 1;
+        const found = if (s.disk) |r| s.recall(r, prompt, found0) else found0;
         const resume_at: u32 = if (found) |n| n.end else 0;
         const planned = try s.marks(a, prompt, resume_at, history_len, shared, if (found) |n| n.entry.?.last else &.{});
         const marks_ = try s.fitting(a, planned);
@@ -248,7 +273,114 @@ pub const Store = struct {
         node.entry = .{ .saved = saved, .bytes = family.vtable.bytes(family.ptr, at), .born = @intCast(prompt.len), .used = t.clock, .last = last, .shared = flagged };
         t.snaps += 1;
         t.counts.kept += 1;
+        if (s.disk) |r| s.writeBehind(r, node, saved);
         return .{ .held = true, .shared = mine.len };
+    }
+
+    /// The state just kept written behind (prompt_cache.Store's `queued`): its pages held once more while the save
+    /// reads them, so the tree may drop the leaf but the pool cannot reuse the pages under the writer.
+    fn writeBehind(s: *Store, r: *rows.Rows, node: *Node, saved: pc.Saved) void {
+        const t = &s.tree;
+        const e = &node.entry.?;
+        const pages = t.gpa.dupe(u32, node.pages) catch return;
+        errdefer t.gpa.free(pages);
+        const tokens = t.gpa.dupe(u32, e.last[0..@min(e.last.len, node.end + t.ahead)]) catch return;
+        errdefer t.gpa.free(tokens);
+        for (pages) |id| t.pages.vtable.retain(t.pages.ptr, id);
+        s.saves.append(t.gpa, .{ .node = node, .pages = pages, .tokens = tokens }) catch {
+            for (pages) |id| t.pages.vtable.release(t.pages.ptr, id);
+            return;
+        };
+        rows.write.queued(r, .{
+            .owner = node,
+            .tokens = tokens,
+            .at = node.end,
+            .saved = saved,
+            .shared = e.shared,
+            .pages = pages,
+            .freed = .{ .ctx = s, .call = gaveBack },
+        }, &.{});
+    }
+
+    /// The writer no longer reads a save's state (staged, ended or dropped): its pages go back, its tokens freed.
+    fn gaveBack(ctx: *anyopaque, owner: *anyopaque) void {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        const t = &s.tree;
+        const n: *Node = @ptrCast(@alignCast(owner));
+        for (s.saves.items, 0..) |save, i| if (save.node == n) {
+            for (save.pages) |id| t.pages.vtable.release(t.pages.ptr, id);
+            t.gpa.free(save.pages);
+            t.gpa.free(save.tokens);
+            _ = s.saves.swapRemove(i);
+            return;
+        };
+    }
+
+    /// A leaf evicted while its save is still queued: the save is written now (its pages are held; rows_write).
+    fn evicting(ctx: *anyopaque, n: *Node) void {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        const r = s.disk orelse return;
+        for (s.saves.items) |save| if (save.node == n) return rows.write.evicting(r, n);
+    }
+
+    /// The longest state on disk below `prompt` that reaches past the tree's deepest match, when reading it pays:
+    /// read into pool pages the store holds and a slot, and keep it as the tree's (its pages adopted like any kept
+    /// state's; the store's holds go once the tree holds them). `found` (the tree's deepest match) otherwise.
+    fn recall(s: *Store, r: *rows.Rows, prompt: []const u32, found: ?*Node) ?*Node {
+        const t = &s.tree;
+        const from: u32 = if (found) |n| n.end else 0;
+        const i = r.best(prompt, &.{}, &.{}, from) orelse return found;
+        const st = &r.states.items[i];
+        if (st.at <= from) return found;
+        const pay = select.savedSeconds(r, i, from) orelse return found; // the read beats prefilling what the tree lacks
+        if (!(pay > 0)) return found;
+        const np = st.at / s.rules.page;
+        while (t.held_pages + np > s.limits.pages or t.snaps + 1 > s.limits.snaps) {
+            t.evict(s.victim(prompt, found) orelse return found);
+        }
+        var pages: std.ArrayList(u32) = .empty;
+        const got = rows.read.readPages(r, i, &pages) catch {
+            pages.deinit(t.gpa);
+            return found;
+        };
+        const give = struct {
+            fn go(t2: *Tree, ps: *std.ArrayList(u32)) void {
+                for (ps.items) |id| t2.pages.vtable.release(t2.pages.ptr, id);
+                ps.deinit(t2.gpa);
+            }
+        }.go;
+        const drop = struct {
+            fn go(f2: pc.Snapshots, saved2: pc.Saved) void {
+                f2.vtable.drop(f2.ptr, saved2);
+            }
+        }.go;
+        const path = t.gpa.alloc(u32, np) catch {
+            give(t, &pages);
+            drop(t.family, got);
+            return found;
+        };
+        defer t.gpa.free(path);
+        const node = t.insert(prompt[0..@min(prompt.len, st.at + s.rules.lookahead)], pages.items, path) catch {
+            give(t, &pages);
+            drop(t.family, got);
+            return found;
+        };
+        if (node.entry != null) { // the tree keeps this state's tokens already: its own copy wins
+            give(t, &pages);
+            drop(t.family, got);
+            return found;
+        }
+        const last = t.gpa.dupe(u32, prompt) catch {
+            give(t, &pages);
+            drop(t.family, got);
+            return found;
+        };
+        t.clock += 1;
+        node.entry = .{ .saved = got, .bytes = t.family.vtable.bytes(t.family.ptr, st.at), .born = @intCast(prompt.len), .used = t.clock, .last = last, .shared = st.shared };
+        t.snaps += 1;
+        t.counts.kept += 1;
+        give(t, &pages); // the tree holds the pages now; the recall's holds go
+        return node;
     }
 
     fn fail(s: *Store, at: u32, err: anyerror, shared: usize) Kept {
@@ -326,4 +458,5 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 
 test {
     _ = @import("prompt_radix_test.zig");
+    _ = @import("prompt_radix_disk_test.zig");
 }

@@ -91,7 +91,7 @@ fn imageOf(a: std.mem.Allocator, f: *Fixture, c: *Copy) ![]u8 {
     defer parts.deinit(a);
     try disk.partsOf(&f.e, @intCast(c.at), &parts, a);
     const out = try a.alloc(u8, @intCast(rows.image.imageBytes(parts.items)));
-    try disk.image.gather(&f.t, c, &.{.{ .off = 0, .len = out.len }}, out);
+    try disk.image.gather(&f.t, c, &.{}, &.{.{ .off = 0, .len = out.len }}, out);
     return out;
 }
 
@@ -123,7 +123,7 @@ test "gather and scatter give back the copy byte for byte; a copy kept with imag
     const back: *Copy = @ptrCast(@alignCast(try disk.image.blank(&f.t, 512)));
     defer reuse.dropCopy(&f.e, back);
     // two pieces, split inside the words: the store reads blocks and a state's own ranges apart
-    try disk.image.scatter(&f.t, back, &.{ .{ .off = 0, .len = 9 }, .{ .off = 9, .len = img.len - 9 } }, img);
+    try disk.image.scatter(&f.t, back, &.{}, &.{ .{ .off = 0, .len = 9 }, .{ .off = 9, .len = img.len - 9 } }, img);
     try std.testing.expectEqualSlices(u8, c.host.bytes[0..c.len], back.host.bytes[0..back.len]);
     try std.testing.expectEqual(@as(i32, -3), back.delta);
     try std.testing.expect(disk.image.whole.?(&f.t, c));
@@ -136,7 +136,7 @@ test "gather and scatter give back the copy byte for byte; a copy kept with imag
     const other: *Copy = @ptrCast(@alignCast(try disk.image.blank(&f.t, 512)));
     defer reuse.dropCopy(&f.e, other);
     other.format = .bf16;
-    try std.testing.expectError(error.KeptWordsDiffer, disk.image.scatter(&f.t, other, &.{.{ .off = 0, .len = img.len }}, img));
+    try std.testing.expectError(error.KeptWordsDiffer, disk.image.scatter(&f.t, other, &.{}, &.{.{ .off = 0, .len = img.len }}, img));
 }
 
 /// Every file under `path` whose name ends in `ext`: cut to 100 bytes, or byte 40 overwritten.
@@ -163,8 +163,8 @@ fn entry(a: std.mem.Allocator, c: *Copy, prompt: []u32) !*pc.Entry {
 fn writeBoth(a: std.mem.Allocator, f: *Fixture, o: rows.Options, prompt: []u32, short: *Copy, long: *Copy) !void {
     const r = try rows.Rows.open(std.testing.allocator, f.snapshots(), o);
     defer r.deinit();
-    rows.write.queued(r, try entry(a, short, prompt), &.{ 0, 512 });
-    rows.write.queued(r, try entry(a, long, prompt), &.{ 0, 512 });
+    rows.write.queued(r, pc.rows.Kept.of(try entry(a, short, prompt)), &.{ 0, 512 });
+    rows.write.queued(r, pc.rows.Kept.of(try entry(a, long, prompt)), &.{ 0, 512 });
     _ = rows.write.drain(r, rows.write.nowNs() + 3 * std.time.ns_per_s); // the write worker publishes the states
     try std.testing.expectEqual(@as(usize, 2), r.states.items.len);
     try std.testing.expectEqual(@as(usize, 4), r.blocks.count()); // 512 and 1024 tokens on a 512-row chunk grid: two blocks shared

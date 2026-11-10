@@ -50,6 +50,12 @@ pub const Node = struct {
     used: u64 = 0,
 };
 
+/// Called before a state's entry is freed (a paged store with a disk store stages a save still queued, rows_write).
+pub const Evict = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, n: *Node) void,
+};
+
 pub const Tree = struct {
     gpa: Allocator,
     family: Snapshots,
@@ -64,6 +70,7 @@ pub const Tree = struct {
     held_pages: usize = 0,
     snaps: usize = 0,
     counts: Counts = .{},
+    on_evict: ?Evict = null,
 
     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, page: usize, ahead: usize) !Tree {
         const root = try gpa.create(Node);
@@ -219,6 +226,7 @@ pub const Tree = struct {
     /// Frees the state at `n`, and the nodes below nothing keeps.
     pub fn evict(t: *Tree, n: *Node) void {
         const e = n.entry orelse return;
+        if (t.on_evict) |h| h.call(h.ctx, n); // a save still queued is staged now (its pages are held)
         t.family.vtable.drop(t.family.ptr, e.saved);
         t.gpa.free(e.last);
         n.entry = null;

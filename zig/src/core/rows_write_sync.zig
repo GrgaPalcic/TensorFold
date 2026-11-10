@@ -16,16 +16,16 @@ const piece: u64 = 16 << 20;
 /// One whole block a state names: its name, group (window), index and file bytes.
 pub const Want = struct { name: Name, window: u32, k: u32, bytes: u64 };
 
-/// A kept entry waiting to be written, with the chunk starts below it (a planned family's state depends on them).
+/// A kept state waiting to be written, with the chunk starts below it (a planned family's state depends on them).
 pub const Queued = struct {
-    entry: *pc.Entry,
+    kept: rows_store.Kept,
     starts: []u32,
     waited: bool = false, // the jobs in flight once left it no room, so losing its entry counts as a skipped save
 };
 
 /// A kept state being written: the blocks the disk lacks, then its own file a piece at a time.
 pub const Job = struct {
-    entry: *pc.Entry,
+    kept: rows_store.Kept,
     starts: []u32,
     name: Name,
     parts: []image.Part,
@@ -41,20 +41,26 @@ pub const Job = struct {
     began: i128 = 0,
 };
 
-/// A newly kept entry joins the queue (the RAM store calls this on every new keep), with the request's chunk starts.
-pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
-    const own = rows_store.startsBelow(r, r.gpa, starts, e.at) catch return;
-    r.queue.append(r.gpa, .{ .entry = e, .starts = own }) catch r.gpa.free(own);
+/// A newly kept state joins the queue (the store calls this on every new keep), with the request's chunk starts.
+pub fn queued(r: *Rows, kept: rows_store.Kept, starts: []const u32) void {
+    const own = rows_store.startsBelow(r, r.gpa, starts, kept.at) catch return;
+    r.queue.append(r.gpa, .{ .kept = kept, .starts = own }) catch r.gpa.free(own);
 }
 
-/// An entry leaving the RAM store leaves the queue, and its write is given up if under way.
-pub fn dropped(r: *Rows, e: *pc.Entry) void {
-    for (r.queue.items, 0..) |q, i| if (q.entry == e) {
+/// The store's hold on a queued save given up: its pages released (nothing held: the flat store's).
+pub fn gave(_: *Rows, q: *const Queued) void {
+    if (q.kept.freed) |f| f.call(f.ctx, q.kept.owner);
+}
+
+/// A state leaving the RAM store leaves the queue, and its write is given up if under way.
+pub fn dropped(r: *Rows, owner: *anyopaque) void {
+    for (r.queue.items, 0..) |*q, i| if (q.kept.owner == owner) {
         r.gpa.free(q.starts);
+        gave(r, q);
         _ = r.queue.orderedRemove(i);
         break;
     };
-    if (r.job) |j| if (j.entry == e) abort(r, j);
+    if (r.job) |j| if (j.kept.owner == owner) abort(r, j);
 }
 
 /// Whether writing waits; spill-only RAM entries wait for eviction or the close-time flush.
@@ -63,14 +69,28 @@ pub fn pending(r: *const Rows) bool {
 }
 
 /// --spill-gib: an entry evicted from RAM is written now, unless the disk holds it already; the write under way first.
-pub fn evicted(r: *Rows, e: *pc.Entry) void {
+pub fn evicted(r: *Rows, owner: *anyopaque) void {
     if (r.spill == .off) return;
-    if (r.job) |j| if (j.entry != e) while (r.job != null) {
+    if (r.job) |j| if (j.kept.owner != owner) while (r.job != null) {
         _ = step(r);
     };
     if (r.job == null) {
-        const i = for (r.queue.items, 0..) |q, k| {
-            if (q.entry == e) break k;
+        const i = for (r.queue.items, 0..) |*q, k| {
+            if (q.kept.owner == owner) break k;
+        } else return;
+        if (!begin(r, r.queue.orderedRemove(i))) return;
+    }
+    while (r.job != null) _ = step(r);
+}
+
+/// A paged store's eviction: a save still queued is written now (its pages are held; the state leaves the tree).
+pub fn evicting(r: *Rows, owner: *anyopaque) void {
+    if (r.job) |j| if (j.kept.owner != owner) while (r.job != null) {
+        _ = step(r);
+    };
+    if (r.job == null) {
+        const i = for (r.queue.items, 0..) |*q, k| {
+            if (q.kept.owner == owner) break k;
         } else return;
         if (!begin(r, r.queue.orderedRemove(i))) return;
     }
@@ -89,7 +109,7 @@ pub fn step(r: *Rows) bool {
     const j = r.job orelse return start(r);
     unit(r, j) catch |err| {
         r.counts.failed += 1;
-        pc.note("imprint: writing {d} tokens failed ({s}); they stay in RAM only", .{ j.entry.at, @errorName(err) });
+        pc.note("imprint: writing {d} tokens failed ({s}); they stay in RAM only", .{ j.kept.at, @errorName(err) });
         end(r, j, false);
     };
     return true;
@@ -121,13 +141,14 @@ fn start(r: *Rows) bool {
 fn begin(r: *Rows, q: Queued) bool {
     const j = (prepare(r, q) catch |err| {
         r.counts.skipped += 1;
-        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ q.entry.at, @errorName(err) });
+        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ q.kept.at, @errorName(err) });
+        gave(r, &q);
         return false;
     }) orelse return false;
     r.job = j;
     admit(r, j) catch |err| {
         r.counts.skipped += 1;
-        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ j.entry.at, @errorName(err) });
+        pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ j.kept.at, @errorName(err) });
         abort(r, j);
         return false;
     };
@@ -138,24 +159,25 @@ fn begin(r: *Rows, q: Queued) bool {
 pub fn prepare(r: *Rows, q: Queued) !?*Job {
     const gpa = r.gpa;
     errdefer gpa.free(q.starts);
-    const e = q.entry;
-    const name = chain.state(r.keying, e.tokens, e.decode_spans, q.starts, e.at);
+    const kept = q.kept;
+    const name = chain.state(r.keying, kept.tokens, kept.spans, q.starts, kept.at);
     if (r.find(name)) |i| {
         r.touch(i);
         gpa.free(q.starts);
+        gave(r, &q);
         return null;
     }
-    if (r.img.whole) |whole| if (!whole(r.family.ptr, e.saved)) return error.NotWhole;
-    const parts = try r.parts(gpa, e.at);
+    if (r.img.whole) |whole| if (!whole(r.family.ptr, kept.saved)) return error.NotWhole;
+    const parts = try r.parts(gpa, kept.at);
     errdefer gpa.free(parts);
     var wants: std.ArrayList(Want) = .empty;
     errdefer wants.deinit(gpa);
-    try r.blockNames(gpa, parts, e.tokens, e.decode_spans, q.starts, e.at, &wants);
+    try r.blockNames(gpa, parts, kept.tokens, kept.spans, q.starts, kept.at, &wants);
     var own: std.ArrayList(image.Range) = .empty;
     errdefer own.deinit(gpa);
-    try image.ownRanges(parts, e.at, r.keying.block, &own, gpa);
+    try image.ownRanges(parts, kept.at, r.keying.block, &own, gpa);
     const j = try gpa.create(Job);
-    j.* = .{ .entry = e, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
+    j.* = .{ .kept = kept, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
     j.wants = wants.toOwnedSlice(gpa) catch |err| {
         gpa.destroy(j);
         return err;
@@ -170,11 +192,11 @@ pub fn prepare(r: *Rows, q: Queued) !?*Job {
 
 /// The job's new bytes checked against today's budget, the cap (evicting by value) and the free-disk floor.
 fn admit(r: *Rows, j: *Job) !void {
-    const e = j.entry;
+    const kept = j.kept;
     for (j.wants) |w| if (!r.blocks.contains(chain.stem(w.name))) {
         j.bytes += w.bytes;
     };
-    j.bytes += image.total(j.own) + 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + j.starts.len) + @sizeOf(file.Trailer);
+    j.bytes += image.total(j.own) + 4 * (3 + kept.tokens.len + 2 * kept.spans.len + j.starts.len) + @sizeOf(file.Trailer);
     if (!r.budget(j.bytes)) return error.DailyBudgetSpent;
     if (!r.room(j.bytes)) return error.OverCap;
     switch (r.admission.reserve(r.dir, j.bytes)) {
@@ -185,7 +207,7 @@ fn admit(r: *Rows, j: *Job) !void {
 
 /// The job's next unit of work.
 fn unit(r: *Rows, j: *Job) !void {
-    if (r.img.whole) |whole| if (!whole(r.family.ptr, j.entry.saved)) return error.NotWhole;
+    if (r.img.whole) |whole| if (!whole(r.family.ptr, j.kept.saved)) return error.NotWhole;
     const gather = r.img.gather;
     while (j.next < j.wants.len and r.blocks.contains(chain.stem(j.wants[j.next].name))) j.next += 1;
     if (j.next < j.wants.len) {
@@ -195,7 +217,7 @@ fn unit(r: *Rows, j: *Job) !void {
         try image.blockRanges(j.parts, r.keying.block, w.window, w.k, &ranges, r.gpa);
         const n = image.total(ranges.items);
         const stage = try r.staged(n);
-        try gather(r.family.ptr, j.entry.saved, ranges.items, stage[0..@intCast(n)]);
+        try gather(r.family.ptr, j.kept.saved, j.kept.pages, ranges.items, stage[0..@intCast(n)]);
         var wr = try file.Writer.open(r.dir, &chain.hex(w.name), ".blk");
         errdefer wr.abort();
         wr.io = r.file_io;
@@ -227,19 +249,19 @@ fn unit(r: *Rows, j: *Job) !void {
             }
         }
         const stage = try r.staged(n);
-        try gather(r.family.ptr, j.entry.saved, pieces.items, stage[0..@intCast(n)]);
+        try gather(r.family.ptr, j.kept.saved, j.kept.pages, pieces.items, stage[0..@intCast(n)]);
         try j.writer.?.append(stage[0..@intCast(n)]);
         return;
     }
-    const e = j.entry;
-    const counts = [3]u32{ @intCast(e.tokens.len), @intCast(e.decode_spans.len), @intCast(j.starts.len) };
-    const meta = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(e.tokens), std.mem.sliceAsBytes(e.decode_spans), std.mem.sliceAsBytes(j.starts) };
-    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, &meta, true);
+    const kept = j.kept;
+    const counts = [3]u32{ @intCast(kept.tokens.len), @intCast(kept.spans.len), @intCast(j.starts.len) };
+    const meta = [_][]const u8{ std.mem.sliceAsBytes(&counts), std.mem.sliceAsBytes(kept.tokens), std.mem.sliceAsBytes(kept.spans), std.mem.sliceAsBytes(j.starts) };
+    const bytes = try j.writer.?.finish(.{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = j.name, .at = kept.at, .block = r.keying.block, .flags = @intFromBool(kept.shared) }, &meta, true);
     j.writer = null;
     r.spent(bytes);
-    var s: rows_store.State = .{ .name = j.name, .at = e.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = bytes, .rows = 0, .used = 0, .shared = e.shared };
-    s.tokens = try r.gpa.dupe(u32, e.tokens);
-    s.spans = r.gpa.dupe(Span, e.decode_spans) catch |err| {
+    var s: rows_store.State = .{ .name = j.name, .at = kept.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = bytes, .rows = 0, .used = 0, .shared = kept.shared };
+    s.tokens = try r.gpa.dupe(u32, kept.tokens);
+    s.spans = r.gpa.dupe(Span, kept.spans) catch |err| {
         r.gpa.free(s.tokens);
         return err;
     };
@@ -251,9 +273,9 @@ fn unit(r: *Rows, j: *Job) !void {
     r.touch(r.states.items.len - 1);
     r.counts.writes += 1;
     const ms = @as(f64, @floatFromInt(nowNs() - j.began)) / 1e6;
-    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ e.at, j.blocks, bytes >> 20, j.bytes >> 20, s.rows >> 20, ms });
+    if (!@import("builtin").is_test) std.log.info("imprint: {d} tokens on disk: {d} new blocks and its own {d} MiB ({d} MiB this state, {d} MiB of rows it shares) in {d:.0} ms", .{ kept.at, j.blocks, bytes >> 20, j.bytes >> 20, s.rows >> 20, ms });
+    if (r.verify) @import("rows_verify.zig").state(r, r.states.items.len - 1, kept.saved, kept.pages);
     finishJob(r, j, true);
-    if (r.verify) @import("rows_verify.zig").state(r, r.states.items.len - 1, e.saved);
 }
 
 /// The job under way given up (its entry left RAM, or the store closes): its file in progress goes.
@@ -271,6 +293,7 @@ fn end(r: *Rows, j: *Job, disk_ok: bool) void {
 
 fn finishJob(r: *Rows, j: *Job, ok: bool) void {
     if (j.reserved) r.admission.finish(r.dir, j.bytes, ok);
+    if (j.kept.freed) |f| f.call(f.ctx, j.kept.owner); // the write no longer reads the state: its pages go back
     r.gpa.free(j.starts);
     r.gpa.free(j.parts);
     r.gpa.free(j.wants);

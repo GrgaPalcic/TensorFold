@@ -22,14 +22,49 @@ pub const block_tokens = 256;
 pub const Image = struct {
     /// A state's image at `at`, its parts in order, appended to `out`.
     parts: *const fn (ptr: *anyopaque, at: u32, out: *std.ArrayList(image.Part), a: Allocator) anyerror!void,
-    /// Copy into owned `out`; all GPU producers and copies must complete before returning.
-    gather: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, out: []u8) anyerror!void,
+    /// Copy into owned `out`; all GPU producers and copies must complete before returning. `pages`: the pool pages a
+    /// paged store's state keeps its rows in, in token order (empty: the state's own storage holds every row).
+    gather: *const fn (ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, out: []u8) anyerror!void,
     /// A new kept state of `at` tokens, its image filled by `scatter` and then restored as any other.
     blank: *const fn (ptr: *anyopaque, at: u32) anyerror!pc.Saved,
-    /// Copy `in`, back to back, into `ranges` of `saved`'s image.
-    scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void,
+    /// Copy `in`, back to back, into `ranges` of `saved`'s image. `pages`: `gather`'s (a read into pool pages).
+    scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) anyerror!void,
     /// Whether `saved`'s image can still be read whole (null: always).
     whole: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
+    /// A new kept state of `at` tokens whose leading rows go into pool pages the store holds (their ids appended to
+    /// `out`, each held once more for the caller; the store's tree releases them when it takes the state), its slot
+    /// past them; null: `blank` alone (null with a paged store's recall: it cannot recall into pages).
+    blank_pages: ?*const fn (ptr: *anyopaque, at: u32, out: *std.ArrayList(u32)) anyerror!pc.Saved = null,
+};
+
+/// A kept state as the disk store takes it, both stores': the flat cache's Entry (a copy holds every row), or a
+/// paged tree's node's (its rows in the tree's pages, each held once more while the save reads them).
+pub const Kept = struct {
+    /// Who owns the state: `dropped` and `evicted` match the queue by it.
+    owner: *anyopaque,
+    /// The state's tokens and the lookahead past them: the blocks are theirs.
+    tokens: []const u32,
+    /// Canonical row arithmetic through `at` (a paged store keeps none).
+    spans: []const Span = &.{},
+    at: u32,
+    saved: pc.Saved,
+    shared: bool = false,
+    /// The pool pages the state's rows sit in, in token order (a paged store's; empty: a copy holds every row).
+    pages: []const u32 = &.{},
+    /// Called when the save no longer reads the state (staged, ended or dropped): the store gives its pages back.
+    freed: ?Free = null,
+
+    /// Who the save's pages go back to, and how.
+    pub const Free = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, owner: *anyopaque) void,
+    };
+
+    /// The flat store's entry as a view: its tokens and spans, nothing held (the entry outlives the save, or its
+    /// eviction and drop say so first).
+    pub fn of(e: *pc.Entry) Kept {
+        return .{ .owner = e, .tokens = e.tokens, .spans = e.decode_spans, .at = e.at, .saved = e.saved, .shared = e.shared };
+    }
 };
 
 /// A state on disk: its name and position, what it read, its file's bytes and its blocks' (each counted whole).
@@ -112,7 +147,7 @@ pub const Rows = struct {
     stopped: bool = false,
     flush_clock: ?u64 = null, // a close protects states touched after this clock from older queued saves
     next_job: u64 = 0,
-    waiting: ?*pc.Entry = null, // the newest save refused room; while it is next, step waits for a reap
+    waiting: ?*anyopaque = null, // the newest save refused room; while it is next, step waits for a reap
     failures: write.Failures = .{},
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
 
@@ -150,7 +185,10 @@ pub const Rows = struct {
         write.stop(r, write.nowNs());
         if (r.fetch) |f| f.destroy();
         if (r.job) |j| write.abort(r, j);
-        for (r.queue.items) |q| r.gpa.free(q.starts);
+        for (r.queue.items) |*q| {
+            write.gave(r, q);
+            r.gpa.free(q.starts);
+        }
         for (r.states.items) |*s| freeState(r.gpa, s);
         r.states.deinit(r.gpa);
         r.blocks.deinit(r.gpa);
@@ -390,7 +428,10 @@ pub const Rows = struct {
     pub fn forgetAll(r: *Rows) u64 {
         write.fence(r);
         if (r.job) |j| write.abort(r, j);
-        for (r.queue.items) |q| r.gpa.free(q.starts);
+        for (r.queue.items) |*q| {
+            write.gave(r, q);
+            r.gpa.free(q.starts);
+        }
         r.queue.clearRetainingCapacity();
         const before = r.held();
         for (r.states.items) |*s| {

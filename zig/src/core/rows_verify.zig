@@ -8,10 +8,10 @@ const Rows = @import("rows_store.zig").Rows;
 const piece: u64 = 16 << 20;
 
 /// Disk state `i` read into a new state and compared with `saved`, the kept state it was written from; a line logged.
-pub fn state(r: *Rows, i: usize, saved: pc.Saved) void {
+pub fn state(r: *Rows, i: usize, saved: pc.Saved, pages: []const u32) void {
     const at = r.states.items[i].at;
     const quiet = @import("builtin").is_test;
-    compare(r, i, saved) catch |err| {
+    compare(r, i, saved, pages) catch |err| {
         r.counts.differed += 1;
         if (!quiet) std.log.err("imprint verify: {d} tokens read back differ or failed ({s})", .{ at, @errorName(err) });
         return;
@@ -20,7 +20,7 @@ pub fn state(r: *Rows, i: usize, saved: pc.Saved) void {
     if (!quiet) std.log.info("imprint verify: {d} tokens read back byte-equal to the kept state ({d} so far)", .{ at, r.counts.verified });
 }
 
-fn compare(r: *Rows, i: usize, saved: pc.Saved) !void {
+fn compare(r: *Rows, i: usize, saved: pc.Saved, pages: []const u32) !void {
     const at = r.states.items[i].at;
     const parts = try r.parts(r.gpa, at);
     defer r.gpa.free(parts);
@@ -37,8 +37,8 @@ fn compare(r: *Rows, i: usize, saved: pc.Saved) !void {
         while (done < p.bytes) {
             const n = @min(piece, p.bytes - done);
             const g = [_]image.Range{.{ .off = off + done, .len = n }};
-            try r.img.gather(r.family.ptr, saved, &g, a[0..@intCast(n)]);
-            try r.img.gather(r.family.ptr, back, &g, b[0..@intCast(n)]);
+            try r.img.gather(r.family.ptr, saved, pages, &g, a[0..@intCast(n)]);
+            try r.img.gather(r.family.ptr, back, &.{}, &g, b[0..@intCast(n)]);
             if (!std.mem.eql(u8, a[0..@intCast(n)], b[0..@intCast(n)])) return error.ImageDiffers;
             done += n;
         }

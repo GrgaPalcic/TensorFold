@@ -38,7 +38,6 @@ pub const Fake = struct {
     pub fn snapshots(f: *Fake) pc.Snapshots {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .rows = &.{ .parts = partsFn, .gather = gatherFn, .blank = blankFn, .scatter = scatterFn } } };
     }
-
     fn of(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }
@@ -133,7 +132,8 @@ pub const Fake = struct {
     fn partsFn(_: *anyopaque, at: u32, out: *std.ArrayList(image.Part), a: Allocator) anyerror!void {
         try layout(at, out, a);
     }
-    fn gatherFn(ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, out: []u8) anyerror!void {
+    fn gatherFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, out: []u8) anyerror!void {
+        _ = pages;
         const f = of(ptr);
         f.gathered += 1;
         if (f.gathers) |*n| if (n.* == 0) return error.GatherFailed else {
@@ -157,7 +157,8 @@ pub const Fake = struct {
         f.blanks += 1;
         return k;
     }
-    fn scatterFn(ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void {
+    fn scatterFn(ptr: *anyopaque, saved: pc.Saved, pages: []const u32, ranges: []const image.Range, in: []const u8) anyerror!void {
+        _ = pages;
         if (of(ptr).scatters) |*n| if (n.after == 0) return n.err else {
             n.after -= 1;
         };
