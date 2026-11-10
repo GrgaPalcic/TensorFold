@@ -292,12 +292,12 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try e.snaps.ensureTotalCapacity(a, 8);
     defer e.snaps.deinit(a);
     const at: u32 = 2048;
-    try snaps.blankAs(&e, 7, at, null);
+    try snaps.blankAs(&e, 7, at, null, 0);
     defer {
         var s = e.snaps.get(7).?;
         snaps.free(&e, &s);
     }
-    try expectError(error.StateKept, snaps.blankAs(&e, 7, at, null));
+    try expectError(error.StateKept, snaps.blankAs(&e, 7, at, null, 0));
     try expectError(error.UnsealedState, snaps.restore(&e, 7));
     try expectError(error.DiskWords, snaps.seal(&e, 7, at + @import("cuda_state.zig").window_rows + 1, .{ 0, 0 }, 0)); // a head past its verify window
     try expectError(error.DiskWords, snaps.seal(&e, 7, at, .{ 0, 0 }, @as(u64, 1) << @intCast(e.cur.st.cur.len))); // a copy bit no layer has
@@ -313,7 +313,7 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try expectError(error.StateKept, snaps.seal(&e, 7, at, .{ 0, 0 }, 0));
     const far: u32 = capacity - 1024; // a state past the rings' rows
     const back: u32 = far - @as(u32, @intCast(e.cur.st.ring_rows)); // the least base whose ring still holds its rows
-    try snaps.blankAs(&e, 8, far, null);
+    try snaps.blankAs(&e, 8, far, null, 0);
     defer {
         var held = e.snaps.get(8).?;
         snaps.free(&e, &held);
@@ -321,7 +321,7 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back - 1, back }, 0)); // a main ring too far back
     try expectError(error.DiskWords, snaps.seal(&e, 8, far, .{ back, back - 1 }, 0)); // a head ring too far back
     try snaps.seal(&e, 8, far, .{ back, back }, 0);
-    try snaps.blankAs(&e, 9, far, null);
+    try snaps.blankAs(&e, 9, far, null, 0);
     defer {
         var held = e.snaps.get(9).?;
         snaps.free(&e, &held);

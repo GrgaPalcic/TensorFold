@@ -485,4 +485,5 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 test {
     _ = @import("prompt_radix_test.zig");
     _ = @import("prompt_radix_disk_test.zig");
+    _ = @import("prompt_radix_disk_parts_test.zig");
 }

@@ -161,15 +161,16 @@ pub fn keepAs(e: anytype, id: u64) !void {
 
 /// A disk read's state: `at`'s pages leased under rank 0's id on each rank, refused by `restore` until `seal`.
 /// `home`: TF_GLM_KV_SHARD's home part, recorded on every rank as a keep records it (null: unsharded); every rank
-/// leases the whole size, as a keep does.
-pub fn blankAs(e: anytype, id: u64, at: usize, home: ?u8) !void {
+/// leases the whole size, as a keep does. `shared`: the pages layout's store pages under the mark (TF_KV_SHARE's
+/// recall; its slot's parts past them on every rank, so a rank's restore leaves the rows to the pages).
+pub fn blankAs(e: anytype, id: u64, at: usize, home: ?u8, shared: usize) !void {
     if (e.snaps.contains(id)) return error.StateKept;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     var lease = try pool.take(bytes(e, at));
     errdefer pool.give(&lease);
     const cur = try e.gpa.alloc(u1, e.cur.st.cur.len);
     @memset(cur, 0);
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = 0, .pos = at, .mtp_len = 0, .cur = cur, .bases = .{ 0, 0 }, .home = home });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = 0, .pos = at, .mtp_len = 0, .cur = cur, .bases = .{ 0, 0 }, .shared = shared, .home = home });
 }
 
 /// Whether an index ring of `rows` rows based at `base` holds every row up to `len`, as the image's ring bytes do.
@@ -299,6 +300,31 @@ fn carryRecv(e: anytype, s: *const types.Snap) !void {
 
 pub fn holds(e: anytype, id: u64) bool {
     return e.snaps.contains(id);
+}
+
+/// A kept state's slot lease bytes [at, at + host.len) read into `host` (out) or written from it, on this rank's
+/// engine thread: rank 0's pages-layout fixed parts, and another rank's through the disk step that calls it.
+pub fn slotBytes(e: anytype, s: *types.Snap, at: usize, host: []u8, out: bool) !void {
+    const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+    const page = pages.page;
+    if (at + host.len > s.lease.count() * page) return error.SnapshotSize;
+    const nd = s.lease.dev.ids.items.len;
+    var done: usize = 0;
+    while (done < host.len) {
+        const x = at + done;
+        const k: usize = @intCast(x / page);
+        const n: usize = @intCast(@min(host.len - done, page - x % page));
+        if (k < nd) {
+            const base = (pool.arena orelse return error.NoSnapshotRoom).ptr + @as(u64, s.lease.dev.ids.items[k]) * page + x % page;
+            if (out) try e.d.check(e.d.api.cuMemcpyDtoH_v2(host[done..].ptr, base, n), "cuMemcpyDtoH") else try e.d.check(e.d.api.cuMemcpyHtoD_v2(base, host[done..].ptr, n), "cuMemcpyHtoD");
+        } else {
+            const buf = (pool.host orelse return error.NoSnapshotRoom).bytes;
+            const from: usize = @as(usize, @intCast(s.lease.host.ids.items[k - nd])) * page + @as(usize, @intCast(x % page));
+            const h = buf[from..][0..n];
+            if (out) @memcpy(host[done..][0..n], h) else @memcpy(h, host[done..][0..n]);
+        }
+        done += n;
+    }
 }
 
 pub fn drop(e: anytype, id: u64) void {

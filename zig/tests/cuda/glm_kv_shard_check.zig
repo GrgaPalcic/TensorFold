@@ -73,7 +73,7 @@ fn throughDisk(a: std.mem.Allocator, e: *@import("glm_cuda").engine.Engine, id: 
     const w = try I.Words.decode(x, at);
     if (w.home != home) return error.DiskWords;
     e.dropState(id);
-    const nid = try R.blank(e, at);
+    const nid = try R.blank(e, at, R.readHome(e), 0);
     const read_home = R.homeOf(e, e.snaps.get(nid).?);
     for ([_][]const Range{ rows.items, own.items }, 0..) |ranges, k| {
         if (k == 1) try R.seal(e, nid, w);

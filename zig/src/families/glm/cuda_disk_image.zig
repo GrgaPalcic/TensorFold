@@ -7,6 +7,7 @@ const Config = @import("config.zig").Config;
 const pages = @import("cuda_snapshot_pages.zig");
 const State = st_mod.State;
 const window_rows = st_mod.window_rows;
+const page_rows = st_mod.page_rows;
 
 /// The image's first bytes: the format, the position, the head's rows, both ring bases and the KDA copy bits. A
 /// KV-sharded state (TF_GLM_KV_SHARD) also names its home part and the parts its pool had in the format word; the
@@ -61,7 +62,8 @@ pub const Words = struct {
 };
 
 /// A part as the rows store takes it: `row` bytes for each `per` tokens from position 0, or the state's own (row 0).
-pub const Part = struct { bytes: u64, row: u32 = 0, per: u32 = 1 };
+/// `at`: the part's first byte in its page (a pages layout's row part: its layer's region there; 0 elsewhere).
+pub const Part = struct { bytes: u64, row: u32 = 0, per: u32 = 1, at: u64 = 0 };
 
 /// `len` image bytes from `img`: the words, `lease` bytes into the state's lease, zeros the lease does not hold, or
 /// latent rows this rank's copy of a sharded state never held (`absent`: another rank's, never read or written here).
@@ -140,16 +142,27 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
 /// The image at `at` when its rows sit in the pool's pages (TF_KV_SHARE's disk store): the words, then each DSA
 /// layer's rows (its latent codes, scales and whole pooled keys, addressed through the tree's page ids), then the
 /// snapshot's fixed parts in the order its slot holds them (the arena head, per layer the rings and the pools past
-/// the mark, the MTP head's caches, the tail).
-pub fn pageParts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
+/// the mark, the MTP head's caches, the tail). `sharded` (TF_GLM_KV_SHARD): a page's latent codes and scales sit in
+/// its part's latent page, its pooled keys in its key page, so each row part's place is in its own page.
+pub fn pageParts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator, sharded: bool) !void {
     if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
     try out.append(a, .{ .bytes = Words.bytes });
     const pooled: u64 = at / sparse.pool;
-    for (0..sh.layers) |_| {
+    const pools: u64 = page_rows / sparse.pool;
+    // a layer's region: its codes, its fp32 scales (E4M3), its pooled keys. A whole page holds them layer after
+    // layer; a sharded page holds the codes and scales in the part's latent page and the keys in its key page, so
+    // a part's place is in its own page there.
+    const codes: u64 = page_rows * sh.latent;
+    const scales: u64 = if (sh.scales) @as(u64, page_rows * 4) else 0;
+    const keys: u64 = pools * sh.pooled_row;
+    for (0..sh.layers) |u| {
         const c = cache(sh, at);
-        try out.append(a, .{ .bytes = c[0], .row = sh.latent }); // the pages' rows, a row a token
-        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
-        try out.append(a, .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool });
+        const j: u64 = @intCast(u);
+        const whole: u64 = j * (codes + scales + keys);
+        const lat: u64 = j * (codes + scales);
+        try out.append(a, .{ .bytes = c[0], .row = sh.latent, .at = if (sharded) lat else whole }); // the pages' rows, a row a token
+        if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4, .at = (if (sharded) lat else whole) + codes });
+        try out.append(a, .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool, .at = if (sharded) j * keys else whole + codes + scales });
     }
     try out.append(a, .{ .bytes = sh.prefix });
     for (0..sh.layers) |_| {
