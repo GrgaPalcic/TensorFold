@@ -324,8 +324,7 @@ pub const Leader = struct {
             x.link.keep_pending = null;
             try x.link.send(x.e.m.glue.put_words, .{ .kind = @backingInt(Kind.keep), .a = kp.rows, .slot = kp.slot }, &.{});
         }
-        // flags 2: rank 0 keeps a whole copy (no shared store's pages left out), so the other ranks do too for this keep
-        if (n >= 256) try x.send(.{ .kind = @backingInt(Kind.keep), .a = n, .flags = @as(u32, @intFromBool(!x.e.share_pages)) << 1 }, &.{}) else x.link.keep_pending = .{ .slot = x.e.slot, .rows = @intCast(n) };
+        if (n >= 256) try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{}) else x.link.keep_pending = .{ .slot = x.e.slot, .rows = @intCast(n) };
         try x.e.keep(n);
     }
 
@@ -483,12 +482,7 @@ pub fn apply(e: *Engine, link: *Link, h_in: Header, ids_in: []const u32, s: *Scr
             var firsts: [engine.max_together]u32 = undefined;
             try e.prefillMany(decoded, &firsts);
         },
-        .keep => {
-            const was = e.share_pages;
-            if (h.flags & 2 != 0) e.share_pages = false; // rank 0's keep is a whole copy (the disk probe under TF_KV_SHARE)
-            defer e.share_pages = was;
-            try e.keep(@intCast(h.a));
-        },
+        .keep => try e.keep(@intCast(h.a)),
         .draft => {
             const ids = try e.gpa.dupe(u32, ids_in);
             defer e.gpa.free(ids);
